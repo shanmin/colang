@@ -1,0 +1,14 @@
+<?
+	int printf(char* str,...);
+
+?><html>
+<head>
+<title>CoLang Test</title>
+</head>
+<body>
+<?
+
+	printf("Hello World!");
+?>
+</body>
+</html>
