@@ -8,9 +8,24 @@
 #include <map>
 #include <string>
 #include <vector>
+//#include "llvm/ADT/APFloat.h"
+//#include "llvm/ADT/STLExtras.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/BasicBlock.h"
+//#include "llvm/IR/Constants.h"
+//#include "llvm/IR/DerivedTypes.h"
+//#include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+//#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+//#include "llvm/Support/TargetSelect.h"
+//#include "llvm/Target/TargetMachine.h"
+//#include "llvm/Transforms/InstCombine/InstCombine.h"
+//#include "llvm/Transforms/Scalar.h"
+//#include "llvm/Transforms/Scalar/GVN.h"
 #include "colang.h"
 //#include "lexer.h"
 #include "ast.h"
@@ -201,7 +216,7 @@ FunctionAST parse_function(std::vector<TOKEN>& tokens)
 		if (tokens[0].type == TOKEN_TYPE::paren_open || tokens[0].type == TOKEN_TYPE::comma)
 			tokens.erase(tokens.begin());	//跳过左括号或逗号
 		else
-			ErrorExit("函数定义中参数部分错误", tokens[0]);
+			ErrorExit("函数定义中参数部分错误", tokens);
 
 		std::string arg_type;
 		std::string arg_name;
@@ -230,7 +245,7 @@ FunctionAST parse_function(std::vector<TOKEN>& tokens)
 			tokens.erase(tokens.begin());
 		}
 		else
-			ErrorExit("函数定义参数识别错误", tokens[0]);
+			ErrorExit("函数定义参数识别错误", tokens);
 
 		args_type.push_back(arg_type);
 		args_name.push_back(arg_name);
@@ -307,17 +322,27 @@ llvm::Type* ir_type(std::vector<TOKEN>& tokens,IR_INFO& ir_info)
 	if (name == "double*") type = llvm::Type::getDoublePtrTy(ir_info.context);
 
 	if (type == NULL)
-		ErrorExit("数据类型定义错误",tokens[0]);
+		ErrorExit("数据类型定义错误",tokens);
 	return type;
 }
 
+llvm::Value* ir_value(std::vector<TOKEN>& tokens, IR_INFO& ir_info)
+{
+	llvm::Value* ret;
+	for (TOKEN t : tokens)
+		if (t.type == TOKEN_TYPE::string)
+			ret = ir_info.builder->CreateGlobalStringPtr(t.Value);
+		else
+			ErrorExit("未识别的值", tokens);
+	return ret;
+}
 
 void ir(std::vector<AST_STRUCT> ast_list,IR_INFO& ir_info)
 {
 	llvm::FunctionType* mainType = llvm::FunctionType::get(ir_info.builder->getInt32Ty(), false);
 	llvm::Function* main = llvm::Function::Create(mainType, llvm::GlobalValue::ExternalLinkage, "main", ir_info.module);
-	llvm::BasicBlock* entryBlock = llvm::BasicBlock::Create(ir_info.context, "entry_main", main);
-	ir_info.builder->SetInsertPoint(entryBlock);
+	llvm::BasicBlock* entryMain = llvm::BasicBlock::Create(ir_info.context, "entry_main", main);
+	ir_info.builder->SetInsertPoint(entryMain);
 
 	for (AST_STRUCT a : ast_list)
 	{
@@ -334,7 +359,7 @@ void ir(std::vector<AST_STRUCT> ast_list,IR_INFO& ir_info)
 				ir_info.builder->CreateCall(function, args);
 			}
 			else
-				ErrorExit("未找到函数定义：printf", a.tokens[0]);
+				ErrorExit("未找到函数定义：printf", a.tokens);
 			continue;
 		}
 		if (a.type == AST_TYPE::function)
@@ -368,12 +393,48 @@ void ir(std::vector<AST_STRUCT> ast_list,IR_INFO& ir_info)
 			}
 			continue;
 		}
-		continue;
+		// Function Call
+		if (a.type == AST_TYPE::call)
+		{
+			std::string fname;
+			std::vector<llvm::Value*> fargs;
+			for (AST_STRUCT aa : a.child)
+				if (aa.type == AST_TYPE::call_name)
+					fname = aa.tokens[0].Value;
+				else if (aa.type == AST_TYPE::call_args)
+				{
+					fargs.push_back(ir_value( aa.tokens, ir_info));
+				}
 
+			llvm::Function* function = ir_info.module->getFunction(fname);
+			if (function)
+			{
+				//std::vector<llvm::Value*> args;
+				//llvm::Value* v = ir_info.builder->CreateGlobalStringPtr(a.tokens[0].Value);
+				//args.push_back(v);
+
+				//llvm::Value* args = ir_info.builder->CreateGlobalStringPtr(a.tokens[0].Value);
+				ir_info.builder->CreateCall(function, fargs);
+			}
+			else
+				ErrorExit( "未找到函数定义", a.tokens);
+			continue;
+		}
+		//ErrorExit("未处理的代码", a.tokens[0]);
+		printf("\n---------- ERROR ----------\n");
+		printf("未处理的代码\n");
+		std::vector<AST_STRUCT> tmp;
+		tmp.push_back(a);
+		ast_echo(tmp, "");
+		exit(3);
 	}
+
+	llvm::ConstantInt* ret =ir_info.builder->getInt32(0);
+	ir_info.builder->CreateRet(ret);
+	llvm::verifyFunction(*main);
 }
 
-//解析一个指定的cm文件到bc格式
+//解析一个指定的co文件到bc格式
 int cm2bc(const char* cmfilename)
 {
 	SRCINFO srcinfo;
@@ -420,19 +481,33 @@ int cm2bc(const char* cmfilename)
 	ir_info.module =new llvm::Module(cmfilename, ir_info.context);
 	ir_info.builder = std::make_unique<llvm::IRBuilder<>>((ir_info.context));
 	ir(ast_list, ir_info);
+	//验证模块是否存在问题
+	std::string mstr;
+	llvm::raw_string_ostream merr(mstr);
+	bool result=llvm::verifyModule(*ir_info.module,&merr);
+	if (result)
+	{
+		printf("模块存在错误！%s",mstr.c_str());
+		exit(2);
+	}
 	printf("\n---------- IR ----------\n");
 	ir_info.module->print(llvm::outs(), nullptr);
 
-
+	//输出ll格式文件
 	std::string col = std::string(cmfilename) + "l";
 	std::error_code ec;
 	llvm::raw_fd_ostream fout(col,ec);
 	ir_info.module->print(fout, nullptr);
 	fout.close();
+	printf("\n---------- write ll ----------\n");
+	printf("save=%x\n",ec.value());
 
-	//std::string cob = std::string(cmfilename) + "b";
-	
-
+	std::string cob = std::string(cmfilename) + "b";
+	llvm::raw_fd_ostream fout_cob(cob, ec);
+	llvm::WriteBitcodeToFile(*ir_info.module, fout_cob);
+	fout_cob.close();
+	printf("\n---------- write bc ----------\n");
+	printf("save=%x\n", ec.value());
 
 }
 
@@ -445,12 +520,13 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
+	//InitializeNativeTarget();
+	//InitializeNativeTargetAsmPrinter();
+	//InitializeNativeTargetAsmParser();
+
 	cm2bc(argv[1]);
 	//const char* filename = "test/test1.cm";
 	//cm2bc(filename);
-
-	//Builder = new llvm::IRBuilder(TheContext);
-	//TheModule = new llvm::Module("", TheContext);
 
 	return 0;
 }

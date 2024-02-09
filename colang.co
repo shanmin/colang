@@ -1,14 +1,17 @@
 //
-//	本文将存档colang中的核心定义部分
+//	本文件是colang公共定义文件
 //
+
+//C库函数
+int printf(char* str,...);
 
 //object基础结构
 //	type=0	null
-struct object
-{
-	void* value;				//值
-	unsigned long long length;	//占用字节数
-	unsigned char type;			//类型
-}
+//struct object
+//{
+//	void* value;				//值
+//	unsigned long long length;	//占用字节数
+//	unsigned char type;			//类型
+//}
 
 //	THE END

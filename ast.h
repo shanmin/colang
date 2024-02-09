@@ -14,7 +14,8 @@ enum AST_TYPE
 	function_name,	//函数名称
 	function_args,	//函数参数列表
 	function_body,	//函数体
-	call,		//函数调用		
+	call,		//函数调用
+	call_name,	//函数调用名称
 	call_args,	//函数调用参数
 	codeblock,	//独立代码块，例如{}括起来的代码
 };
@@ -29,6 +30,7 @@ void ast(std::vector<TOKEN>& tokens, std::vector<AST_STRUCT>& ast_list)
 {
 	while (!tokens.empty())
 	{
+		//非代码，直接输出
 		if (tokens[0].type == TOKEN_TYPE::noncode)
 		{
 			AST_STRUCT a;
@@ -64,7 +66,7 @@ void ast(std::vector<TOKEN>& tokens, std::vector<AST_STRUCT>& ast_list)
 			if (tokens[0].type == TOKEN_TYPE::paren_open)
 				tokens.erase(tokens.begin());
 			else
-				ErrorExit("函数定义解析错误", tokens[0]);
+				ErrorExit("函数定义解析错误", tokens);
 			//参数列表
 			while (tokens[0].type != TOKEN_TYPE::paren_close) //只要不是)节点，则一直读取
 			{
@@ -84,7 +86,7 @@ void ast(std::vector<TOKEN>& tokens, std::vector<AST_STRUCT>& ast_list)
 			if (tokens[0].Value == ")")
 				tokens.erase(tokens.begin());
 			else
-				ErrorExit("函数定义结束部分错误", tokens[0]);
+				ErrorExit("函数定义结束部分错误", tokens);
 			//判断后续是否存在函数体
 			if (tokens[0].Value == ";")
 				tokens.erase(tokens.begin());
@@ -107,7 +109,7 @@ void ast(std::vector<TOKEN>& tokens, std::vector<AST_STRUCT>& ast_list)
 			call.type = AST_TYPE::call;
 			//名称
 			AST_STRUCT name;
-			name.type = AST_TYPE::function_name;
+			name.type = AST_TYPE::call_name;
 			name.tokens.push_back(tokens[0]);
 			call.child.push_back(name);
 			tokens.erase(tokens.begin());
@@ -115,12 +117,12 @@ void ast(std::vector<TOKEN>& tokens, std::vector<AST_STRUCT>& ast_list)
 			if (tokens[0].type == TOKEN_TYPE::paren_open)
 				tokens.erase(tokens.begin());
 			else
-				ErrorExit("函数调用解析错误", tokens[0]);
+				ErrorExit("函数调用解析错误", tokens);
 			//参数列表
 			while (tokens[0].type != TOKEN_TYPE::paren_close) //只要不是)节点，则一直读取
 			{
 				AST_STRUCT arg;
-				arg.type = AST_TYPE::function_args;
+				arg.type = AST_TYPE::call_args;
 				while (tokens[0].type != TOKEN_TYPE::paren_close && tokens[0].type != TOKEN_TYPE::comma)
 				{
 					arg.tokens.push_back(tokens[0]);
@@ -135,7 +137,7 @@ void ast(std::vector<TOKEN>& tokens, std::vector<AST_STRUCT>& ast_list)
 			if (tokens[0].Value == ")")
 				tokens.erase(tokens.begin());
 			else
-				ErrorExit("函数定义结束部分错误", tokens[0]);
+				ErrorExit("函数定义结束部分错误", tokens);
 			//判断后续是否存在函数体
 			if (tokens[0].Value == ";")
 				tokens.erase(tokens.begin());
@@ -143,7 +145,7 @@ void ast(std::vector<TOKEN>& tokens, std::vector<AST_STRUCT>& ast_list)
 			ast_list.push_back(call);
 			continue;
 		}
-		ErrorExit("未识别标识", tokens[0]);
+		ErrorExit("未识别标识", tokens);
 		break;
 	}
 }
