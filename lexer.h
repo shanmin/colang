@@ -36,6 +36,21 @@ struct TOKEN
 	int col_index;	//所在列
 };
 
+
+void token_echo(std::vector<TOKEN> tokens, std::string pre)
+{
+	for (TOKEN token : tokens)
+	{
+		printf(pre.c_str());
+		printf("[r:%3d,c:%3d]%2d : %s\n", token.row_index+1, token.col_index, token.type, token.Value.c_str());
+	}
+}
+void token_echo(TOKEN token, std::string pre)
+{
+		printf(pre.c_str());
+		printf("[r:%3d,c:%3d]%2d : %s\n", token.row_index+1, token.col_index, token.type, token.Value.c_str());
+}
+
 //词法分析器
 //	把源代码拆分为最小的token单元
 void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)

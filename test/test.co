@@ -1,5 +1,6 @@
 <?
 	int printf(char* str,...);
+	//void* malloc(void* size);
 
 ?><html>
 <head>
@@ -8,7 +9,16 @@
 <body>
 <?
 
-	printf("Hello World!");
+	{
+		printf("Hello World!");
+	}
+
+	int a;
+	a=1;
+	//int a=1;
+	//int b=2;
+	//int c=a+b;
+
 ?>
 </body>
 </html>

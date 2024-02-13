@@ -76,7 +76,7 @@ link_libraries(D:/svn/bp.shanmin.com/co/llvm-17.0.6/build/Debug/lib/LLVMDemangle
 project ("colang")
 
 # 将源代码添加到此项目的可执行文件。
-add_executable (colang "colang.cpp" "colang.h" "lexer.h" "ast.h")
+add_executable (colang "colang.cpp" "colang.h" "lexer.h" "ast.h"  "ir.h")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET colang PROPERTY CXX_STANDARD 20)
