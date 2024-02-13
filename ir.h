@@ -3,11 +3,11 @@
 //
 
 #include <vector>
+#include <llvm/Bitcode/BitcodeWriter.h>
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "lexer.h"
 #include "ast.h"
-#include <llvm/Bitcode/BitcodeWriter.h>
 
 void ErrorExit(const char* str, std::vector<AST>& ast_list)
 {
@@ -18,8 +18,13 @@ void ErrorExit(const char* str, std::vector<AST>& ast_list)
 
 struct VAR_INFO
 {
+	llvm::Type* type;
+	llvm::Value* value;
+};
+struct VAR_LIST
+{
 	std::string zone; //global,codeblock,function
-	std::map<std::string, llvm::Type*> info; //name,type
+	std::map<std::string, VAR_INFO> info; //name,type
 };
 
 struct IRINFO
@@ -28,7 +33,7 @@ struct IRINFO
 	llvm::Module* module;
 	std::unique_ptr<llvm::IRBuilder<>> builder;
 
-	std::vector<VAR_INFO> varlist;
+	std::vector<VAR_LIST> varlist; //局部变量范围
 };
 
 
@@ -42,9 +47,9 @@ void ir(std::vector<AST>& tokens,const char* filename)
 	irinfo.builder = std::make_unique<llvm::IRBuilder<>>((irinfo.context));
 
 	//设置当前变量作用域
-	VAR_INFO varinfo;
-	varinfo.zone = "global";
-	irinfo.varlist.push_back(varinfo);
+	VAR_LIST varlist;
+	varlist.zone = "global";
+	irinfo.varlist.push_back(varlist);
 
 	llvm::FunctionType* mainType = llvm::FunctionType::get(irinfo.builder->getInt32Ty(), false);
 	llvm::Function* main = llvm::Function::Create(mainType, llvm::GlobalValue::ExternalLinkage, "main", irinfo.module);
@@ -135,6 +140,31 @@ llvm::Value* irvalue(std::vector<TOKEN>& tokens, IRINFO& irinfo)
 	return ret;
 }
 
+struct IR_EXPR
+{
+	std::string op;
+	llvm::Value* value;
+};
+//表达式处理
+llvm::Value* ir_expr(std::vector<TOKEN>& tokens, IRINFO& irinfo)
+{
+	llvm::Value* value;
+	for (TOKEN t : tokens)
+		if (t.type == TOKEN_TYPE::string)
+		{
+			value = irinfo.builder->CreateGlobalStringPtr(t.Value);
+			tokens.erase(tokens.begin());
+		}
+		else if (t.type == TOKEN_TYPE::number)
+		{
+			int v = atoi(t.Value.c_str());
+			value = irinfo.builder->getInt32(v);
+		}
+		else
+			ErrorExit("未识别的值", tokens);
+	return value;
+}
+
 //语法分析，并生成IR代码
 void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 {
@@ -142,7 +172,7 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 	while (!ast_list.empty())
 	{
 		//非代码，直接输出
-		if (ast_list[0].type=="noncode")
+		if (ast_list[0].type==AST_TYPE::ast_noncode)
 		{
 			llvm::Function* function = irinfo.module->getFunction("printf");
 			if (function)
@@ -162,7 +192,7 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 		//       |      + 函数名称
 		//       +  返回值类型
 		//判断依据：当前为字符，下一个token是一个字符，再下一个是(
-		if (ast_list[0].type=="function")
+		if (ast_list[0].type==AST_TYPE::ast_function)
 		{
 			//args
 			llvm::Type* frtype = irtype(ast_list[0].value["ret"], irinfo);
@@ -204,9 +234,9 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 			if (!ast_list[0].body.empty())
 			{
 				//设置当前变量作用域
-				VAR_INFO varinfo;
-				varinfo.zone = "function";
-				irinfo.varlist.push_back(varinfo);
+				VAR_LIST varlist;
+				varlist.zone = "function";
+				irinfo.varlist.push_back(varlist);
 
 				ir_proc(ast_list[0].body, irinfo, false);
 
@@ -218,7 +248,7 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 
 		//函数调用
 		//Ex:	printf("abc");
-		if (ast_list[0].type=="call")
+		if (ast_list[0].type==AST_TYPE::ast_call)
 		{
 			std::string fname=ast_list[0].value["name"][0].Value;
 			std::vector<llvm::Value*> fargs;
@@ -243,12 +273,12 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 			continue;
 		}
 
-		if (ast_list[0].type == "codeblock")
+		if (ast_list[0].type ==AST_TYPE::ast_codeblock)
 		{
 			//设置当前变量作用域
-			VAR_INFO varinfo;
-			varinfo.zone = "function";
-			irinfo.varlist.push_back(varinfo);
+			VAR_LIST varlist;
+			varlist.zone = "function";
+			irinfo.varlist.push_back(varlist);
 
 			ir_proc(ast_list[0].body,irinfo,false);
 			
@@ -261,17 +291,23 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 		//变量定义
 		//Ex:	int a;
 		//		int b=2;
-		if (ast_list[0].type=="var")
+		if (ast_list[0].type==AST_TYPE::ast_var)
 		{
-			VAR_INFO var = irinfo.varlist.back();
-			var.info[ast_list[0].value["name"][0].Value] =irtype(ast_list[0].value["type"],irinfo);
+			//VAR_LIST var_list = irinfo.varlist.rbegin();
+			VAR_INFO var_info;
+			var_info.type= irtype(ast_list[0].value["type"], irinfo);
+			var_info.value = irinfo.builder->CreateAlloca(var_info.type);
+			irinfo.varlist[irinfo.varlist.size()-1].info[ast_list[0].value["name"][0].Value] = var_info;
 			ast_list.erase(ast_list.begin());
 			continue;
 		}
 
 		//变量赋值
-		if (ast_list[0].type == "=")
+		if (ast_list[0].type ==AST_TYPE::ast_expr)
 		{
+			//VAR_LIST var_list = irinfo.varlist.back();
+			VAR_INFO var_info = irinfo.varlist[irinfo.varlist.size() - 1].info[ast_list[0].value["name"][0].Value];
+			irinfo.builder->CreateStore(ir_expr(ast_list[0].value["value"],irinfo), var_info.value);
 			ast_list.erase(ast_list.begin());
 			continue;
 		}

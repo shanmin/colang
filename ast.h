@@ -7,13 +7,30 @@
 #include <vector>
 #include "lexer.h"
 
+enum AST_TYPE
+{
+	ast_noncode,
+	ast_codeblock,
+	ast_function,
+	ast_call,
+	ast_var,
+	ast_expr,
+};
+std::vector<std::string> AST_TYPE_STRING = {
+	"noncode",
+	"codeblock",
+	"function",
+	"call",
+	"var",
+	"expr",
+};
+
 struct AST
 {
-	std::string type;
+	AST_TYPE type;
 	std::map<std::string, std::vector<TOKEN>> value;
 	std::vector<AST> body;
 };
-
 
 //语法分析，主要区分代码层次、语句用途
 std::vector<AST> ast(std::vector<TOKEN>& tokens)
@@ -26,7 +43,7 @@ std::vector<AST> ast(std::vector<TOKEN>& tokens)
 			{
 				tokens.erase(tokens.begin());
 				AST a;
-				a.type = "codeblock";
+				a.type = AST_TYPE::ast_codeblock;
 				a.body = ast(tokens);
 				ast_list.push_back(a);
 				continue;
@@ -41,7 +58,7 @@ std::vector<AST> ast(std::vector<TOKEN>& tokens)
 		if (tokens[0].type == TOKEN_TYPE::noncode)
 		{
 			AST a;
-			a.type = "noncode";
+			a.type =AST_TYPE::ast_noncode;
 			a.value["value"].push_back(tokens[0]);
 			ast_list.push_back(a);
 			tokens.erase(tokens.begin());
@@ -54,10 +71,10 @@ std::vector<AST> ast(std::vector<TOKEN>& tokens)
 		//       |      + 函数名称
 		//       +  返回值类型
 		//判断依据：当前为字符，下一个token是一个字符，再下一个是(
-		if (tokens[0].type == TOKEN_TYPE::block && tokens[1].type == TOKEN_TYPE::block && tokens[2].type == TOKEN_TYPE::paren_open)
+		if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code && tokens[2].type == TOKEN_TYPE::code && tokens[2].Value=="(")
 		{
 			AST a;
-			a.type = "function";
+			a.type =AST_TYPE::ast_function;
 			//返回值
 			a.value["ret"].push_back(tokens[0]);
 			tokens.erase(tokens.begin());
@@ -107,10 +124,10 @@ std::vector<AST> ast(std::vector<TOKEN>& tokens)
 
 		//函数调用
 		//Ex:	printf("abc");
-		if (tokens[0].type == TOKEN_TYPE::block && tokens[1].type == TOKEN_TYPE::paren_open)
+		if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code && tokens[1].Value=="(")
 		{
 			AST a;
-			a.type = "call";
+			a.type =AST_TYPE::ast_call;
 			a.value["name"].push_back(tokens[0]);
 			tokens.erase(tokens.begin());
 
@@ -142,12 +159,12 @@ std::vector<AST> ast(std::vector<TOKEN>& tokens)
 		//变量定义
 		//Ex:	int a;
 		//		int b=2;
-		if (tokens[0].type == TOKEN_TYPE::block && tokens[1].type == TOKEN_TYPE::block)
+		if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code)
 		{
 			if (tokens[2].Value == ";") //变量定义
 			{
 				AST a;
-				a.type = "var";
+				a.type = AST_TYPE::ast_var;
 				a.value["type"].push_back(tokens[0]);
 				tokens.erase(tokens.begin());
 				a.value["name"].push_back(tokens[0]);
@@ -159,7 +176,7 @@ std::vector<AST> ast(std::vector<TOKEN>& tokens)
 			else if (tokens[2].Value == "=")
 			{
 				AST a;
-				a.type = "var";
+				a.type = AST_TYPE::ast_var;
 				a.value["type"].push_back(tokens[0]);
 				tokens.erase(tokens.begin());
 				a.value["name"].push_back(tokens[0]);
@@ -172,7 +189,7 @@ std::vector<AST> ast(std::vector<TOKEN>& tokens)
 		if (tokens[1].type != TOKEN_TYPE::string && tokens[1].Value == "=")
 		{
 			AST a;
-			a.type = "=";
+			a.type =AST_TYPE::ast_expr;
 			a.value["name"].push_back(tokens[0]);
 			tokens.erase(tokens.begin());
 			tokens.erase(tokens.begin());

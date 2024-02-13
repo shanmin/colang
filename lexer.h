@@ -7,24 +7,30 @@
 #include <vector>
 #include "colang.h"
 
+struct SRCINFO
+{
+	char* src;	//源代码内容
+	unsigned int size = 0;	//当前待处理文件长度
+};
+
 enum TOKEN_TYPE
 {
 	noncode,	//非代码
 	preproc,	//预处理代码，以#开头的指令
-	block,	//关键字
+	code,	//关键字
 	string,		//字符串
 	number,		//数字
-	paren_open,		//左括号(
-	paren_close,	//右括号)
-	bracket_open,	//左中括号[
-	bracket_close,	//右中括号]
-	curly_open,		//左大括号{
-	curly_close,	//右大括号}
-	semicolon,	//分号;
-	comma,		//逗号,
-	colon,		//冒号:
-	equal,		//等号=
-	define,		//常量预处理
+	//paren_open,		//左括号(
+	//paren_close,	//右括号)
+	//bracket_open,	//左中括号[
+	//bracket_close,	//右中括号]
+	//curly_open,		//左大括号{
+	//curly_close,	//右大括号}
+	//semicolon,	//分号;
+	//comma,		//逗号,
+	//colon,		//冒号:
+	//equal,		//等号=
+	//define,		//常量预处理
 };
 
 struct TOKEN
@@ -36,6 +42,17 @@ struct TOKEN
 	int col_index;	//所在列
 };
 
+
+void ErrorExit(const char* str, std::vector<TOKEN>& tokens)
+{
+	//printf(str);
+	if (tokens.size() == 0)
+		printf("\n---------- Error ----------\n%s\n", str);
+	else
+		printf("\n---------- Error ----------\n%s\n\t  row: %d\n\t  col: %d\n\t type: %d\n\ttoken: %s\n",
+			str, tokens[0].row_index, tokens[0].col_index, tokens[0].type, tokens[0].Value.c_str());
+	exit(1);
+}
 
 void token_echo(std::vector<TOKEN> tokens, std::string pre)
 {
@@ -231,7 +248,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 				{
 					TOKEN token;
 					token.filename = srcinfo.src;
-					token.type = TOKEN_TYPE::block;
+					token.type = TOKEN_TYPE::code;
 					token.Value = current;
 					token.row_index = row_index;
 					token.col_index = col_index;
@@ -257,28 +274,28 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 
 					TOKEN token;
 					token.filename = srcinfo.src;
-					if (src[0] == '(')
-						token.type = TOKEN_TYPE::paren_open;
-					else if (src[0] == ')')
-						token.type = TOKEN_TYPE::paren_close;
-					else if (src[0] == '[')
-						token.type = TOKEN_TYPE::bracket_open;
-					else if (src[0] == ']')
-						token.type = TOKEN_TYPE::bracket_close;
-					else if (src[0] == '{')
-						token.type = TOKEN_TYPE::curly_open;
-					else if (src[0] == '}')
-						token.type = TOKEN_TYPE::curly_close;
-					else if (src[0] == ';')
-						token.type = TOKEN_TYPE::semicolon;
-					else if (src[0] == ',')
-						token.type = TOKEN_TYPE::comma;
-					else if (src[0] == ':')
-						token.type = TOKEN_TYPE::colon;
-					else if (src[0] == '=')
-						token.type = TOKEN_TYPE::equal;
-					else
-						token.type = TOKEN_TYPE::block;
+					//if (src[0] == '(')
+					//	token.type = TOKEN_TYPE::paren_open;
+					//else if (src[0] == ')')
+					//	token.type = TOKEN_TYPE::paren_close;
+					//else if (src[0] == '[')
+					//	token.type = TOKEN_TYPE::bracket_open;
+					//else if (src[0] == ']')
+					//	token.type = TOKEN_TYPE::bracket_close;
+					//else if (src[0] == '{')
+					//	token.type = TOKEN_TYPE::curly_open;
+					//else if (src[0] == '}')
+					//	token.type = TOKEN_TYPE::curly_close;
+					//else if (src[0] == ';')
+					//	token.type = TOKEN_TYPE::semicolon;
+					//else if (src[0] == ',')
+					//	token.type = TOKEN_TYPE::comma;
+					//else if (src[0] == ':')
+					//	token.type = TOKEN_TYPE::colon;
+					//else if (src[0] == '=')
+					//	token.type = TOKEN_TYPE::equal;
+					//else
+						token.type = TOKEN_TYPE::code;
 					token.Value = current;
 					token.row_index = row_index;
 					token.col_index = col_index;
@@ -326,7 +343,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 				else if (token.Value.starts_with("#"))
 					token.type = TOKEN_TYPE::preproc;
 				else
-					token.type = TOKEN_TYPE::block;
+					token.type = TOKEN_TYPE::code;
 				token.Value = current;
 				token.row_index = begin_row_index;
 				token.col_index = begin_col_index;
