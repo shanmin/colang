@@ -140,30 +140,168 @@ llvm::Value* irvalue(std::vector<TOKEN>& tokens, IRINFO& irinfo)
 	return ret;
 }
 
+std::map<std::string,int> IR_EXPR_PRI =
+{
+	{"*",30},
+	{"/",30},
+	{"+",20},
+	{"-",20},
+	{"=",10}
+};
+
+llvm::Value* ir_expr(std::vector<AST>& ast_list, IRINFO& irinfo);
+
 struct IR_EXPR
 {
-	std::string op;
-	llvm::Value* value;
+	AST op;		//操作符节点
+	int op_pri; //操作符优先级
+	AST right;
+	llvm::Value* right_value=NULL;
 };
-//表达式处理
-llvm::Value* ir_expr(std::vector<TOKEN>& tokens, IRINFO& irinfo)
+//查找变量
+llvm::Value* ir_var(std::string name,std::vector<VAR_LIST> var_list)
 {
-	llvm::Value* value;
-	for (TOKEN t : tokens)
-		if (t.type == TOKEN_TYPE::string)
+	//从下往上查找变量定义
+	while (!var_list.empty())
+	{
+		VAR_LIST vlist = var_list.back();
+		var_list.pop_back();
+
+		VAR_INFO vinfo = vlist.info[name];
+		if (vinfo.value)
 		{
-			value = irinfo.builder->CreateGlobalStringPtr(t.Value);
-			tokens.erase(tokens.begin());
+			return vinfo.value;
 		}
-		else if (t.type == TOKEN_TYPE::number)
+	}
+}
+//表达式转为值类型
+void ir_value(IR_EXPR& current, IRINFO& irinfo)
+{
+	if (current.right_value)
+		return;
+	if (current.right.type == AST_TYPE::ast_call)
+	{
+		//函数调用
+		//Ex:	printf("abc");
+		std::string fname = current.right.value["name"][0].Value;
+		std::vector<llvm::Value*> fargs;
+		std::vector<AST> args = current.right.body;
+		while (!args.empty())
 		{
-			int v = atoi(t.Value.c_str());
-			value = irinfo.builder->getInt32(v);
+			std::vector<AST> a1 = { args[0] };
+			fargs.push_back(ir_expr(a1, irinfo));
+			args.erase(args.begin());
+		}
+		llvm::Function* function = irinfo.module->getFunction(fname);
+		if (function)
+		{
+			current.right_value = irinfo.builder->CreateCall(function, fargs);
 		}
 		else
-			ErrorExit("未识别的值", tokens);
+			ErrorExit("未找到函数定义", current.right.value["name"]);
+	}
+	else if (current.right.value.empty()) //没有值节点的，计算下层节点
+		current.right_value = ir_expr(current.right.body, irinfo);
+	else if (current.right.value["value"][0].type == TOKEN_TYPE::string)
+		current.right_value = irinfo.builder->CreateGlobalStringPtr(current.right.value["value"][0].Value);
+	else if (current.right.value["value"][0].type == TOKEN_TYPE::number)
+	{
+		int v = atoi(current.right.value["value"][0].Value.c_str());
+		current.right_value = irinfo.builder->getInt32(v);
+	}
+	else
+	{
+		current.right_value = ir_var(current.right.value["value"][0].Value,irinfo.varlist);
+		if(current.right_value==NULL)
+			ErrorExit("未识别的表达式类型", current.right.value["value"]);
+	}
+}
+//表达式处理
+llvm::Value* ir_expr(std::vector<AST>& ast_list, IRINFO& irinfo)
+{
+	std::vector<IR_EXPR> expr_list;
+	//计算表达式优先级
+	IR_EXPR expr;
+	expr.op_pri = 0;
+	expr.right = ast_list[0];
+	expr_list.push_back(expr);
+	ast_list.erase(ast_list.begin());
+	//后表达式计算
+	while (!ast_list.empty())
+	{
+		expr.op = ast_list[0];
+		expr.op_pri= IR_EXPR_PRI[expr.op.value["value"][0].Value];
+		ast_list.erase(ast_list.begin());
+		expr.right = ast_list[0];
+		expr_list.push_back(expr);
+		ast_list.erase(ast_list.begin());
+	}
+
+	//计算表达式
+	llvm::Value* value;
+	while (!expr_list.empty())
+	{
+		//查找最高优先级表达式
+		IR_EXPR* current = &expr_list[0];
+		int index = 0;
+		for (index = 1; index < expr_list.size(); index++)
+		{
+			if (expr_list[index].op_pri > current->op_pri ||
+				expr_list[index].op_pri == current->op_pri && current->op.value["value"][0].Value == "=")
+				current = &expr_list[index];
+		}
+		//转换
+		ir_value(*current,irinfo);
+		//只有一个值，不需计算的处理
+		if (current->op_pri == 0)
+		{
+			value=current->right_value;
+			expr_list.erase(expr_list.begin()+index-1);
+			continue;
+		}
+		
+		IR_EXPR* prev = &expr_list[index - 2];
+		//判断赋值操作
+		if (current->op.value["value"][0].Value == "=")
+		{
+			prev->right_value = current->right_value;
+			VAR_INFO var_info = irinfo.varlist[irinfo.varlist.size() - 1].info[prev->right.value["value"][0].Value];
+			irinfo.builder->CreateStore(prev->right_value, var_info.value);
+			value=current->right_value;
+			expr_list.erase(expr_list.begin() + index - 1);
+			continue;
+		}
+
+		ir_value(*prev,irinfo);
+		if (current->op.value["value"][0].Value == "+")
+		{
+			llvm::Type* type1 = llvm::Type::getInt32Ty(irinfo.context);
+			llvm::Value* v1 = irinfo.builder->CreateAlloca(type1, 0, "v1");
+			llvm::Value* v1v = irinfo.builder->getInt32(123);
+			irinfo.builder->CreateStore(v1v,v1);
+
+			llvm::Value* v2 = irinfo.builder->CreateAlloca(type1, 0, "v2");
+			llvm::Value* v2v = irinfo.builder->getInt32(456);
+			irinfo.builder->CreateStore(v2v, v2);
+
+			llvm::Value* v3 = irinfo.builder->CreateAlloca(type1, 0, "v3");
+			llvm::Value* v3v= irinfo.builder->CreateAdd(v1v,v2v,"vvv");
+			irinfo.builder->CreateStore(v3v, v3);
+
+			//prev->right_value=
+			//irinfo.builder->CreateAdd(prev->right_value, current->right_value);
+			//std::cout << prev->right_value->getType() << std::endl;
+			//std::cout << current->right_value << std::endl;
+			expr_list.erase(expr_list.begin() + index - 1);
+		}
+		else
+		{
+			ErrorExit("未识别的表达式计算", current->right.value["value"]);
+		}
+	}
 	return value;
 }
+
 
 //语法分析，并生成IR代码
 void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
@@ -195,7 +333,7 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 		if (ast_list[0].type==AST_TYPE::ast_function)
 		{
 			//args
-			llvm::Type* frtype = irtype(ast_list[0].value["ret"], irinfo);
+			llvm::Type* frtype = irtype(ast_list[0].value["rett"], irinfo);
 			std::string fname=ast_list[0].value["name"][0].Value;
 			std::vector<llvm::Type*> fatype;
 			std::vector<std::string> faname;
@@ -246,33 +384,6 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 			continue;
 		}
 
-		//函数调用
-		//Ex:	printf("abc");
-		if (ast_list[0].type==AST_TYPE::ast_call)
-		{
-			std::string fname=ast_list[0].value["name"][0].Value;
-			std::vector<llvm::Value*> fargs;
-			std::vector<TOKEN> args = ast_list[0].value["args"];
-			while (!args.empty())
-				if (args[0].Value == ",")
-				{
-					args.erase(args.begin());
-				}
-				else
-				{
-					fargs.push_back(irvalue(args, irinfo));
-				}
-			llvm::Function* function = irinfo.module->getFunction(fname);
-			if (function)
-			{
-				irinfo.builder->CreateCall(function, fargs);
-			}
-			else
-				ErrorExit( "未找到函数定义", ast_list[0].value["name"]);
-			ast_list.erase(ast_list.begin());
-			continue;
-		}
-
 		if (ast_list[0].type ==AST_TYPE::ast_codeblock)
 		{
 			//设置当前变量作用域
@@ -305,9 +416,10 @@ void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 		//变量赋值
 		if (ast_list[0].type ==AST_TYPE::ast_expr)
 		{
-			//VAR_LIST var_list = irinfo.varlist.back();
-			VAR_INFO var_info = irinfo.varlist[irinfo.varlist.size() - 1].info[ast_list[0].value["name"][0].Value];
-			irinfo.builder->CreateStore(ir_expr(ast_list[0].value["value"],irinfo), var_info.value);
+			ir_expr(ast_list[0].body, irinfo);
+			////VAR_LIST var_list = irinfo.varlist.back();
+			//VAR_INFO var_info = irinfo.varlist[irinfo.varlist.size() - 1].info[ast_list[0].value["name"][0].Value];
+			//irinfo.builder->CreateStore(ir_expr(ast_list[0].value["value"],irinfo), var_info.value);
 			ast_list.erase(ast_list.begin());
 			continue;
 		}

@@ -15,9 +15,15 @@
 
 	int a;
 	a=1;
-	//int a=1;
-	//int b=2;
-	//int c=a+b;
+
+	int b=2+3;
+
+	int c=a+b;
+
+	//int b=2*(3+4);
+
+	//printf("a=%d",a);
+
 
 ?>
 </body>

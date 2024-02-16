@@ -9,6 +9,7 @@
 
 struct SRCINFO
 {
+	std::string filename;
 	char* src;	//源代码内容
 	unsigned int size = 0;	//当前待处理文件长度
 };
@@ -20,6 +21,7 @@ enum TOKEN_TYPE
 	code,	//关键字
 	string,		//字符串
 	number,		//数字
+	opcode,		//操作符
 	//paren_open,		//左括号(
 	//paren_close,	//右括号)
 	//bracket_open,	//左中括号[
@@ -31,6 +33,15 @@ enum TOKEN_TYPE
 	//colon,		//冒号:
 	//equal,		//等号=
 	//define,		//常量预处理
+};
+std::vector<std::string> TOKEN_TYPE_STRING = 
+{
+	"noncode",
+	"preproc",
+	"code",
+	"string",
+	"number",
+	"opcode",
 };
 
 struct TOKEN
@@ -59,7 +70,7 @@ void token_echo(std::vector<TOKEN> tokens, std::string pre)
 	for (TOKEN token : tokens)
 	{
 		printf(pre.c_str());
-		printf("[r:%3d,c:%3d]%2d : %s\n", token.row_index+1, token.col_index, token.type, token.Value.c_str());
+		printf("[r:%3d,c:%3d]%2d(%s) : %s\n", token.row_index+1, token.col_index, token.type,TOKEN_TYPE_STRING[token.type], token.Value.c_str());
 	}
 }
 void token_echo(TOKEN token, std::string pre)
@@ -201,7 +212,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 							col_index++;
 					}
 				TOKEN token;
-				token.filename = srcinfo.src;
+				token.filename = srcinfo.filename;
 				token.type = TOKEN_TYPE::string;
 				token.Value = current;
 				token.row_index = begin_row_index;
@@ -247,8 +258,8 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 				if (!current.empty())
 				{
 					TOKEN token;
-					token.filename = srcinfo.src;
-					token.type = TOKEN_TYPE::code;
+					token.filename = srcinfo.filename;
+					token.type = TOKEN_TYPE::opcode;
 					token.Value = current;
 					token.row_index = row_index;
 					token.col_index = col_index;
@@ -273,7 +284,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 					current = src[0];
 
 					TOKEN token;
-					token.filename = srcinfo.src;
+					token.filename = srcinfo.filename;
 					//if (src[0] == '(')
 					//	token.type = TOKEN_TYPE::paren_open;
 					//else if (src[0] == ')')
@@ -295,7 +306,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 					//else if (src[0] == '=')
 					//	token.type = TOKEN_TYPE::equal;
 					//else
-						token.type = TOKEN_TYPE::code;
+						token.type = TOKEN_TYPE::opcode;
 					token.Value = current;
 					token.row_index = row_index;
 					token.col_index = col_index;
@@ -337,7 +348,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 			if (!current.empty())
 			{
 				TOKEN token;
-				token.filename = srcinfo.src;
+				token.filename = srcinfo.filename;
 				if (isdigit(current[0]))
 					token.type = TOKEN_TYPE::number;
 				else if (token.Value.starts_with("#"))
@@ -385,7 +396,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 			if (!current.empty())
 			{
 				TOKEN token;
-				token.filename = srcinfo.src;
+				token.filename = srcinfo.filename;
 				token.type = TOKEN_TYPE::noncode;
 				token.Value = current;
 				token.row_index = begin_row_index;

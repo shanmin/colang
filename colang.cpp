@@ -297,12 +297,12 @@ llvm::Value* ir_value(std::vector<TOKEN>& tokens, IR_INFO& ir_info)
 //}
 
 //解析一个指定的co文件到bc格式
-int cm2bc(const char* cmfilename)
+int co2bc(const char* filename)
 {
 	SRCINFO srcinfo;
 
 	//读取源文件内容
-	FILE* fp = fopen(cmfilename, "rb");
+	FILE* fp = fopen(filename, "rb");
 	if (fp == NULL)
 	{
 		printf("ERROR: input file open fail.");
@@ -310,6 +310,7 @@ int cm2bc(const char* cmfilename)
 	}
 	fseek(fp, 0, SEEK_END);
 	srcinfo.size = ftell(fp);
+	srcinfo.filename = filename;
 	srcinfo.src = (char*)malloc(srcinfo.size + 1);
 	if (srcinfo.src == NULL)
 	{
@@ -339,8 +340,7 @@ int cm2bc(const char* cmfilename)
 
 	//IR
 	printf("\n---------- IR ----------\n");
-	
-	ir(ast_list,cmfilename);
+	ir(ast_list,filename);
 	//IR_INFO ir_info;
 	////ir_info.context = llvm::LLVMContext();
 	//ir_info.module =new llvm::Module(cmfilename, ir_info.context);
@@ -372,7 +372,7 @@ int main(int argc, char** argv)
 	//InitializeNativeTargetAsmPrinter();
 	//InitializeNativeTargetAsmParser();
 
-	cm2bc(argv[1]);
+	co2bc(argv[1]);
 	//const char* filename = "test/test1.cm";
 	//cm2bc(filename);
 
