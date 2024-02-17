@@ -19,7 +19,7 @@ void ErrorExit(const char* str, std::vector<AST>& ast_list)
 struct VAR_INFO
 {
 	llvm::Type* type;
-	llvm::Value* value;
+	llvm::AllocaInst* value;
 };
 struct VAR_LIST
 {
@@ -125,20 +125,6 @@ llvm::Type* irtype(std::vector<TOKEN>& tokens, IRINFO& irinfo)
 	}
 	return type;
 }
-llvm::Value* irvalue(std::vector<TOKEN>& tokens, IRINFO& irinfo)
-{
-	llvm::Value* ret;
-	for (TOKEN t : tokens)
-		if (t.type == TOKEN_TYPE::string)
-		{
-			ret = irinfo.builder->CreateGlobalStringPtr(t.Value);
-			tokens.erase(tokens.begin());
-			break;
-		}
-		else
-			ErrorExit("未识别的值", tokens);
-	return ret;
-}
 
 std::map<std::string,int> IR_EXPR_PRI =
 {
@@ -159,7 +145,7 @@ struct IR_EXPR
 	llvm::Value* right_value=NULL;
 };
 //查找变量
-llvm::Value* ir_var(std::string name,std::vector<VAR_LIST> var_list)
+VAR_INFO ir_var(std::string name,std::vector<VAR_LIST> var_list,std::vector<TOKEN> tokens)
 {
 	//从下往上查找变量定义
 	while (!var_list.empty())
@@ -167,13 +153,21 @@ llvm::Value* ir_var(std::string name,std::vector<VAR_LIST> var_list)
 		VAR_LIST vlist = var_list.back();
 		var_list.pop_back();
 
+		if (vlist.info.find(name) == vlist.info.end())
+			ErrorExit("ERROR: 变量不存在", tokens);
 		VAR_INFO vinfo = vlist.info[name];
 		if (vinfo.value)
 		{
-			return vinfo.value;
+			return vinfo;
 		}
 	}
 }
+//读取变量值
+llvm::Value* ir_var_load(VAR_INFO& var_info,IRINFO& irinfo)
+{
+	return irinfo.builder->CreateLoad(var_info.type, var_info.value);
+}
+
 //表达式转为值类型
 void ir_value(IR_EXPR& current, IRINFO& irinfo)
 {
@@ -211,7 +205,8 @@ void ir_value(IR_EXPR& current, IRINFO& irinfo)
 	}
 	else
 	{
-		current.right_value = ir_var(current.right.value["value"][0].Value,irinfo.varlist);
+		VAR_INFO vinfo = ir_var(current.right.value["value"][0].Value, irinfo.varlist, current.right.value["value"]);
+		current.right_value =ir_var_load( vinfo,irinfo);
 		if(current.right_value==NULL)
 			ErrorExit("未识别的表达式类型", current.right.value["value"]);
 	}
@@ -266,6 +261,7 @@ llvm::Value* ir_expr(std::vector<AST>& ast_list, IRINFO& irinfo)
 		{
 			prev->right_value = current->right_value;
 			VAR_INFO var_info = irinfo.varlist[irinfo.varlist.size() - 1].info[prev->right.value["value"][0].Value];
+
 			irinfo.builder->CreateStore(prev->right_value, var_info.value);
 			value=current->right_value;
 			expr_list.erase(expr_list.begin() + index - 1);
@@ -275,23 +271,24 @@ llvm::Value* ir_expr(std::vector<AST>& ast_list, IRINFO& irinfo)
 		ir_value(*prev,irinfo);
 		if (current->op.value["value"][0].Value == "+")
 		{
-			llvm::Type* type1 = llvm::Type::getInt32Ty(irinfo.context);
-			llvm::Value* v1 = irinfo.builder->CreateAlloca(type1, 0, "v1");
-			llvm::Value* v1v = irinfo.builder->getInt32(123);
-			irinfo.builder->CreateStore(v1v,v1);
-
-			llvm::Value* v2 = irinfo.builder->CreateAlloca(type1, 0, "v2");
-			llvm::Value* v2v = irinfo.builder->getInt32(456);
-			irinfo.builder->CreateStore(v2v, v2);
-
-			llvm::Value* v3 = irinfo.builder->CreateAlloca(type1, 0, "v3");
-			llvm::Value* v3v= irinfo.builder->CreateAdd(v1v,v2v,"vvv");
-			irinfo.builder->CreateStore(v3v, v3);
-
-			//prev->right_value=
-			//irinfo.builder->CreateAdd(prev->right_value, current->right_value);
-			//std::cout << prev->right_value->getType() << std::endl;
-			//std::cout << current->right_value << std::endl;
+			if(prev->right_value->getType()!=current->right_value->getType())
+				ErrorExit("类型不一致", current->right.value["value"]);
+			prev->right_value=irinfo.builder->CreateAdd(prev->right_value, current->right_value);
+			expr_list.erase(expr_list.begin() + index - 1);
+		}
+		else if (current->op.value["value"][0].Value == "-")
+		{
+			prev->right_value = irinfo.builder->CreateSub(prev->right_value, current->right_value);
+			expr_list.erase(expr_list.begin() + index - 1);
+		}
+		else if (current->op.value["value"][0].Value == "*")
+		{
+			prev->right_value = irinfo.builder->CreateMul(prev->right_value, current->right_value);
+			expr_list.erase(expr_list.begin() + index - 1);
+		}
+		else if (current->op.value["value"][0].Value == "/")
+		{
+			prev->right_value = irinfo.builder->CreateSDiv(prev->right_value, current->right_value);
 			expr_list.erase(expr_list.begin() + index - 1);
 		}
 		else

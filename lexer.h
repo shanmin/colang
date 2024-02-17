@@ -3,56 +3,40 @@
 //
 #pragma once
 
-#include <string>
 #include <vector>
-#include "colang.h"
+#include <string>
 
 struct SRCINFO
 {
 	std::string filename;
 	char* src;	//源代码内容
-	unsigned int size = 0;	//当前待处理文件长度
 };
 
 enum TOKEN_TYPE
 {
 	noncode,	//非代码
-	preproc,	//预处理代码，以#开头的指令
-	code,	//关键字
+	code,		//代码
+	opcode,		//操作符
 	string,		//字符串
 	number,		//数字
-	opcode,		//操作符
-	//paren_open,		//左括号(
-	//paren_close,	//右括号)
-	//bracket_open,	//左中括号[
-	//bracket_close,	//右中括号]
-	//curly_open,		//左大括号{
-	//curly_close,	//右大括号}
-	//semicolon,	//分号;
-	//comma,		//逗号,
-	//colon,		//冒号:
-	//equal,		//等号=
-	//define,		//常量预处理
 };
 std::vector<std::string> TOKEN_TYPE_STRING = 
 {
 	"noncode",
-	"preproc",
-	"code",
-	"string",
-	"number",
-	"opcode",
+	"   code",
+	" opcode",
+	" string",
+	" number",
 };
 
 struct TOKEN
 {
-	TOKEN_TYPE type;
 	std::string filename;
-	std::string Value;
 	int row_index;	//所在行
 	int col_index;	//所在列
+	TOKEN_TYPE type;
+	std::string Value;
 };
-
 
 void ErrorExit(const char* str, std::vector<TOKEN>& tokens)
 {
@@ -65,18 +49,27 @@ void ErrorExit(const char* str, std::vector<TOKEN>& tokens)
 	exit(1);
 }
 
-void token_echo(std::vector<TOKEN> tokens, std::string pre)
-{
-	for (TOKEN token : tokens)
-	{
-		printf(pre.c_str());
-		printf("[r:%3d,c:%3d]%2d(%s) : %s\n", token.row_index+1, token.col_index, token.type,TOKEN_TYPE_STRING[token.type], token.Value.c_str());
-	}
-}
 void token_echo(TOKEN token, std::string pre)
 {
-		printf(pre.c_str());
-		printf("[r:%3d,c:%3d]%2d : %s\n", token.row_index+1, token.col_index, token.type, token.Value.c_str());
+	printf(pre.c_str());
+	printf("[r:%3d,c:%3d](%d:%s) : %s\n", token.row_index + 1, token.col_index, token.type, TOKEN_TYPE_STRING[token.type].c_str(), token.Value.c_str());
+}
+void token_echo(std::vector<TOKEN> tokens, std::string pre="")
+{
+	for (TOKEN token : tokens)
+		token_echo(token, pre);
+}
+
+//判断字符是否为单字符操作符
+bool is_opcode1(char c)
+{
+	return  c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c==';';
+}
+//判断字符是否为操作符字符
+bool is_opcode2(char c)
+{
+	return  c == '<' || c == '>' || c == '=' || c == ',' ||
+		c == '+' || c == '-' || c == '*' || c == '/' || c == '|' || c == '&' || c == '!';
 }
 
 //词法分析器
@@ -87,10 +80,10 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 	std::string current;
 	//读取源代码数据进行解析
 	bool iscode = false; //标识是否进入代码区
-	int row_index = 0; //当前处理的代码行号
-	int col_index = 0; //当前处理的代码列号
 	int begin_row_index = 0;//当前处理开始的行号
 	int begin_col_index = 0;//当前处理开始的列号
+	int row_index = 0; //当前处理的代码行号
+	int col_index = 0; //当前处理的代码列号
 
 	while (src[0] != 0)
 	{
@@ -114,7 +107,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 			{
 				iscode = false;
 				src += 2;
-				col_index+=2;
+				col_index += 2;
 				continue;
 			}
 
@@ -164,6 +157,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 						col_index++;
 					}
 				}
+				continue;
 			}
 
 			//判断字符串读取
@@ -223,112 +217,46 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 				continue;
 			}
 
-			//运算符
+			//运算操作符
 			if (current.empty())
 			{
-				//双运算符
-				if (src[0] == '=' && src[1] == '=') current = "==";
-				else if (src[0] == '>' && src[1] == '=') current = ">=";
-				else if (src[0] == '=' && src[1] == '>') current = ">=";
-				else if (src[0] == '<' && src[1] == '=') current = "<=";
-				else if (src[0] == '=' && src[1] == '<') current = "<=";
-				else if (src[0] == '!' && src[1] == '=') current = "!=";
-				else if (src[0] == '<' && src[1] == '>') current = "!=";
-				else if (src[0] == '>' && src[1] == '<') current = "!=";
-				else if (src[0] == '+' && src[1] == '=') current = "+=";
-				else if (src[0] == '-' && src[1] == '=') current = "-=";
-				else if (src[0] == '*' && src[1] == '=') current = "*=";
-				else if (src[0] == '/' && src[1] == '=') current = "/=";
-				else if (src[0] == '&' && src[1] == '=') current = "&=";
-				else if (src[0] == '|' && src[1] == '=') current = "|=";
-				else if (src[0] == '<' && src[1] == '<')
+				while (is_opcode1(src[0]))
 				{
-					if (src[2] == '=')
-						current = "<<=";
-					else
-						current = "<<";
+					current += src[0];
+					src++;
+					col_index++;
+					break;
 				}
-				else if (src[0] == '>' && src[1] == '>')
-				{
-					if (src[2] == '=')
-						current = ">>=";
-					else
-						current = ">>";
-				}
+				if (current.empty())
+					while (is_opcode2(src[0]))
+					{
+						current += src[0];
+						src++;
+						col_index++;
+					}
+				//运算符
 				if (!current.empty())
 				{
 					TOKEN token;
 					token.filename = srcinfo.filename;
+					token.row_index = row_index;
+					token.col_index = col_index;
 					token.type = TOKEN_TYPE::opcode;
 					token.Value = current;
-					token.row_index = row_index;
-					token.col_index = col_index;
 					tokens.push_back(token);
 
 					current = "";
-					src += 2;
-					col_index += 2;
-					continue;
-				}
-
-				if (src[0] == '=' || src[0] == '!' ||
-					src[0] == '+' || src[0] == '-' || src[0] == '*' || src[0] == '/' ||
-					src[0] == '|' || src[0] == '&' || src[0] == '%' || src[0] == '?' ||
-					src[0] == '<' || src[0] == '>' ||
-					src[0] == '(' || src[0] == ')' ||
-					src[0] == '[' || src[0] == ']' ||
-					src[0] == '{' || src[0] == '}' ||
-					src[0] == ',' || src[0] == ':' || src[0] == ';'
-					)
-				{
-					current = src[0];
-
-					TOKEN token;
-					token.filename = srcinfo.filename;
-					//if (src[0] == '(')
-					//	token.type = TOKEN_TYPE::paren_open;
-					//else if (src[0] == ')')
-					//	token.type = TOKEN_TYPE::paren_close;
-					//else if (src[0] == '[')
-					//	token.type = TOKEN_TYPE::bracket_open;
-					//else if (src[0] == ']')
-					//	token.type = TOKEN_TYPE::bracket_close;
-					//else if (src[0] == '{')
-					//	token.type = TOKEN_TYPE::curly_open;
-					//else if (src[0] == '}')
-					//	token.type = TOKEN_TYPE::curly_close;
-					//else if (src[0] == ';')
-					//	token.type = TOKEN_TYPE::semicolon;
-					//else if (src[0] == ',')
-					//	token.type = TOKEN_TYPE::comma;
-					//else if (src[0] == ':')
-					//	token.type = TOKEN_TYPE::colon;
-					//else if (src[0] == '=')
-					//	token.type = TOKEN_TYPE::equal;
-					//else
-						token.type = TOKEN_TYPE::opcode;
-					token.Value = current;
-					token.row_index = row_index;
-					token.col_index = col_index;
-					tokens.push_back(token);
-
-					current = "";
-					src++;
-					col_index++;
 					continue;
 				}
 			}
 
-			//关键字
+			//代码
 			while (src[0])
-				if (src[0] == ' ' || src[0] == '=' ||
-					src[0] == '+' || src[0] == '-' || src[0] == '*' || src[0] == '/' ||
+			{
+				if (is_opcode1(src[0]) || is_opcode2(src[0]) ||
+					src[0] == ' ' ||
 					src[0] == '|' || src[0] == '&' || src[0] == '%' || src[0] == '?' ||
-					src[0] == '<' || src[0] == '>' ||
-					src[0] == '(' || src[0] == ')' ||
-					src[0] == '[' || src[0] == ']' ||
-					src[0] == '{' || src[0] == '}' ||
-					src[0] == ',' || src[0] == ':' || src[0] == ';' || src[0] == 0 ||
+					src[0] == ',' || src[0] == ':' || src[0] == 0 ||
 					src[0] == '\t' || src[0] == '\r' || src[0] == '\n' || src[0] == '\\'
 					)
 				{
@@ -345,19 +273,18 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 					src++;
 					col_index++;
 				}
+			}
 			if (!current.empty())
 			{
 				TOKEN token;
 				token.filename = srcinfo.filename;
+				token.row_index = begin_row_index;
+				token.col_index = begin_col_index;
 				if (isdigit(current[0]))
 					token.type = TOKEN_TYPE::number;
-				else if (token.Value.starts_with("#"))
-					token.type = TOKEN_TYPE::preproc;
 				else
 					token.type = TOKEN_TYPE::code;
 				token.Value = current;
-				token.row_index = begin_row_index;
-				token.col_index = begin_col_index;
 				tokens.push_back(token);
 
 				current = "";
@@ -365,6 +292,7 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 		}
 		else
 		{
+			//读取非代码区内容
 			while (src[0] != 0)
 			{
 				//判断是否进入代码区
@@ -397,16 +325,16 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 			{
 				TOKEN token;
 				token.filename = srcinfo.filename;
-				token.type = TOKEN_TYPE::noncode;
-				token.Value = current;
 				token.row_index = begin_row_index;
 				token.col_index = begin_col_index;
+				token.type = TOKEN_TYPE::noncode;
+				token.Value = current;
 				tokens.push_back(token);
 			}
 			current = "";
 			iscode = true;	//进入代码区
 		}
-	}
+	}//while (src[0] != 0)
 }
 
 //	THE END
