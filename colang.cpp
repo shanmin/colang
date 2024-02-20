@@ -4,9 +4,7 @@
 
 #include <cstdio>
 #include <vector>
-#include "lexer.h"
-#include "ast.h"
-#include "ir.h"
+#include "colang.h"
 
 //解析一个指定的co文件到bc格式
 void co2bc(const char* filename)
@@ -37,13 +35,12 @@ void co2bc(const char* filename)
 	std::vector<TOKEN> tokens;
 	lexer(tokens, srcinfo);
 	printf("---------- Lexer ----------\n");
-    token_echo(tokens);
+    token_echo(tokens,"");
 
 	//语法分析
 	printf("\n---------- AST ----------\n");
-	std::vector<AST> ast_list = ast(tokens);
+	std::vector<AST*> ast_list = ast(tokens);
 	ast_echo(ast_list, "");
-
 
 	//IR
 	printf("\n---------- IR ----------\n");

@@ -2,9 +2,9 @@
 
 #pragma once
 
-#include <iostream>
 #include "lexer.h"
-
+#include "ast.h"
+#include "ir.h"
 
 
 //	THE END
