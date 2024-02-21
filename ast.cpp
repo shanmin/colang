@@ -75,6 +75,7 @@ llvm::Type* ir_type(std::vector<TOKEN>& tokens)
 
 	llvm::Type* type = NULL;
 	if (name == "void") type = llvm::Type::getVoidTy(ir_context);
+	if (name == "int1" || name == "bool") type = llvm::Type::getInt1Ty(ir_context);
 	if (name == "int8" || name == "byte" || name == "char") type = llvm::Type::getInt8Ty(ir_context);
 	if (name == "int8*" || name == "byte*" || name == "char*") type = llvm::Type::getInt8PtrTy(ir_context);
 	if (name == "int16" || name == "short") type = llvm::Type::getInt16Ty(ir_context);
@@ -125,6 +126,20 @@ VAR_INFO ir_var(std::string name, std::vector<VAR_LIST> var_list, TOKEN token)
 llvm::Value* ir_var_load(VAR_INFO& var_info)
 {
 	return ir_builder->CreateLoad(var_info.type, var_info.value);
+}
+
+//类型转换
+llvm::Value* ir_type_conver(llvm::Value* value,llvm::Type* to)
+{
+	llvm::Type* src = value->getType();
+	if (src == to)
+		return value;
+	if (src->isIntegerTy())
+		if (to->isIntegerTy(1))
+			return ir_builder->getInt1(value != 0);
+	
+	printf("ERR! type conver!");
+	exit(1);
 }
 
 std::map<std::string,int> IR_EXPR_PRI =
@@ -180,7 +195,7 @@ AST* ast_parse_expr(std::vector<TOKEN>& tokens, int left_pri = 0, AST* left = NU
 		AST* right = ast_parse_expr1(tokens);
 
 		int next_pri = 0;
-		if (tokens[0].type == TOKEN_TYPE::opcode)
+		if (!tokens.empty() && tokens[0].type == TOKEN_TYPE::opcode)
 		{
 			if (IR_EXPR_PRI.find(tokens[0].Value) != IR_EXPR_PRI.end())
 				next_pri = IR_EXPR_PRI[tokens[0].Value];
@@ -305,6 +320,12 @@ AST_codeblock::AST_codeblock(std::vector<TOKEN>& tokens)
 	if (tokens[0].type == TOKEN_TYPE::opcode && tokens[0].Value == "{")
 		tokens.erase(tokens.begin());
 	body = ast(tokens);
+	//while (!tokens.empty())
+	//{
+	//	if (tokens[0].type != TOKEN_TYPE::string && tokens[0].Value == "}")
+	//		break;
+	//	body.push_back(ast1(tokens));
+	//}
 }
 void AST_codeblock::show(std::string pre)
 {
@@ -384,7 +405,7 @@ void AST_expr::show(std::string pre)
 {
 	std::cout<<pre << "#TYPE:expr" << std::endl;
 	std::cout << pre << " left:" << std::endl;
-	left->show(pre+"      ");
+	left->show(pre + "      ");
 	std::cout << pre << "   op:";
 	token_echo(op, "           ");
 	std::cout << pre << "right:" << std::endl;
@@ -546,11 +567,113 @@ llvm::Value* AST_function::codegen()
 		ir_varlist.push_back(varlist);
 
 		for (auto& a : body)
-			a.codegen();
+			a->codegen();
 
 		ir_varlist.pop_back();
 	}
 	return function;
+}
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// AST_if
+//
+////////////////////////////////////////////////////////////////////////////////
+
+
+AST_if::AST_if(std::vector<TOKEN>& tokens)
+{
+	//名称
+	name = tokens[0];
+	tokens.erase(tokens.begin());
+	//参数
+	if (tokens[0].Value == "(")
+		tokens.erase(tokens.begin());
+	else
+		ErrorExit("if定义参数部分解析错误", tokens);
+	
+	//解析参数
+	expr1 = ast_parse_expr1(tokens);
+	//while (!tokens.empty())
+	//	if (tokens[0].Value == ")")
+	//	{
+	//		break;
+	//	}
+	//	else
+	//	{
+	//		expr1.push_back(tokens[0]);
+	//		tokens.erase(tokens.begin());
+	//	}
+	//移除)
+	if (tokens[0].Value == ")")
+		tokens.erase(tokens.begin());
+	else
+		ErrorExit("if定义结束部分错误", tokens);
+	
+	//判断后续是否存在函数体
+	if (tokens[0].Value == ";")
+	{
+		tokens.erase(tokens.begin());
+		return;
+	}
+	thenbody = ast1(tokens);
+
+	if (tokens[0].Value == ";")
+	{
+		tokens.erase(tokens.begin());
+	}
+	if (!tokens.empty() && tokens[0].Value == "else")
+	{
+		tokens.erase(tokens.begin());
+		elsebody = ast1(tokens);
+	}
+
+}
+void AST_if::show(std::string pre)
+{
+	std::cout << pre << "#TYPE:if" << std::endl;
+	std::cout << pre << " expr1:";
+	expr1->show("");
+	if (thenbody)
+	{
+		std::cout << pre << " then:" << std::endl;
+		thenbody->show(pre + "      ");
+	}
+	if (elsebody)
+	{
+		std::cout << pre << " else:"<<std::endl;
+		elsebody->show(pre+"      ");
+	}
+	std::cout << std::endl;
+}
+llvm::Value* AST_if::codegen()
+{
+	llvm::BasicBlock* bb = ir_builder->GetInsertBlock();
+
+	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
+	llvm::BasicBlock* thenbb = llvm::BasicBlock::Create(ir_context, "",func);
+	llvm::BasicBlock* elsebb = llvm::BasicBlock::Create(ir_context, "",func);
+	llvm::BasicBlock* enddbb = llvm::BasicBlock::Create(ir_context, "",func);
+
+	llvm::Value* expr1v = ir_type_conver(expr1->codegen(), llvm::Type::getInt1Ty(ir_context));
+	//expr1v = ir_builder->getInt1(true);
+	ir_builder->CreateCondBr(expr1v, thenbb, elsebb);
+
+	ir_builder->SetInsertPoint(thenbb);
+	if(thenbody)
+		thenbody->codegen();
+	ir_builder->CreateBr(enddbb);
+
+	ir_builder->SetInsertPoint(elsebb);
+	if(elsebody)
+		elsebody->codegen();
+	ir_builder->CreateBr(enddbb);
+
+	ir_builder->SetInsertPoint(enddbb);
+
+	return nullptr;
 }
 
 
@@ -685,82 +808,91 @@ llvm::Value* AST_var::codegen()
 ////////////////////////////////////////////////////////////////////////////////
 
 
-std::vector<AST*> ast(std::vector<TOKEN>& tokens)
+//AST解析
+//	oneblock 只解析一段
+AST* ast1(std::vector<TOKEN>& tokens)
 {
-	std::vector<AST*> ast_list;
 	while (!tokens.empty())
 	{
 		if (tokens[0].type == TOKEN_TYPE::noncode)//非代码，直接输出
 		{
-			ast_list.push_back(new AST_noncode(tokens));
-			continue;
+			return new AST_noncode(tokens);
 		}
 
-		if (tokens[0].type == TOKEN_TYPE::string)
-		{
-			//ast_list.push_back(new AST_expr(tokens));
-			ast_list.push_back(ast_parse_expr(tokens));
-			continue;
-		}
+		//if (tokens[0].type == TOKEN_TYPE::string)
+		//{
+		//	return ast_parse_expr(tokens);
+		//}
 
 		if (tokens[0].type != TOKEN_TYPE::string)
 		{
 			if (tokens[0].Value == "{")
 			{
-				ast_list.push_back(new AST_codeblock(tokens));
-				continue;
+				return new AST_codeblock(tokens);
 			}
 			else if (tokens[0].Value == "}")
 			{
-				tokens.erase(tokens.begin());
-				break;
+				//tokens.erase(tokens.begin());
+				return NULL;
 			}
 			else if (tokens[0].Value == ";")
 			{
 				tokens.erase(tokens.begin());
-				continue;
+				return NULL;
+			}
+
+			if (tokens[0].Value == "if" && tokens[1].Value == "(")
+			{
+				return new AST_if(tokens);
+			}
+
+			//Function
+			//	Ex: int function_name(int arg1)
+			//		 |		|              + args
+			//       |      + 函数名称
+			//       +  返回值类型
+			//判断依据：当前为字符，下一个token是一个字符，再下一个是(
+			if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code && tokens[2].type == TOKEN_TYPE::opcode && tokens[2].Value == "(")
+			{
+				return new AST_function(tokens);
+			}
+
+			//函数调用
+			//Ex:	printf("abc");
+			if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::opcode && tokens[1].Value == "(")
+			{
+				return new AST_call(tokens);
+			}
+
+			//变量定义
+			//Ex:	int a;
+			//		int b=2;
+			if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code && tokens[1].Value != "(")
+			{
+				return new AST_var(tokens);
 			}
 		}
 
-		//Function
-		//	Ex: int function_name(int arg1)
-		//		 |		|              + args
-		//       |      + 函数名称
-		//       +  返回值类型
-		//判断依据：当前为字符，下一个token是一个字符，再下一个是(
-		if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code && tokens[2].type == TOKEN_TYPE::opcode && tokens[2].Value == "(")
-		{
-			ast_list.push_back(new AST_function(tokens));
-			continue;
-		}
-
-		//函数调用
-		//Ex:	printf("abc");
-		if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::opcode && tokens[1].Value == "(")
-		{
-			ast_list.push_back(new AST_call(tokens));
-			continue;
-		}
-
-		//变量定义
-		//Ex:	int a;
-		//		int b=2;
-		if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code && tokens[1].Value != "(")
-		{
-			ast_list.push_back(new AST_var(tokens));
-			continue;
-		}
-
 		//ast_list.push_back(new AST_expr(tokens));
-		ast_list.push_back(ast_parse_expr(tokens));
-		continue;
-
-		std::cout << "未处理标识:" << tokens[0].Value << std::endl;
-		tokens.erase(tokens.begin());
+		return ast_parse_expr(tokens);
+	}
+}
+std::vector<AST*> ast(std::vector<TOKEN>& tokens)
+{
+	std::vector<AST*> ast_list;
+	while (!tokens.empty())
+	{
+		if (tokens[0].type != TOKEN_TYPE::string && tokens[0].Value == "}")
+		{
+			tokens.erase(tokens.begin());
+			break;
+		}
+		AST* a = ast1(tokens);
+		if (a)
+			ast_list.push_back(a);
 	}
 	return ast_list;
 }
-
 void ast_echo(std::vector<AST*> ast_list, std::string pre)
 {
 	for (AST* a : ast_list)

@@ -61,18 +61,6 @@ llvm::Type* ir_type(std::vector<TOKEN>& tokens);
 
 
 //
-////表达式转为值类型
-//void ir_value(IR_EXPR& current, IRINFO& irinfo)
-//{
-
-//}
-////表达式处理
-//llvm::Value* ir_expr(std::vector<AST>& ast_list, IRINFO& irinfo)
-//{
-
-//}
-//
-//
 ////语法分析，并生成IR代码
 //void ir_proc(std::vector<AST>& ast_list,IRINFO& irinfo,bool ismain)
 //{

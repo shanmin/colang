@@ -20,7 +20,7 @@
 <body>
 <?
 
-	//printf("Hello World! %d+%d=%d\n",1,1,1+1);
+	printf("Hello World! %d+%d=%d\n",1,1,1+1);
 	{
 		printf("Hello World2!\n");
 	}
@@ -37,12 +37,12 @@
 	int g=a+b*c+d*e+f;
 	int h=1*(2+3)+4;
 
-	//printf("a=%d\n",a);
-	//printf("b=%d\n",b);
-	//printf("c=%d\n",c);
-	//printf("d=%d\n",d);
+	printf("a=%d\n",a);
+	printf("b=%d\n",b);
+	printf("c=%d\n",c);
+	printf("d=%d\n",d);
 	printf("e=%d\n",e);
-	//printf("f=%d\n",f+2);
+	printf("f=%d\n",f+2);
 
 	//int a1=1;
 	//short a2=2;
@@ -60,11 +60,26 @@
 
 	//printf("other");
 	
-
 	//if(a)
-	//{
-	//	printf("2:if true");
-	//}
+	//	if(b)
+	//		printf("1b:if true");
+	//	else
+	//		printf("1b:if false");
+	//else
+	//	printf("1:if false");
+
+	int aa=0;
+	if(aa)
+	{
+		printf("2:if true");
+	}
+	else
+	{
+		printf("2:if false");
+	}
+
+	//if(a){}
+	//if(a);
 
 
 ?>

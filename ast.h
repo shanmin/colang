@@ -34,6 +34,7 @@ public:
 
 
 std::vector<AST*> ast(std::vector<TOKEN>& tokens);
+AST* ast1(std::vector<TOKEN>& tokens);
 
 
 class AST_noncode :public AST
@@ -73,11 +74,24 @@ class AST_function :public AST
 	std::vector<TOKEN> rett;
 	TOKEN name;
 	std::vector<TOKEN> args;
-	std::vector<AST> body;
+	std::vector<AST*> body;
 public:
 	llvm::Value* codegen() override;
 	void show(std::string pre) override;
 	AST_function(std::vector<TOKEN>& tokens);
+};
+
+
+class AST_if :public AST
+{
+	TOKEN name;
+	AST* expr1=NULL;
+	AST* thenbody=NULL;
+	AST* elsebody=NULL;
+public:
+	llvm::Value* codegen() override;
+	void show(std::string pre) override;
+	AST_if(std::vector<TOKEN>& tokens);
 };
 
 
