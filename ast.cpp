@@ -152,6 +152,35 @@ std::map<std::string,int> IR_EXPR_PRI =
 };
 
 
+//对++和--操作符进行处理
+AST* ast_parse_expr_add1(AST* old, std::vector<TOKEN>& tokens)
+{
+	if (tokens[0].type == TOKEN_TYPE::opcode && (tokens[0].Value == "++" || tokens[0].Value=="--"))
+	{
+		TOKEN opa = tokens[0];
+		if(tokens[0].Value == "++")
+			opa.Value = "+";
+		else
+			opa.Value = "-";
+
+		TOKEN code1 = tokens[0];
+		code1.type = TOKEN_TYPE::number;
+		code1.Value = "1";
+		AST_value* value1 = new AST_value(code1);
+
+		AST* add = new AST_expr(old, opa, value1);
+
+		TOKEN ope = tokens[0];
+		ope.Value = "=";
+
+		AST* ret = new AST_expr(old, ope, add);
+
+		tokens.erase(tokens.begin());
+
+		return ret;
+	}
+	return old;
+}
 //读取一个表达式
 AST* ast_parse_expr1(std::vector<TOKEN>& tokens);
 //解析表达式
@@ -169,6 +198,8 @@ AST* ast_parse_expr(std::vector<TOKEN>& tokens, int left_pri = 0, AST* left = NU
 		left = ast_parse_expr1(tokens);
 	}
 
+	left = ast_parse_expr_add1(left, tokens);
+
 	while (!tokens.empty())
 	{
 		int right_pri = 0;
@@ -181,8 +212,9 @@ AST* ast_parse_expr(std::vector<TOKEN>& tokens, int left_pri = 0, AST* left = NU
 				tokens.erase(tokens.begin());
 				return left;
 			}
-			if(tokens[0].Value==";" || tokens[0].Value==",")
+			if (tokens[0].Value == ";" || tokens[0].Value == ",")
 				return left;
+			
 			if (IR_EXPR_PRI.find(tokens[0].Value) == IR_EXPR_PRI.end())
 				ErrorExit("未识别的运算符", tokens);
 			right_pri = IR_EXPR_PRI[tokens[0].Value];
@@ -191,6 +223,43 @@ AST* ast_parse_expr(std::vector<TOKEN>& tokens, int left_pri = 0, AST* left = NU
 		}
 		if (right_pri < left_pri)
 			return left;
+
+		//if (tokens.size() > 2 && tokens[1].type == TOKEN_TYPE::opcode && tokens[1].Value == "++")
+		//{
+		//	std::vector<TOKEN> tmp;
+		//	{
+		//		TOKEN t=tokens[1];
+		//		t.Value = "(";
+		//		tmp.push_back(t);
+		//	}
+		//	tmp.push_back(tokens[0]);
+		//	{
+		//		TOKEN t = tokens[1];
+		//		t.Value = "=";
+		//		tmp.push_back(t);
+		//	}
+		//	tmp.push_back(tokens[0]);
+		//	{
+		//		TOKEN t = tokens[1];
+		//		t.Value = "+";
+		//		tmp.push_back(t);
+		//	}
+		//	{
+		//		TOKEN t = tokens[0];
+		//		t.type = TOKEN_TYPE::number;
+		//		t.Value = "1";
+		//		tmp.push_back(t);
+		//	}
+		//	{
+		//		TOKEN t = tokens[1];
+		//		t.Value = ")";
+		//		tmp.push_back(t);
+		//	}
+		//	//
+		//	tokens.erase(tokens.begin());
+		//	tokens.erase(tokens.begin());
+		//	tokens.insert(tokens.begin(), tmp.begin(),tmp.end());
+		//}
 
 		AST* right = ast_parse_expr1(tokens);
 
@@ -201,7 +270,7 @@ AST* ast_parse_expr(std::vector<TOKEN>& tokens, int left_pri = 0, AST* left = NU
 				next_pri = IR_EXPR_PRI[tokens[0].Value];
 		}
 
-		if(right_pri<next_pri)
+		if(right_pri<next_pri || op.Value=="=" && right_pri == next_pri)
 		{
 			right = ast_parse_expr(tokens, right_pri, right);
 			if (!right)
@@ -408,8 +477,11 @@ void AST_expr::show(std::string pre)
 	left->show(pre + "      ");
 	std::cout << pre << "   op:";
 	token_echo(op, "           ");
-	std::cout << pre << "right:" << std::endl;
-	right->show(pre+"      ");
+	if (right)
+	{
+		std::cout << pre << "right:" << std::endl;
+		right->show(pre + "      ");
+	}
 	std::cout << std::endl;
 }
 llvm::Value* AST_expr::codegen()
@@ -428,7 +500,9 @@ llvm::Value* AST_expr::codegen()
 	if (op.Value == "=")
 	{
 		VAR_INFO var_info = ir_var(((AST_value*)left)->value.Value, ir_varlist, ((AST_value*)left)->value);
-		return ir_builder->CreateStore(right->codegen(), var_info.value);
+		llvm::Value* ret = right->codegen();
+		ir_builder->CreateStore(ret, var_info.value);
+		return ret;
 	}
 
 	llvm::Value* l = left->codegen();
@@ -679,6 +753,97 @@ llvm::Value* AST_if::codegen()
 
 ////////////////////////////////////////////////////////////////////////////////
 //
+// AST_if
+//
+////////////////////////////////////////////////////////////////////////////////
+
+
+AST_for::AST_for(std::vector<TOKEN>& tokens)
+{
+	//名称
+	name = tokens[0];
+	tokens.erase(tokens.begin());
+	//参数
+	if (tokens[0].Value == "(")
+		tokens.erase(tokens.begin());
+	else
+		ErrorExit("for定义参数部分解析错误", tokens);
+
+	//解析参数
+	expr1 = ast_parse_expr1(tokens);
+	//移除;
+	if (tokens[0].Value == ";")
+		tokens.erase(tokens.begin());
+	else
+		ErrorExit("for定义部分1错误", tokens);
+
+	expr2 = ast_parse_expr1(tokens);
+	//移除;
+	if (tokens[0].Value == ";")
+		tokens.erase(tokens.begin());
+	else
+		ErrorExit("for定义部分2错误", tokens);
+
+	expr3 = ast_parse_expr1(tokens);
+	//移除)
+	if (tokens[0].Value == ")")
+		tokens.erase(tokens.begin());
+	else
+		ErrorExit("for定义部分3错误", tokens);
+
+	//判断后续是否存在函数体
+	if (tokens[0].Value == ";")
+	{
+		tokens.erase(tokens.begin());
+		return;
+	}
+	body = ast1(tokens);
+
+	if (tokens[0].Value == ";")
+	{
+		tokens.erase(tokens.begin());
+	}
+}
+void AST_for::show(std::string pre)
+{
+	std::cout << pre << "#TYPE:if" << std::endl;
+	std::cout << pre << " expr1:";
+	expr1->show("");
+	std::cout << pre << " expr2:";
+	expr2->show("");
+	std::cout << pre << " expr3:";
+	expr3->show("");
+	if (body)
+	{
+		std::cout << pre << " then:" << std::endl;
+		body->show(pre + "      ");
+	}
+	std::cout << std::endl;
+}
+llvm::Value* AST_for::codegen()
+{
+	llvm::BasicBlock* bb = ir_builder->GetInsertBlock();
+
+	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
+	llvm::BasicBlock* bodybb = llvm::BasicBlock::Create(ir_context, "", func);
+	llvm::BasicBlock* enddbb = llvm::BasicBlock::Create(ir_context, "", func);
+
+	expr1->codegen();
+
+	ir_builder->SetInsertPoint(bodybb);
+	llvm::Value* expr2v=expr2->codegen();
+	ir_builder->CreateCondBr(expr2v, bodybb, enddbb);
+	if(body)
+		body->codegen();
+	expr3->codegen();
+	ir_builder->SetInsertPoint(enddbb);
+
+	return nullptr;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+//
 // AST_noncode
 //
 ////////////////////////////////////////////////////////////////////////////////
@@ -845,6 +1010,8 @@ AST* ast1(std::vector<TOKEN>& tokens)
 			{
 				return new AST_if(tokens);
 			}
+
+			if (tokens[0].Value == "for" && tokens[1].Value == "(") return new AST_for(tokens);
 
 			//Function
 			//	Ex: int function_name(int arg1)

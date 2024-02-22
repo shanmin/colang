@@ -95,12 +95,27 @@ public:
 };
 
 
+class AST_for :public AST
+{
+	TOKEN name;
+	AST* expr1 = NULL;
+	AST* expr2 = NULL;
+	AST* expr3 = NULL;
+	AST* body = NULL;
+public:
+	llvm::Value* codegen() override;
+	void show(std::string pre) override;
+	AST_for(std::vector<TOKEN>& tokens);
+};
+
+
 class AST_value :public AST
 {
 public:
 	TOKEN value;
 	llvm::Value* codegen() override;
 	void show(std::string pre) override;
+	AST_value(TOKEN token) :value(token) {}
 	AST_value(std::vector<TOKEN>& tokens);
 };
 
