@@ -136,7 +136,10 @@ llvm::Value* ir_type_conver(llvm::Value* value,llvm::Type* to)
 		return value;
 	if (src->isIntegerTy())
 		if (to->isIntegerTy(1))
-			return ir_builder->getInt1(value != 0);
+		{
+			llvm::Value* i0= llvm::ConstantInt::get(src,0);
+			return ir_builder->CreateICmpNE(value, i0);
+		}
 	
 	printf("ERR! type conver!");
 	exit(1);
@@ -148,6 +151,12 @@ std::map<std::string,int> IR_EXPR_PRI =
 	{"/",30},
 	{"+",20},
 	{"-",20},
+	//{">",15},
+	//{"<",15},
+	{"==",15},
+	{"!=",15},
+	//{">=",15},
+	//{"<=",15},
 	{"=",10}
 };
 
@@ -198,7 +207,7 @@ AST* ast_parse_expr(std::vector<TOKEN>& tokens, int left_pri = 0, AST* left = NU
 		left = ast_parse_expr1(tokens);
 	}
 
-	left = ast_parse_expr_add1(left, tokens);
+	left = ast_parse_expr_add1(left, tokens); //对++和--操作符进行处理
 
 	while (!tokens.empty())
 	{
@@ -525,6 +534,9 @@ llvm::Value* AST_expr::codegen()
 	{
 		return ir_builder->CreateSDiv(l, r);
 	}
+	if (op.Value == "==") return ir_builder->CreateICmpEQ(l, r);
+	if (op.Value == "!=") return ir_builder->CreateICmpNE(l, r);
+
 	ErrorExit("不支持的运算符", op);
 }
 
@@ -669,7 +681,7 @@ AST_if::AST_if(std::vector<TOKEN>& tokens)
 		ErrorExit("if定义参数部分解析错误", tokens);
 	
 	//解析参数
-	expr1 = ast_parse_expr1(tokens);
+	expr1 = ast_parse_expr(tokens);
 	//while (!tokens.empty())
 	//	if (tokens[0].Value == ")")
 	//	{
@@ -680,11 +692,12 @@ AST_if::AST_if(std::vector<TOKEN>& tokens)
 	//		expr1.push_back(tokens[0]);
 	//		tokens.erase(tokens.begin());
 	//	}
-	//移除)
-	if (tokens[0].Value == ")")
-		tokens.erase(tokens.begin());
-	else
-		ErrorExit("if定义结束部分错误", tokens);
+	// 
+	////移除)
+	//if (tokens[0].Value == ")")
+	//	tokens.erase(tokens.begin());
+	//else
+	//	ErrorExit("if定义结束部分错误", tokens);
 	
 	//判断后续是否存在函数体
 	if (tokens[0].Value == ";")
@@ -770,21 +783,21 @@ AST_for::AST_for(std::vector<TOKEN>& tokens)
 		ErrorExit("for定义参数部分解析错误", tokens);
 
 	//解析参数
-	expr1 = ast_parse_expr1(tokens);
+	expr1 = ast_parse_expr(tokens);
 	//移除;
 	if (tokens[0].Value == ";")
 		tokens.erase(tokens.begin());
 	else
 		ErrorExit("for定义部分1错误", tokens);
 
-	expr2 = ast_parse_expr1(tokens);
+	expr2 = ast_parse_expr(tokens);
 	//移除;
 	if (tokens[0].Value == ";")
 		tokens.erase(tokens.begin());
 	else
 		ErrorExit("for定义部分2错误", tokens);
 
-	expr3 = ast_parse_expr1(tokens);
+	expr3 = ast_parse_expr(tokens);
 	//移除)
 	if (tokens[0].Value == ")")
 		tokens.erase(tokens.begin());
