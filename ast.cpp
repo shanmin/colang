@@ -68,29 +68,23 @@ void ir(std::vector<AST*>& ast_list, const char* filename)
 llvm::Type* ir_type(std::vector<TOKEN>& tokens)
 {
 	std::string name = tokens[0].Value;
-	if (tokens.size() > 1 && tokens[1].Value == "*")
-	{
-		name += "*";
-	}
 
 	llvm::Type* type = NULL;
 	if (name == "void") type = llvm::Type::getVoidTy(ir_context);
-	if (name == "int1" || name == "bool") type = llvm::Type::getInt1Ty(ir_context);
 	if (name == "int8" || name == "byte" || name == "char") type = llvm::Type::getInt8Ty(ir_context);
-	if (name == "int8*" || name == "byte*" || name == "char*") type = llvm::Type::getInt8PtrTy(ir_context);
 	if (name == "int16" || name == "short") type = llvm::Type::getInt16Ty(ir_context);
-	if (name == "int16*" || name == "short*") type = llvm::Type::getInt16PtrTy(ir_context);
 	if (name == "int32" || name == "int") type = llvm::Type::getInt32Ty(ir_context);
-	if (name == "int32*" || name == "int*") type = llvm::Type::getInt32PtrTy(ir_context);
+	if (name == "uint32" || name == "uint") type = llvm::Type::getInt32Ty(ir_context);
 	if (name == "int64" || name == "long") type = llvm::Type::getInt64Ty(ir_context);
-	if (name == "int64*" || name == "long*") type = llvm::Type::getInt64PtrTy(ir_context);
 	if (name == "float") type = llvm::Type::getFloatTy(ir_context);
-	if (name == "float*") type = llvm::Type::getFloatPtrTy(ir_context);
 	if (name == "double") type = llvm::Type::getDoubleTy(ir_context);
-	if (name == "double*") type = llvm::Type::getDoublePtrTy(ir_context);
 
 	if (type == NULL)
 		ErrorExit("数据类型定义错误", tokens);
+
+	//如果是指针，则转换指针类型
+	if (tokens.size() > 1 && tokens[1].Value == "*")
+		type = type->getPointerTo();
 
 	tokens.erase(tokens.begin());
 	if (tokens.size() > 0 && tokens[0].Value == "*")
@@ -151,17 +145,20 @@ std::map<std::string,int> IR_EXPR_PRI =
 	{"/",30},
 	{"+",20},
 	{"-",20},
-	//{">",15},
-	//{"<",15},
+	{">",15},
+	{"<",15},
+	{">=",15},
+	{"<=",15},
 	{"==",15},
 	{"!=",15},
-	//{">=",15},
-	//{"<=",15},
+	//{"&&",13},
+	//{"||",12},
 	{"=",10}
 };
 
 
 //对++和--操作符进行处理
+//	这里对a++改写为a=a+1
 AST* ast_parse_expr_add1(AST* old, std::vector<TOKEN>& tokens)
 {
 	if (tokens[0].type == TOKEN_TYPE::opcode && (tokens[0].Value == "++" || tokens[0].Value=="--"))
@@ -516,6 +513,7 @@ llvm::Value* AST_expr::codegen()
 
 	llvm::Value* l = left->codegen();
 	llvm::Value* r = right->codegen();
+	
 	if (l->getType() != r->getType())
 		ErrorExit("表达式两边类型不一致", op);
 	if (op.Value == "+")
@@ -534,6 +532,10 @@ llvm::Value* AST_expr::codegen()
 	{
 		return ir_builder->CreateSDiv(l, r);
 	}
+	if (op.Value == ">") return ir_builder->CreateICmpSGT(l, r);
+	if (op.Value == "<") return ir_builder->CreateICmpSLT(l, r);
+	if (op.Value == ">=") return ir_builder->CreateICmpSGE(l, r);
+	if (op.Value == "<=") return ir_builder->CreateICmpSLE(l, r);
 	if (op.Value == "==") return ir_builder->CreateICmpEQ(l, r);
 	if (op.Value == "!=") return ir_builder->CreateICmpNE(l, r);
 

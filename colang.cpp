@@ -6,6 +6,8 @@
 #include <vector>
 #include "colang.h"
 
+#pragma comment(lib,"ws2_32.lib")
+
 //解析一个指定的co文件到bc格式
 void co2bc(const char* filename)
 {
