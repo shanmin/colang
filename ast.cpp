@@ -9,7 +9,49 @@
 llvm::LLVMContext ir_context;
 llvm::Module* ir_module;
 std::unique_ptr<llvm::IRBuilder<>> ir_builder;
+
 std::vector<VAR_LIST> ir_varlist; //局部变量范围
+
+
+//截取到指定结束符前的所有token
+std::vector<TOKEN> get_tokens(std::vector<TOKEN>& tokens, std::string end)
+{
+	std::vector<TOKEN> ret;
+	if (end == ")")
+	{
+		int kh = 0;
+		while (tokens.size() > 0)
+		{
+			if (tokens[0].type == TOKEN_TYPE::opcode)
+			{
+				if (tokens[0].Value == "(")
+					kh++;
+				else if (tokens[0].Value == ")")
+					kh--;
+			}
+			if (kh >= 0)
+				ret.push_back(tokens[0]);
+			tokens.erase(tokens.begin());
+			if (kh < 0)
+				break;
+		}
+	}
+	//else if (end == "}")
+	//{
+
+	//}
+	//else if (end == ";")
+	//{
+
+	//}
+	//else if (end == "\"")
+	//{
+
+	//}
+	else
+		ErrorExit("不支持的结束符", tokens);
+	return ret;
+}
 
 
 void ir(std::vector<AST*>& ast_list, const char* filename)
@@ -41,6 +83,8 @@ void ir(std::vector<AST*>& ast_list, const char* filename)
 	bool result = llvm::verifyModule(*ir_module, &merr);
 	if (result)
 	{
+		ir_module->print(llvm::outs(), nullptr);
+		printf("\n---------- ERROR ----------\n");
 		printf("模块存在错误！%s", mstr.c_str());
 		exit(2);
 	}
@@ -64,33 +108,29 @@ void ir(std::vector<AST*>& ast_list, const char* filename)
 	printf("save=%x\n", ec.value());
 }
 
-
+//变量类型，从token中获取对应的实类型
 llvm::Type* ir_type(std::vector<TOKEN>& tokens)
 {
-	std::string name = tokens[0].Value;
-
 	llvm::Type* type = NULL;
-	if (name == "void") type = llvm::Type::getVoidTy(ir_context);
-	if (name == "int8" || name == "byte" || name == "char") type = llvm::Type::getInt8Ty(ir_context);
-	if (name == "int16" || name == "short") type = llvm::Type::getInt16Ty(ir_context);
-	if (name == "int32" || name == "int") type = llvm::Type::getInt32Ty(ir_context);
-	if (name == "uint32" || name == "uint") type = llvm::Type::getInt32Ty(ir_context);
-	if (name == "int64" || name == "long") type = llvm::Type::getInt64Ty(ir_context);
-	if (name == "float") type = llvm::Type::getFloatTy(ir_context);
-	if (name == "double") type = llvm::Type::getDoubleTy(ir_context);
+	std::string code = tokens[0].Value;
 
-	if (type == NULL)
-		ErrorExit("数据类型定义错误", tokens);
-
-	//如果是指针，则转换指针类型
-	if (tokens.size() > 1 && tokens[1].Value == "*")
-		type = type->getPointerTo();
-
+	if (code == "void") type = llvm::Type::getVoidTy(ir_context);
+	else if (code == "char") type = llvm::Type::getInt8Ty(ir_context);
+	else if (code == "short") type = llvm::Type::getInt16Ty(ir_context);
+	else if (code == "int") type = llvm::Type::getInt32Ty(ir_context);
+	else if (code == "long") type = llvm::Type::getInt64Ty(ir_context);
+	else if (code == "float") type = llvm::Type::getFloatTy(ir_context);
+	else if (code == "double") type = llvm::Type::getDoubleTy(ir_context);
+	else ErrorExit("数据类型定义错误", tokens);
+	
 	tokens.erase(tokens.begin());
+	//如果是指针，则转换指针类型
 	if (tokens.size() > 0 && tokens[0].Value == "*")
 	{
+		type = type->getPointerTo();
 		tokens.erase(tokens.begin());
 	}
+
 	return type;
 }
 
@@ -105,9 +145,7 @@ VAR_INFO ir_var(std::string name, std::vector<VAR_LIST> var_list, TOKEN token)
 
 		if (vlist.info.find(name) == vlist.info.end())
 		{
-			std::vector<TOKEN> tmp;
-			tmp.push_back(token);
-			ErrorExit("ERROR: 变量不存在", tmp);
+			continue;
 		}
 		VAR_INFO vinfo = vlist.info[name];
 		if (vinfo.value)
@@ -115,6 +153,9 @@ VAR_INFO ir_var(std::string name, std::vector<VAR_LIST> var_list, TOKEN token)
 			return vinfo;
 		}
 	}
+	std::vector<TOKEN> tmp;
+	tmp.push_back(token);
+	ErrorExit("ERROR: 变量不存在", tmp);
 }
 //读取变量值
 llvm::Value* ir_var_load(VAR_INFO& var_info)
@@ -360,10 +401,17 @@ void AST_call::show(std::string pre)
 {
 	std::cout << pre << "#TYPE:call" << std::endl;
 	std::cout << pre << " name:";
-	token_echo(name,"");
-	std::cout << pre << " args:" << std::endl;
+	token_echo(name,"           ");
+	std::cout << pre << " args:";
+	bool first = true;
 	for (auto a : args)
-		a->show(pre + "      ");
+		if (first)
+		{
+			a->show("");
+			first = false;
+		}
+		else
+			a->show(pre + "      ");
 	std::cout << std::endl;
 }
 llvm::Value* AST_call::codegen()
@@ -682,6 +730,9 @@ AST_if::AST_if(std::vector<TOKEN>& tokens)
 	else
 		ErrorExit("if定义参数部分解析错误", tokens);
 	
+	//std::vector<TOKEN> e = get_tokens(tokens, ")");
+	//expr1 = ast_parse_expr(e);
+
 	//解析参数
 	expr1 = ast_parse_expr(tokens);
 	//while (!tokens.empty())
@@ -700,7 +751,7 @@ AST_if::AST_if(std::vector<TOKEN>& tokens)
 	//	tokens.erase(tokens.begin());
 	//else
 	//	ErrorExit("if定义结束部分错误", tokens);
-	
+
 	//判断后续是否存在函数体
 	if (tokens[0].Value == ";")
 	{
@@ -723,8 +774,8 @@ AST_if::AST_if(std::vector<TOKEN>& tokens)
 void AST_if::show(std::string pre)
 {
 	std::cout << pre << "#TYPE:if" << std::endl;
-	std::cout << pre << " expr1:";
-	expr1->show("");
+	std::cout << pre << " expr:" << std::endl;
+	expr1->show(pre+"      ");
 	if (thenbody)
 	{
 		std::cout << pre << " then:" << std::endl;
@@ -739,7 +790,7 @@ void AST_if::show(std::string pre)
 }
 llvm::Value* AST_if::codegen()
 {
-	llvm::BasicBlock* bb = ir_builder->GetInsertBlock();
+	//llvm::BasicBlock* bb = ir_builder->GetInsertBlock();
 
 	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
 	llvm::BasicBlock* thenbb = llvm::BasicBlock::Create(ir_context, "",func);
@@ -747,7 +798,6 @@ llvm::Value* AST_if::codegen()
 	llvm::BasicBlock* enddbb = llvm::BasicBlock::Create(ir_context, "",func);
 
 	llvm::Value* expr1v = ir_type_conver(expr1->codegen(), llvm::Type::getInt1Ty(ir_context));
-	//expr1v = ir_builder->getInt1(true);
 	ir_builder->CreateCondBr(expr1v, thenbb, elsebb);
 
 	ir_builder->SetInsertPoint(thenbb);
@@ -756,7 +806,7 @@ llvm::Value* AST_if::codegen()
 	ir_builder->CreateBr(enddbb);
 
 	ir_builder->SetInsertPoint(elsebb);
-	if(elsebody)
+	if (elsebody)
 		elsebody->codegen();
 	ir_builder->CreateBr(enddbb);
 
@@ -768,7 +818,7 @@ llvm::Value* AST_if::codegen()
 
 ////////////////////////////////////////////////////////////////////////////////
 //
-// AST_if
+// AST_for
 //
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -800,11 +850,12 @@ AST_for::AST_for(std::vector<TOKEN>& tokens)
 		ErrorExit("for定义部分2错误", tokens);
 
 	expr3 = ast_parse_expr(tokens);
-	//移除)
-	if (tokens[0].Value == ")")
-		tokens.erase(tokens.begin());
-	else
-		ErrorExit("for定义部分3错误", tokens);
+	//）在上面表达式读取时已经移除
+	////移除)
+	//if (tokens[0].Value == ")")
+	//	tokens.erase(tokens.begin());
+	//else
+	//	ErrorExit("for定义部分3错误", tokens);
 
 	//判断后续是否存在函数体
 	if (tokens[0].Value == ";")
@@ -821,37 +872,88 @@ AST_for::AST_for(std::vector<TOKEN>& tokens)
 }
 void AST_for::show(std::string pre)
 {
-	std::cout << pre << "#TYPE:if" << std::endl;
-	std::cout << pre << " expr1:";
-	expr1->show("");
-	std::cout << pre << " expr2:";
-	expr2->show("");
-	std::cout << pre << " expr3:";
-	expr3->show("");
+	std::cout << pre << "#TYPE:for" << std::endl;
+	std::cout << pre << " expr1:" << std::endl;
+	expr1->show(pre+"      ");
+	std::cout << pre << " expr2:" << std::endl;
+	expr2->show(pre+"      ");
+	std::cout << pre << " expr3:" << std::endl;
+	expr3->show(pre+"      ");
 	if (body)
 	{
-		std::cout << pre << " then:" << std::endl;
+		std::cout << pre << " body:" << std::endl;
 		body->show(pre + "      ");
 	}
 	std::cout << std::endl;
 }
 llvm::Value* AST_for::codegen()
 {
-	llvm::BasicBlock* bb = ir_builder->GetInsertBlock();
+	//for (for1; for2; for3)
+	//	for4;
+	//
+	//for1
+	//if(for2) for4 else for3
+	//for4
+	//for3
+	//goto for2;
+
+	//llvm::BasicBlock* bb = ir_builder->GetInsertBlock();
 
 	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
-	llvm::BasicBlock* bodybb = llvm::BasicBlock::Create(ir_context, "", func);
-	llvm::BasicBlock* enddbb = llvm::BasicBlock::Create(ir_context, "", func);
+	llvm::BasicBlock* forexpr = llvm::BasicBlock::Create(ir_context, "", func);
+	llvm::BasicBlock* forbody = llvm::BasicBlock::Create(ir_context, "", func);
+	llvm::BasicBlock* forover = llvm::BasicBlock::Create(ir_context, "", func);
 
 	expr1->codegen();
+	ir_builder->CreateBr(forexpr); //必须有一个跳转，好让前面的BasicBlock结束
 
-	ir_builder->SetInsertPoint(bodybb);
-	llvm::Value* expr2v=expr2->codegen();
-	ir_builder->CreateCondBr(expr2v, bodybb, enddbb);
+	ir_builder->SetInsertPoint(forexpr);
+	llvm::Value* expr2v = ir_type_conver(expr2->codegen(), llvm::Type::getInt1Ty(ir_context));
+	ir_builder->CreateCondBr(expr2v, forbody, forover);
+
+	ir_builder->SetInsertPoint(forbody);
 	if(body)
 		body->codegen();
 	expr3->codegen();
-	ir_builder->SetInsertPoint(enddbb);
+	ir_builder->CreateBr(forexpr);
+	//ir_builder->CreateBr(forend);
+
+	ir_builder->SetInsertPoint(forover);
+	//ir_builder->SetInsertPoint(bb);
+
+	return nullptr;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// AST_label
+//
+////////////////////////////////////////////////////////////////////////////////
+
+
+AST_label::AST_label(std::vector<TOKEN>& tokens)
+{
+	//名称
+	name = tokens[0];
+	tokens.erase(tokens.begin());
+	//参数
+	if (tokens[0].Value == ":")
+		tokens.erase(tokens.begin());
+	else
+		ErrorExit("label定义参数部分解析错误", tokens);
+}
+void AST_label::show(std::string pre)
+{
+	std::cout << pre << "#TYPE:label    " << name.Value << std::endl << std::endl << std::endl;
+}
+llvm::Value* AST_label::codegen()
+{
+	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
+	llvm::BasicBlock* label = llvm::BasicBlock::Create(ir_context, "", func);
+
+	//ir_builder->SetInsertPoint(label);
+	
 
 	return nullptr;
 }
@@ -1026,6 +1128,9 @@ AST* ast1(std::vector<TOKEN>& tokens)
 				return new AST_if(tokens);
 			}
 
+			if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::opcode && tokens[1].Value == ":")
+				return new AST_label(tokens);
+
 			if (tokens[0].Value == "for" && tokens[1].Value == "(") return new AST_for(tokens);
 
 			//Function
@@ -1075,6 +1180,8 @@ std::vector<AST*> ast(std::vector<TOKEN>& tokens)
 	}
 	return ast_list;
 }
+
+
 void ast_echo(std::vector<AST*> ast_list, std::string pre)
 {
 	for (AST* a : ast_list)

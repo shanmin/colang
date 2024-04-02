@@ -22,6 +22,7 @@ struct VAR_INFO
 {
 	llvm::Type* type;
 	llvm::AllocaInst* value;
+	bool un; //是否为unsigned类型
 };
 struct VAR_LIST
 {
