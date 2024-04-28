@@ -9,9 +9,11 @@ if (POLICY CMP0141)
   set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
 endif()
 
-set(LLVM_PATH D:/svn/bp.shanmin.com/co/llvm-18.1.2)
+project ("colang")
 
-include_directories(${LLVM_PATH}/llvm-project-llvmorg-18.1.2/llvm/include)
+set(LLVM_PATH D:/svn/bp.shanmin.com/co/llvm-18.1.4)
+
+include_directories(${LLVM_PATH}/llvm-project-18.1.4.src/llvm/include)
 include_directories(${LLVM_PATH}/build/include)
 
 link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMX86TargetMCA.lib)
@@ -74,11 +76,8 @@ link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMTargetParser.lib)
 link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMSupport.lib)
 link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMDemangle.lib)
 
-
-project ("colang")
-
 # 将源代码添加到此项目的可执行文件。
-add_executable (colang "colang.cpp" "colang.h" "lexer.h" "ast.h"  "ir.h" "lexer.cpp" "ast.cpp" )
+add_executable (colang "colang.cpp" "colang.h" "lexer.cpp" "ast.cpp" "lexer.h" "ast.h")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET colang PROPERTY CXX_STANDARD 20)

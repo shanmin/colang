@@ -1,10 +1,13 @@
-﻿// cmlang.h
+﻿//
+// colang.h
+//
 
 #pragma once
 
 #include "lexer.h"
 #include "ast.h"
-#include "ir.h"
+
+SRCINFO loadfile(const char* filename);
 
 
 //	THE END

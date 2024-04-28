@@ -1,0 +1,82 @@
+<?
+#include "../../../colang.co"
+
+?><html>
+<head><title>colang test1</title></head>
+<body>
+<?
+	printf("Hello world!\n");
+	printf("你好!\n");
+
+	//值输出
+	printf("test a=%d\n",123);
+
+	//变量定义、赋值、输出测试
+	int a1;
+	a1=123;
+	printf("a1=%d\n",a1);
+
+	a1++;
+	printf("a1=%d\n",a1);
+
+	a1--;
+	printf("a1=%d\n",a1);
+
+	a1=a1+10;
+	printf("a1=%d\n",a1);
+
+	a1=a1-10;
+	printf("a1=%d\n",a1);
+
+	a1=a1*10;
+	printf("a1=%d\n",a1);
+	
+	a1=a1/10;
+	printf("a1=%d\n",a1);
+
+	if(a1==100)
+		printf("a1==100\n");
+	else
+		printf("a1!=100\n");
+
+	int i;
+	for(i=0;i<10;i++)
+	{
+		printf("for i=%d\n",i);
+	}
+
+	i=0;
+	while(i<10)
+	{
+		printf("while i=%d\n",i);
+		i++;
+	}
+
+	i=0;
+	while(i<10)
+		printf("while i=%d\n",i++);
+
+	i=0;
+	do
+	{
+		printf("do i=%d\n",i);
+		i++;
+	}while(i<10);
+
+	i=0;
+	do
+		printf("do i=%d\n",i++);
+	while(i<10)
+
+	i=0;
+	LABEL1:
+		printf("label1\n");
+	if(i==0)
+	{
+		i++;
+		//goto LABEL1;
+	}
+
+?>
+</body>
+</html>

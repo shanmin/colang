@@ -1,11 +1,10 @@
 //
-//	Lexer
+//	lexer.h
 //
 #pragma once
 
-#include <vector>
 #include <string>
-#include <iostream>
+#include <vector>
 
 struct SRCINFO
 {
@@ -34,16 +33,9 @@ struct TOKEN
 void ErrorExit(const char* str, std::vector<TOKEN>& tokens);
 void ErrorExit(const char* str, TOKEN token);
 
+void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo);
+bool lexer_prepare(std::vector<TOKEN>& tokens);
 void token_echo(TOKEN token, std::string pre);
 void token_echo(std::vector<TOKEN> tokens, std::string pre);
 
-//判断字符是否为单字符操作符
-bool is_opcode1(char c);
-//判断字符是否为操作符字符
-bool is_opcode2(char c);
-
-//词法分析器
-//	把源代码拆分为最小的token单元
-void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo);
-
-//	THE END
+//THE END
