@@ -80,6 +80,13 @@
 		goto LABEL1;
 	}
 
+	a1=15;
+	if(a1<10 || a1>20)
+		printf("a1<10 || a1>20");
+	if(a1>10 && a1<20)
+		printf("a1>10 && a1<20");
+	
+
 ?>
 </body>
 </html>

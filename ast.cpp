@@ -481,8 +481,8 @@ llvm::Value* AST_expr::codegen()
 	else if (op.Value == "<=") return ir_builder->CreateICmpSLE(l, r);
 	else if (op.Value == "==") return ir_builder->CreateICmpEQ(l, r);
 	else if (op.Value == "!=") return ir_builder->CreateICmpNE(l, r);
-	else if (op.Value == "&&") return ir_builder->CreateAnd(l, r);
-	else if (op.Value == "||") return ir_builder->CreateOr(l, r);
+	else if (op.Value == "&" or op.Value == "&&") return ir_builder->CreateAnd(l, r);
+	else if (op.Value == "|" or op.Value == "||") return ir_builder->CreateOr(l, r);
 
 	ErrorExit("不支持的运算符", op);
 }
