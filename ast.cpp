@@ -15,22 +15,23 @@ std::unique_ptr<llvm::IRBuilder<>> ir_builder;
 
 
 std::vector<VAR_LIST> ir_varlist; //局部变量范围
+std::vector<LABEL_LIST> ir_labellist; //局部标签
 
 std::map<std::string, int> IR_EXPR_PRI =
 {
-	{"*",30},
-	{"/",30},
-	{"+",20},
-	{"-",20},
-	{">",15},
-	{"<",15},
-	{">=",15},
-	{"<=",15},
-	{"==",15},
-	{"!=",15},
-	{"&&",13},
-	{"||",12},
-	{"=",10}
+	{"*",6},
+	{"/",6},
+	{"+",5},
+	{"-",5},
+	{">",4},
+	{"<",4},
+	{">=",4},
+	{"<=",4},
+	{"==",4},
+	{"!=",4},
+	{"&&",3},
+	{"||",2},
+	{"=",1}
 };
 
 
@@ -50,6 +51,9 @@ void ir(std::vector<AST*>& ast_list, const char* filename)
 	VAR_LIST varlist;
 	varlist.zone = "global";
 	ir_varlist.push_back(varlist);
+
+	LABEL_LIST labellist;
+	ir_labellist.push_back(labellist);
 
 	llvm::FunctionType* mainType = llvm::FunctionType::get(ir_builder->getInt32Ty(), false);
 	llvm::Function* main = llvm::Function::Create(mainType, llvm::GlobalValue::ExternalLinkage, "main", ir_module);
@@ -598,7 +602,6 @@ llvm::Value* AST_for::codegen()
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-
 AST_function::AST_function(std::vector<TOKEN>& tokens)
 {
 	//返回值
@@ -713,13 +716,75 @@ llvm::Value* AST_function::codegen()
 			varlist.info[faname[i]] = vi;
 		}
 		ir_varlist.push_back(varlist);
+		//当前标签域
+		LABEL_LIST lablelist;
+		ir_labellist.push_back(lablelist);
 
 		for (auto& a : body)
 			a->codegen();
 
+		//清理变量、标签作用域
 		ir_varlist.pop_back();
+		ir_labellist.pop_back();
 	}
 	return function;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// AST_goto
+//
+////////////////////////////////////////////////////////////////////////////////
+
+AST_goto::AST_goto(std::vector<TOKEN>& tokens)
+{
+	//返回值
+	tokens.erase(tokens.begin());
+	if (tokens[0].type == TOKEN_TYPE::code)
+	{
+		name = tokens[0];
+		tokens.erase(tokens.begin());
+	}
+	else
+		ErrorExit("goto部分解析错误", tokens);
+	
+	//if (tokens[0].Value == ";")
+	//	tokens.erase(tokens.begin());
+	//else
+	//	ErrorExit("goto部分结束符错误", tokens);
+}
+void AST_goto::show(std::string pre)
+{
+	std::cout << pre << "#TYPE:goto" << std::endl;
+	token_echo(name, pre + "");
+	std::cout << std::endl;
+}
+llvm::Value* AST_goto::codegen()
+{
+	llvm::BasicBlock* bbstart;
+	//如果goto在前，则前面已经创建这个标签了
+	LABEL_LIST labellist = ir_labellist.back();
+	if (labellist.info.find(name.Value) == labellist.info.end())
+	{
+		llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
+		bbstart = llvm::BasicBlock::Create(ir_context,name.Value, func);
+		ir_labellist[ir_labellist.size() - 1].info[name.Value] = bbstart;
+	}
+	else
+	{
+		bbstart =labellist.info[name.Value];
+	}
+	ir_builder->CreateBr(bbstart);
+
+	//goto后面要新常见一个basic block，否则会出现“Terminator found in the middle of a basic block!”错误信息
+	{
+		llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
+		llvm::BasicBlock* bbstart1 = llvm::BasicBlock::Create(ir_context,"", func);
+		ir_builder->SetInsertPoint(bbstart1);
+	}
+	
+	return nullptr;
 }
 
 
@@ -850,9 +915,19 @@ void AST_label::show(std::string pre)
 }
 llvm::Value* AST_label::codegen()
 {
-	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
-	llvm::BasicBlock* bbstart = llvm::BasicBlock::Create(ir_context, "", func);
-
+	llvm::BasicBlock* bbstart;
+	//如果goto在前，则前面已经创建这个标签了
+	LABEL_LIST labellist = ir_labellist.back();
+	if (labellist.info.find(name.Value) == labellist.info.end())
+	{
+		llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
+		bbstart = llvm::BasicBlock::Create(ir_context, name.Value, func);
+		ir_labellist[ir_labellist.size() - 1].info[name.Value] = bbstart;
+	}
+	else
+	{
+		bbstart = (llvm::BasicBlock*)labellist.info.find(name.Value)._Ptr;
+	}
 	ir_builder->CreateBr(bbstart);
 	ir_builder->SetInsertPoint(bbstart);
 
@@ -1178,6 +1253,7 @@ AST* ast1(std::vector<TOKEN>& tokens)
 
 			if (tokens[0].Value == "do") return new AST_do(tokens);
 			if (tokens[0].Value == "for" && tokens[1].Value == "(") return new AST_for(tokens);
+			if (tokens[0].Value == "goto") return new AST_goto(tokens);
 			if (tokens[0].Value == "if" && tokens[1].Value == "(") return new AST_if(tokens);
 			if (tokens[0].Value == "while" && tokens[1].Value == "(") return new AST_while(tokens);
 

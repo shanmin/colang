@@ -28,6 +28,10 @@ struct VAR_LIST
 	std::map<std::string, VAR_INFO> info; //name,type
 };
 
+struct LABEL_LIST
+{
+	std::map<std::string, llvm::BasicBlock*> info;
+};
 
 
 class AST
@@ -110,6 +114,16 @@ public:
 	llvm::Value* codegen() override;
 	void show(std::string pre) override;
 	AST_function(std::vector<TOKEN>& tokens);
+};
+
+
+class AST_goto :public AST
+{
+	TOKEN name;
+public:
+	llvm::Value* codegen() override;
+	void show(std::string pre) override;
+	AST_goto(std::vector<TOKEN>& tokens);
 };
 
 
