@@ -1,5 +1,5 @@
-﻿# CMakeList.txt: colang 的 CMake 项目，在此处包括源代码并定义
-# 项目特定的逻辑。
+﻿# CMakeList.txt: 顶层 CMake 项目文件，在此处执行全局配置
+# 并包含子项目。
 #
 cmake_minimum_required (VERSION 3.8)
 
@@ -11,76 +11,5 @@ endif()
 
 project ("colang")
 
-set(LLVM_PATH D:/svn/bp.shanmin.com/co/llvm-18.1.4)
-
-include_directories(${LLVM_PATH}/llvm-project-18.1.4.src/llvm/include)
-include_directories(${LLVM_PATH}/build/include)
-
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMX86TargetMCA.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMMCA.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMX86Disassembler.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMX86AsmParser.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMX86CodeGen.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMX86Desc.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMX86Info.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMMCDisassembler.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMGlobalISel.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMSelectionDAG.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMCFGuard.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMAsmPrinter.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMOrcJIT.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMPasses.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMIRPrinter.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMCoroutines.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMipo.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMInstrumentation.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMVectorize.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMLinker.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMFrontendOpenMP.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMCodeGen.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMScalarOpts.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMInstCombine.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMObjCARCOpts.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMCodeGenTypes.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMBitWriter.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMAggressiveInstCombine.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMTransformUtils.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMWindowsDriver.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMJITLink.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMOption.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMExecutionEngine.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMTarget.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMAnalysis.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMProfileData.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMSymbolize.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMDebugInfoBTF.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMDebugInfoPDB.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMDebugInfoMSF.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMDebugInfoDWARF.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMRuntimeDyld.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMOrcTargetProcess.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMOrcShared.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMObject.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMTextAPI.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMMCParser.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMIRReader.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMAsmParser.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMBitReader.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMMC.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMDebugInfoCodeView.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMCore.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMRemarks.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMBitstreamReader.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMBinaryFormat.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMTargetParser.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMSupport.lib)
-link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMDemangle.lib)
-
-# 将源代码添加到此项目的可执行文件。
-add_executable (colang "colang.cpp" "colang.h" "lexer.cpp" "ast.cpp" "lexer.h" "ast.h")
-
-if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET colang PROPERTY CXX_STANDARD 20)
-endif()
-
-# TODO: 如有需要，请添加测试并安装目标。
+# 包含子项目。
+add_subdirectory ("colang")

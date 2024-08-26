@@ -1,42 +1,33 @@
 ﻿//
 // colang
 //
-
 #include "colang.h"
 
 #pragma comment(lib,"ws2_32.lib")
 
-SRCINFO loadfile(const char* filename)
-{
-	SRCINFO srcinfo;
-	//读取源文件内容
-	FILE* fp = fopen(filename, "rb");
-	if (fp == NULL)
-	{
-		printf("ERROR: input file open fail.");
-		return srcinfo;
-	}
-	fseek(fp, 0, SEEK_END);
-	long size = ftell(fp);
-	srcinfo.filename = filename;
-	srcinfo.src = (char*)malloc(size + 1);
-	if (srcinfo.src == NULL)
-	{
-		printf("ERROR: out of memory");
-		return srcinfo;
-	}
-	fseek(fp, 0, SEEK_SET);
-	fread(srcinfo.src, 1, size, fp);
-	srcinfo.src[size] = 0;
-	fclose(fp);
 
-	return srcinfo;
+void ErrorExit(const char* str, TOKEN token)
+{
+	printf("\n---------- Error ----------\n%s\n\t  row: %d\n\t  col: %d\n\t type: %d\n\ttoken: %s\n",
+		str, token.row_index + 1, token.col_index, token.type, token.Value.c_str());
+	exit(1);
 }
+void ErrorExit(const char* str, std::vector<TOKEN>& tokens)
+{
+	if (tokens.size() == 0)
+		printf("\n---------- Error ----------\n%s\n", str);
+	else
+	{
+		ErrorExit(str, tokens[0]);
+	}
+	exit(1);
+}
+
 
 //解析一个指定的co文件到bc格式
 void co2bc(const char* filename)
 {
-	SRCINFO srcinfo=loadfile(filename);
+	SRCINFO srcinfo = loadsrc(filename);
 
 	//词法分析
 	std::vector<TOKEN> tokens;
@@ -57,6 +48,7 @@ void co2bc(const char* filename)
 	printf("\n---------- IR ----------\n");
 	ir(ast_list, filename);
 }
+
 
 int main(int argc, char** argv)
 {

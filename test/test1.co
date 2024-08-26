@@ -1,46 +1,42 @@
 <?
-#include "../../../colang.co"
+#include "../../../../colang/colang.co"
 
 ?><html>
-<head><title>colang test1</title></head>
+<head>
+<title>colang测试</title>
+</head>
 <body>
 <?
-	printf("Hello world!\n");
-	printf("你好!\n");
 
-	//值输出
-	printf("test a=%d\n",123);
+	//这个文件用于测试colang的基本语法
 
-	//变量定义、赋值、输出测试
-	int a1;
-	a1=123;
-	printf("a1=%d\n",a1);
+	/* 块注释测试 */
 
-	a1++;
-	printf("a1=%d\n",a1);
+	printf("Hello world! 你好\n"/*测试嵌入的注释块*/);
 
-	a1--;
-	printf("a1=%d\n",a1);
+	//测试32位整数定义及赋值
+	int a=1;
+	int b;
+	b=2;
+	printf("a=%d\tb=%d\n",a,b);
+	//测试常量及变量运算
+	a=1+b-3*40/5;
+	printf("a=1+b-3*40/5=%d\n",a);
 
-	a1=a1+10;
-	printf("a1=%d\n",a1);
+	//测试自增、自减
+	a++;
+	printf("a++=%d\n",a);
+	a--;
+	printf("a--=%d\n",a);
 
-	a1=a1-10;
-	printf("a1=%d\n",a1);
+	//a+=100;
+	//printf("a+=100=%d\n",a);
 
-	a1=a1*10;
-	printf("a1=%d\n",a1);
-	
-	a1=a1/10;
-	printf("a1=%d\n",a1);
-
-	//a1+=10;
-	//printf("a1+=10 = %d\n",a1);
-
-	if(a1==100)
-		printf("a1==100\n");
+	//测试if
+	if(a==100)
+		printf("if a==100\n");
 	else
-		printf("a1!=100\n");
+		printf("if a!=100\n");
 
 	int i;
 	for(i=0;i<10;i++)
@@ -80,13 +76,60 @@
 		goto LABEL1;
 	}
 
+	int a1=10;
 	a1=15;
 	if(a1<10 || a1>20)
 		printf("a1<10 || a1>20");
 	if(a1>10 && a1<20)
 		printf("a1>10 && a1<20");
 	
+	//void echo(char* str)
+	//{
+	//	printf(str);
+	//	return;
+	//}
+	//echo("echo\n");
 
+	//int echo2(char* str)
+	//{
+	//	int r=printf(str);
+	//	return r;
+	//}
+
+	//int echo3(char* str)
+	//{
+	//	return printf(str);
+	//}
+
+	int echo4(char* str)
+	{
+		int a=1;
+
+		int i;
+		for(i=0;i<10;i++)
+		{
+			//break;
+			//return 0;
+		}
+
+	//	if(a==1)
+	//		return 0;
+	//	else
+	//		return printf(str);
+
+		//if(a==1)
+		//	a=2;
+		//else
+		//	a=3;
+
+		return 0;
+	}
+
+	int zz=1;
+	//if(zz=1)
+	//	return 0;
+
+	int zx=2;
 ?>
 </body>
 </html>
