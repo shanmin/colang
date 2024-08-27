@@ -149,7 +149,8 @@ class AST_function :public AST
 	std::vector<TOKEN> rett;
 	TOKEN name;
 	std::vector<TOKEN> args;
-	std::vector<AST*> body;
+	//std::vector<AST*> body;
+	AST* body=NULL;
 public:
 	llvm::Value* codegen() override;
 	void show(std::string pre) override;

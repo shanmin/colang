@@ -43,12 +43,15 @@ AST_function::AST_function(std::vector<TOKEN>& tokens)
 		ErrorExit("函数定义结束部分错误", tokens);
 	//判断后续是否存在函数体
 	if (tokens[0].Value == ";")
-		tokens.erase(tokens.begin());
-	else if (tokens[0].Value == "{")
 	{
 		tokens.erase(tokens.begin());
-		body = ast(tokens);
-		//ErrorExit("函数体部分还未实现", tokens);
+	}
+	else if (tokens[0].Value == "{")
+	{
+		//tokens.erase(tokens.begin());
+		//body = ast(tokens);
+		////ErrorExit("函数体部分还未实现", tokens);
+		body = new AST_codeblock(tokens);
 	}
 	else
 		ErrorExit("函数定义解析错误", tokens);
@@ -64,12 +67,14 @@ void AST_function::show(std::string pre)
 	token_echo(name, pre);
 	std::cout << pre << " args:";
 	token_echo(args, pre + "      ");
-	if (!body.empty())
+	//if (!body.empty())
+	if(body)
 	{
 		std::cout << pre << " body:" << std::endl;
-		for (auto a : body)
-			//token_echo(body, pre + "      ");
-			a->show(pre + "    ");
+		//for (auto a : body)
+		//	//token_echo(body, pre + "      ");
+		//	a->show(pre + "    ");
+		body->show(pre+"    ");
 	}
 	std::cout << std::endl;
 }
@@ -111,14 +116,15 @@ llvm::Value* AST_function::codegen()
 		}
 	llvm::FunctionType* functionType = llvm::FunctionType::get(frtype, fatype, isVarArg);
 	llvm::Function* function = llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage, fname, ir_module);
-	////arg name
-	//unsigned i = 0;
-	//for (auto& a : function->args())
-	//{
-	//	if(faname[i]!="")
-	//		a.setName(faname[i]);
-	//}
-	if (!body.empty())
+	//////arg name
+	////unsigned i = 0;
+	////for (auto& a : function->args())
+	////{
+	////	if(faname[i]!="")
+	////		a.setName(faname[i]);
+	////}
+	//if (!body.empty())
+	if (body)
 	{
 		//设置当前变量作用域
 		scope::push("function");
@@ -165,8 +171,26 @@ llvm::Value* AST_function::codegen()
 
 		ir_builder->SetInsertPoint(entry);
 
-		for (auto& a : body)
-			a->codegen();
+		//for (auto& a : body)
+		//	a->codegen();
+		body->codegen();
+
+		//获取当前代码块最后一条指令，如果指令不是return或br则创建一个默认return指令
+		llvm::Instruction* last_instruction;
+		last_instruction = ir_builder->GetInsertBlock()->getTerminator();
+		if (last_instruction != NULL && (last_instruction->getOpcode() == llvm::Instruction::TermOps::Ret || last_instruction->getOpcode() == llvm::Instruction::TermOps::Br))
+		{
+		}
+		else
+			if (function->getReturnType()->isVoidTy())
+				ir_builder->CreateRetVoid();
+			else
+			{
+				if (function->getReturnType()->isIntOrPtrTy())
+					ir_builder->CreateRet(ir_builder->getIntN(function->getReturnType()->getIntegerBitWidth(), 0));
+				else
+					ErrorExit("ERROR: 函数未设置返回",this->name);
+			}
 
 		//清理变量、标签作用域
 		scope::pop();
