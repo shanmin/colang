@@ -57,6 +57,8 @@ AST_if::AST_if(std::vector<TOKEN>& tokens)
 	}
 
 }
+
+
 void AST_if::show(std::string pre)
 {
 	std::cout << pre << "#TYPE:if" << std::endl;
@@ -74,6 +76,8 @@ void AST_if::show(std::string pre)
 	}
 	std::cout << std::endl;
 }
+
+
 llvm::Value* AST_if::codegen()
 {
 	//llvm::BasicBlock* bb = ir_builder->GetInsertBlock();
@@ -97,12 +101,26 @@ llvm::Value* AST_if::codegen()
 		//		printf("\n---------- class name : %d ----------\n", llvm::ReturnInst::classof(cv));
 
 	}
-	ir_builder->CreateBr(enddbb);
+	llvm::Instruction* last_instruction;
+	//获取当前代码块最后一条指令，如果指令是return则不创建后面的br指令
+	last_instruction = ir_builder->GetInsertBlock()->getTerminator();
+	if(last_instruction!=NULL && last_instruction->getOpcode()== llvm::Instruction::TermOps::Ret)
+	{ }
+	else
+		ir_builder->CreateBr(enddbb);
 
 	ir_builder->SetInsertPoint(elsebb);
 	if (elsebody)
+	{
 		elsebody->codegen();
-	ir_builder->CreateBr(enddbb);
+	}
+	//获取当前代码块最后一条指令，如果指令是return则不创建后面的br指令
+	last_instruction = ir_builder->GetInsertBlock()->getTerminator();
+	if (last_instruction != NULL && last_instruction->getOpcode() == llvm::Instruction::TermOps::Ret)
+	{
+	}
+	else
+		ir_builder->CreateBr(enddbb); //这个结束跳转没有意义了
 
 	ir_builder->SetInsertPoint(enddbb);
 

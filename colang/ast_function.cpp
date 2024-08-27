@@ -137,14 +137,39 @@ llvm::Value* AST_function::codegen()
 		LABEL_LIST lablelist;
 		ir_labellist.push_back(lablelist);
 
+
 		llvm::BasicBlock* old = ir_builder->GetInsertBlock();
+		//创建进入标签
 		llvm::BasicBlock* entry = llvm::BasicBlock::Create(ir_context, "", function);
 		ir_builder->SetInsertPoint(entry);
 
-		
+		////创建 RETURN 返回值变量
+		//VAR_INFO return_val;
+		//if (!frtype->isVoidTy())
+		//{
+		//	return_val.type = frtype;
+		//	return_val.value = ir_builder->CreateAlloca(function->getReturnType(), NULL, NULL, "__co__RETURN_VAL");
+		//	varlist.info["__co__RETURN_VAL"] = return_val;
+		//}
+		//ir_varlist.push_back(varlist);
+
+		////创建 RETURN 标签
+		//llvm::BasicBlock* bb_return = llvm::BasicBlock::Create(ir_context, "__co__RETURN", function);
+		//ir_builder->SetInsertPoint(bb_return);
+		////提前插入返回指令
+		//if (frtype->isVoidTy())
+		//	ir_builder->CreateRetVoid();
+		//else
+		//{
+		//	llvm::Value* v=ir_var_load(return_val);
+		//	ir_builder->CreateRet(v);
+		//}
+
+		ir_builder->SetInsertPoint(entry);
 
 		for (auto& a : body)
 			a->codegen();
+
 
 		//return
 		//ir_builder->CreateRetVoid();

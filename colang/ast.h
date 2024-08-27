@@ -164,6 +164,7 @@ public:
 
 class AST_return :public AST
 {
+	TOKEN token;
 	AST* value = NULL;
 public:
 	llvm::Value* codegen() override;

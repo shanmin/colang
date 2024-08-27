@@ -18,6 +18,10 @@ AST_for::AST_for(std::vector<TOKEN>& tokens)
 		ErrorExit("for定义参数部分解析错误", tokens);
 
 	//解析参数
+	if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code && tokens[1].Value != "(")
+	{
+		new AST_var(tokens);
+	}
 	expr1 = ast_parse_expr(tokens);
 	//移除;
 	if (tokens[0].Value == ";")

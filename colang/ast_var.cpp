@@ -22,6 +22,7 @@ AST_var::AST_var(std::vector<TOKEN>& tokens)
 	if (tokens[1].Value == ";")
 		tokens.erase(tokens.begin());
 }
+
 void AST_var::show(std::string pre)
 {
 	std::cout << pre << "#TYPE:var" << std::endl;
@@ -31,6 +32,7 @@ void AST_var::show(std::string pre)
 	token_echo(name, pre);
 	std::cout << std::endl;
 }
+
 llvm::Value* AST_var::codegen()
 {
 	//创建声明变量的占位

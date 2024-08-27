@@ -17,6 +17,8 @@ AST_codeblock::AST_codeblock(std::vector<TOKEN>& tokens)
 	//	body.push_back(ast1(tokens));
 	//}
 }
+
+
 void AST_codeblock::show(std::string pre)
 {
 	std::cout << pre << "#TYPE:codeblock" << std::endl;
@@ -26,6 +28,8 @@ void AST_codeblock::show(std::string pre)
 	}
 	std::cout << std::endl;
 }
+
+
 llvm::Value* AST_codeblock::codegen()
 {
 	//设置当前变量作用域
@@ -38,10 +42,12 @@ llvm::Value* AST_codeblock::codegen()
 	//ir_builder->SetInsertPoint(bb);
 	//llvm::Value* bb = nullptr;
 
+	llvm::Value* ret = nullptr;
 	for (auto a : body)
-		a->codegen();
+		ret=a->codegen();
 
 	ir_varlist.pop_back();
 	//return bb;
-	return nullptr;
+	//return nullptr;
+	return ret;
 }

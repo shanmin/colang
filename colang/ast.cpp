@@ -423,6 +423,8 @@ llvm::Value* ir_type_conver(llvm::Value* value, llvm::Type* to)
 
 
 //查找变量
+//	name	变量名称
+//	var_list	变量列表
 VAR_INFO ir_var(std::string name, std::vector<VAR_LIST> var_list, TOKEN token)
 {
 	//if (name == "str")
