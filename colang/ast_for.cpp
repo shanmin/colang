@@ -20,7 +20,7 @@ AST_for::AST_for(std::vector<TOKEN>& tokens)
 	//解析参数
 	if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::code && tokens[1].Value != "(")
 	{
-		new AST_var(tokens);
+		var=new AST_var(tokens);
 	}
 	expr1 = ast_parse_expr(tokens);
 	//移除;
@@ -85,13 +85,19 @@ llvm::Value* AST_for::codegen()
 	//goto for2;
 
 	//llvm::BasicBlock* bb = ir_builder->GetInsertBlock();
+	
+	//因为在for里面会新定义变量，所以这里单独作用域 20240827 shanmin
+	scope::push("for");
 
 	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
 	llvm::BasicBlock* bbexpr = llvm::BasicBlock::Create(ir_context, "", func);
 	llvm::BasicBlock* bbbody = llvm::BasicBlock::Create(ir_context, "", func);
 	llvm::BasicBlock* bbover = llvm::BasicBlock::Create(ir_context, "", func);
 
-	expr1->codegen();
+	if (var)
+		var->codegen();
+	if(expr1)
+		expr1->codegen();
 	ir_builder->CreateBr(bbexpr); //必须有一个跳转，好让前面的BasicBlock结束
 
 	ir_builder->SetInsertPoint(bbexpr);
@@ -107,6 +113,8 @@ llvm::Value* AST_for::codegen()
 
 	ir_builder->SetInsertPoint(bbover);
 	//ir_builder->SetInsertPoint(bb);
+
+	scope::pop();
 
 	return nullptr;
 }

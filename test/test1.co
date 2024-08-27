@@ -29,8 +29,13 @@
 	a--;
 	printf("a--=%d\n",a);
 
-	//a+=100;
-	//printf("a+=100=%d\n",a);
+	//变量作用域测试
+	printf("新作用域之前 a=%d\n",a);
+	{
+		int a=200;
+		printf("新作用域之中 a=%d\n",a);
+	}
+	printf("新作用用之后 a=%d\n",a);
 
 	//测试if
 	if(a==100)
@@ -38,6 +43,7 @@
 	else
 		printf("if a!=100\n");
 
+	//测试while
 	int i=0;
 	while(i<10)
 	{
@@ -49,6 +55,7 @@
 	while(i<10)
 		printf("while i=%d\n",i++);
 
+	//测试do
 	i=0;
 	do
 	{
@@ -136,11 +143,10 @@
 	//测试函数调用及基本参数传递、for循环、全局变量与函数内同名变量的使用
 	int function_test2(int count)
 	{
-		int count=100;
+		int count1=100;
 		int sum=0;
-		//int i=0;
-		//for(int i=1;i<=count;i++)
-		//	sum=sum+i;
+		for(int i=1;i<=count1;i++)
+			sum=sum+i;
 		return sum;
 	}
 	printf("sum=%d\n",function_test2(100));

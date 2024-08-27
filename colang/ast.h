@@ -3,20 +3,21 @@
 //
 #pragma once
 
+#include <vector>
+
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Value.h>
 #include "llvm/IR/Verifier.h"
 
-
-struct VAR_INFO
+struct VARINFO
 {
-	llvm::Type* type; //变量类型
-	//llvm::AllocaInst* value;	//变量实例
+	std::string name;	//变量名称
+	llvm::Type* type;	//变量类型
 	llvm::Value* value;
-	bool un; //是否为unsigned类型
+	bool un;			//是否为unsigned类型
 };
-struct VAR_LIST
+struct VARLIST
 {
 	//变量范围
 	//	global		全局
@@ -24,7 +25,17 @@ struct VAR_LIST
 	//	codeblock	局部
 	std::string zone;
 	//变量列表
-	std::map<std::string, VAR_INFO> info; //name,type
+	std::map<std::string, VARINFO> info;
+};
+extern std::vector<VARLIST> varlist;
+//变量作用域
+class scope
+{
+public:
+	static void push(std::string zone);
+	static void pop();
+	static void set(VARINFO vi);
+	static VARINFO get(TOKEN token);
 };
 
 struct LABEL_LIST
@@ -37,7 +48,7 @@ extern std::unique_ptr<llvm::IRBuilder<>> ir_builder;
 extern llvm::Module* ir_module;
 extern llvm::LLVMContext ir_context;
 
-extern std::vector<VAR_LIST> ir_varlist; //局部变量范围
+//extern std::vector<VAR_LIST> ir_varlist; //局部变量范围
 extern std::vector<LABEL_LIST> ir_labellist; //局部标签
 
 
@@ -122,6 +133,7 @@ public:
 class AST_for :public AST
 {
 	TOKEN name;
+	AST* var = NULL;//变量定义
 	AST* expr1 = NULL;
 	AST* expr2 = NULL;
 	AST* expr3 = NULL;
@@ -223,8 +235,8 @@ llvm::Type* ir_type(std::vector<TOKEN>& tokens);
 llvm::Value* ir_type_conver(llvm::Value* value, llvm::Type* to);
 
 void ir(std::vector<AST*>& ast_list, const char* filename);
-VAR_INFO ir_var(std::string name, std::vector<VAR_LIST> var_list, TOKEN token);
-llvm::Value* ir_var_load(VAR_INFO& var_info);
+//VARINFO ir_var(std::string name, std::vector<VARLIST> var_list, TOKEN token);
+llvm::Value* ir_var_load(VARINFO& var_info);
 
 
 

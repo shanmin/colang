@@ -9,7 +9,8 @@ llvm::Module* ir_module;
 llvm::LLVMContext ir_context;
 
 
-std::vector<VAR_LIST> ir_varlist; //局部变量范围
+
+//std::vector<VAR_LIST> ir_varlist; //局部变量范围
 std::vector<LABEL_LIST> ir_labellist; //局部标签
 
 std::map<std::string, int> IR_EXPR_PRI =
@@ -73,7 +74,6 @@ AST* ast1(std::vector<TOKEN>& tokens)
 			}
 			else if (tokens[0].Value == "}")
 			{
-				//tokens.erase(tokens.begin());
 				return NULL;
 			}
 			else if (tokens[0].Value == ";")
@@ -311,10 +311,8 @@ void ir(std::vector<AST*>& ast_list, const char* filename)
 	ir_module = new llvm::Module(filename, ir_context);
 	ir_builder = std::make_unique<llvm::IRBuilder<>>((ir_context));
 
-	//设置当前变量作用域
-	VAR_LIST varlist;
-	varlist.zone = "global";
-	ir_varlist.push_back(varlist);
+	//设置当前全局变量作用域
+	scope::push("global");
 
 	LABEL_LIST labellist;
 	ir_labellist.push_back(labellist);
@@ -422,40 +420,40 @@ llvm::Value* ir_type_conver(llvm::Value* value, llvm::Type* to)
 
 
 
-//查找变量
-//	name	变量名称
-//	var_list	变量列表
-VAR_INFO ir_var(std::string name, std::vector<VAR_LIST> var_list, TOKEN token)
-{
-	//if (name == "str")
-	//	printf("aa");
-	// 
-	//从下往上查找变量定义
-	while (!var_list.empty())
-	{
-		VAR_LIST vlist = var_list.back();
-		var_list.pop_back();
-
-		if (vlist.info.find(name) == vlist.info.end())
-		{
-			continue;
-		}
-		VAR_INFO vinfo = vlist.info[name];
-		if (vinfo.value)
-		{
-			return vinfo;
-		}
-		//如果当前是function定义，则下一步转到全局变量 20240411 shanmin
-		if (vlist.zone == "function")
-			var_list.resize(1);
-	}
-	//
-	std::vector<TOKEN> tmp;
-	tmp.push_back(token);
-	ErrorExit("ERROR: 变量不存在", tmp);
-}
+////查找变量
+////	name	变量名称
+////	var_list	变量列表
+//VARINFO ir_var(std::string name, std::vector<VAR_LIST> var_list, TOKEN token)
+//{
+//	//if (name == "str")
+//	//	printf("aa");
+//	// 
+//	//从下往上查找变量定义
+//	while (!var_list.empty())
+//	{
+//		VAR_LIST vlist = var_list.back();
+//		var_list.pop_back();
+//
+//		if (vlist.info.find(name) == vlist.info.end())
+//		{
+//			continue;
+//		}
+//		VAR_INFO vinfo = vlist.info[name];
+//		if (vinfo.value)
+//		{
+//			return vinfo;
+//		}
+//		//如果当前是function定义，则下一步转到全局变量 20240411 shanmin
+//		if (vlist.zone == "function")
+//			var_list.resize(1);
+//	}
+//	//
+//	std::vector<TOKEN> tmp;
+//	tmp.push_back(token);
+//	ErrorExit("ERROR: 变量不存在", tmp);
+//}
 //读取变量值
-llvm::Value* ir_var_load(VAR_INFO& var_info)
+llvm::Value* ir_var_load(VARINFO& var_info)
 {
 	return ir_builder->CreateLoad(var_info.type, var_info.value);
 }

@@ -33,21 +33,13 @@ void AST_codeblock::show(std::string pre)
 llvm::Value* AST_codeblock::codegen()
 {
 	//设置当前变量作用域
-	VAR_LIST varlist;
-	varlist.zone = "codeblock";
-	ir_varlist.push_back(varlist);
-
-	//llvm::Function* TheFunction = ir_builder->GetInsertBlock()->getParent();
-	//llvm::BasicBlock* bb = llvm::BasicBlock::Create(ir_context,"codeblock",TheFunction);
-	//ir_builder->SetInsertPoint(bb);
-	//llvm::Value* bb = nullptr;
+	scope::push("codeblock");
 
 	llvm::Value* ret = nullptr;
 	for (auto a : body)
 		ret=a->codegen();
 
-	ir_varlist.pop_back();
-	//return bb;
-	//return nullptr;
+	scope::pop();
+
 	return ret;
 }

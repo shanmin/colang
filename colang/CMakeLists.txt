@@ -67,7 +67,7 @@ link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMSupport.lib)
 link_libraries(${LLVM_PATH}/build/Debug/lib/LLVMDemangle.lib)
 
 # 将源代码添加到此项目的可执行文件。
-add_executable (colang "colang.cpp" "colang.h" "lexer.cpp" "lexer.h" "ast.h" "ast.cpp" "ast_noncode.cpp" "ast_function.cpp" "ast_call.cpp" "ast_expr.cpp" "ast_value.cpp" "ast_var.cpp" "ast_codeblock.cpp" "ast_do.cpp" "ast_for.cpp" "ast_goto.cpp" "ast_if.cpp" "ast_label.cpp" "ast_return.cpp" "ast_while.cpp")
+add_executable (colang "colang.cpp" "colang.h" "lexer.cpp" "lexer.h" "ast.h" "ast.cpp" "ast_noncode.cpp" "ast_function.cpp" "ast_call.cpp" "ast_expr.cpp" "ast_value.cpp" "ast_var.cpp" "ast_codeblock.cpp" "ast_do.cpp" "ast_for.cpp" "ast_goto.cpp" "ast_if.cpp" "ast_label.cpp" "ast_return.cpp" "ast_while.cpp" "scope.cpp")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET colang PROPERTY CXX_STANDARD 20)

@@ -72,7 +72,7 @@ llvm::Value* AST_expr::codegen()
 	//ÅÐ¶Ï¸³Öµ²Ù×÷
 	if (op.Value == "=")
 	{
-		VAR_INFO var_info = ir_var(((AST_value*)left)->value.Value, ir_varlist, ((AST_value*)left)->value);
+		VARINFO var_info =scope::get(((AST_value*)left)->value);
 		llvm::Value* ret = right->codegen();
 		ir_builder->CreateStore(ret, var_info.value);
 		return ret;

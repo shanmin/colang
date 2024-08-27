@@ -36,10 +36,11 @@ void AST_var::show(std::string pre)
 llvm::Value* AST_var::codegen()
 {
 	//创建声明变量的占位
-	VAR_INFO var_info;
+	VARINFO var_info;
+	var_info.name = name.Value;
 	var_info.type = ir_type(type);
 	var_info.value = ir_builder->CreateAlloca(var_info.type);
-	ir_varlist[ir_varlist.size() - 1].info[name.Value] = var_info;
+	scope::set(var_info);
 	return var_info.value;
 }
 

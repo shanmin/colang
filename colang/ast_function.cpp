@@ -121,22 +121,20 @@ llvm::Value* AST_function::codegen()
 	if (!body.empty())
 	{
 		//设置当前变量作用域
-		VAR_LIST varlist;
-		varlist.zone = "function";
+		scope::push("function");
 		llvm::Function::arg_iterator args = function->arg_begin();
 		for (int i = 0; i < fatype.size(); i++)
 		{
-			VAR_INFO vi;
+			VARINFO vi;
+			vi.name = faname[i];
 			vi.type = fatype[i];
 			vi.value = args;// ir_builder->CreateAlloca(function->getArg(i)->getType(), function->getArg(i));
-			varlist.info[faname[i]] = vi;
+			scope::set(vi);
 			args++;
 		}
-		ir_varlist.push_back(varlist);
 		//当前标签域
 		LABEL_LIST lablelist;
 		ir_labellist.push_back(lablelist);
-
 
 		llvm::BasicBlock* old = ir_builder->GetInsertBlock();
 		//创建进入标签
@@ -170,16 +168,10 @@ llvm::Value* AST_function::codegen()
 		for (auto& a : body)
 			a->codegen();
 
-
-		//return
-		//ir_builder->CreateRetVoid();
-
 		//清理变量、标签作用域
-		ir_varlist.pop_back();
+		scope::pop();
 		ir_labellist.pop_back();
 		ir_builder->SetInsertPoint(old);
-
-		//ir_builder-
 	}
 	return function;
 }

@@ -101,7 +101,7 @@ llvm::Value* AST_value::codegen()
 	//{
 
 	//≤È’“±‰¡ø
-	VAR_INFO vinfo = ir_var(value.Value, ir_varlist, value);
+	VARINFO vinfo = scope::get(value);
 	return ir_var_load(vinfo);
 
 	//if(current.right_value==NULL)
