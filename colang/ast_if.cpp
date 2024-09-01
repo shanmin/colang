@@ -45,6 +45,9 @@ AST_if::AST_if(std::vector<TOKEN>& tokens)
 		return;
 	}
 	thenbody = ast1(tokens);
+	
+	if (tokens.empty())
+		return;
 
 	if (tokens[0].Value == ";")
 	{

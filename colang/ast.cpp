@@ -56,7 +56,7 @@ std::vector<AST*> ast(std::vector<TOKEN>& tokens)
 
 
 //AST解析
-//	oneblock 只解析一段
+//	oneblock 只解析一段，直到“}”或“;”结尾为止。
 AST* ast1(std::vector<TOKEN>& tokens)
 {
 	while (!tokens.empty())

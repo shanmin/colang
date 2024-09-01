@@ -128,16 +128,8 @@ llvm::Value* AST_function::codegen()
 	{
 		//设置当前变量作用域
 		scope::push("function");
-		llvm::Function::arg_iterator args = function->arg_begin();
-		for (int i = 0; i < fatype.size(); i++)
-		{
-			VARINFO vi;
-			vi.name = faname[i];
-			vi.type = fatype[i];
-			vi.value = args;// ir_builder->CreateAlloca(function->getArg(i)->getType(), function->getArg(i));
-			scope::set(vi);
-			args++;
-		}
+
+
 		//当前标签域
 		LABEL_LIST lablelist;
 		ir_labellist.push_back(lablelist);
@@ -170,6 +162,27 @@ llvm::Value* AST_function::codegen()
 		//}
 
 		ir_builder->SetInsertPoint(entry);
+
+		//处理函数接收的变量
+		llvm::Function::arg_iterator args = function->arg_begin();
+		for (int i = 0; i < fatype.size(); i++)
+		{
+			//创建声明变量的占位
+			VARINFO var_info;
+			var_info.name = faname[i];
+			var_info.type = fatype[i];
+			var_info.value = ir_builder->CreateAlloca(var_info.type);
+			ir_builder->CreateStore(args,var_info.value);
+			scope::set(var_info);
+
+			//VARINFO vi;
+			//vi.name = faname[i];
+			//vi.type = fatype[i];
+			//vi.value = args;// ir_builder->CreateAlloca(function->getArg(i)->getType(), function->getArg(i));
+			//scope::set(vi);
+
+			args++;
+		}
 
 		//for (auto& a : body)
 		//	a->codegen();

@@ -26,6 +26,8 @@ AST_while::AST_while(std::vector<TOKEN>& tokens)
 		return;
 	}
 	body = ast1(tokens);
+	if (tokens.empty())
+		return;
 
 	if (tokens[0].Value == ";")
 	{

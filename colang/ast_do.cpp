@@ -13,6 +13,8 @@ AST_do::AST_do(std::vector<TOKEN>& tokens)
 
 	//判断后续是否存在函数体
 	body = ast1(tokens);
+	if (tokens.empty())
+		return;
 
 	if (tokens[0].type != TOKEN_TYPE::string && tokens[0].Value == ";")
 		tokens.erase(tokens.begin());
@@ -42,8 +44,11 @@ void AST_do::show(std::string pre)
 		std::cout << pre << " body:" << std::endl;
 		body->show(pre + "      ");
 	}
-	std::cout << pre << " expr:" << std::endl;
-	expr->show(pre + "      ");
+	if (expr)
+	{
+		std::cout << pre << " expr:" << std::endl;
+		expr->show(pre + "      ");
+	}
 	std::cout << std::endl;
 }
 llvm::Value* AST_do::codegen()
@@ -68,8 +73,11 @@ llvm::Value* AST_do::codegen()
 	if (body)
 		body->codegen();
 
-	llvm::Value* expr2v = ir_type_conver(expr->codegen(), llvm::Type::getInt1Ty(ir_context));
-	ir_builder->CreateCondBr(expr2v, bbbody, bbover);
+	if (expr)
+	{
+		llvm::Value* expr2v = ir_type_conver(expr->codegen(), llvm::Type::getInt1Ty(ir_context));
+		ir_builder->CreateCondBr(expr2v, bbbody, bbover);
+	}
 
 	ir_builder->SetInsertPoint(bbover);
 

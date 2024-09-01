@@ -159,11 +159,19 @@
 
 	long function_test5(){}
 
+
 	int test6(int a)
 	{
-		int b=10;
+		a=a*a;
+		//int b=1;
+		//int c=a;
+		int b=a*a;
 		return b;
 	}
+	int test6v=6;
+	printf("test6v=%d\n",test6v));
+	printf("test6=%d\n",test6(test6v));
+	printf("test6v=%d\n",test6v));
 ?>
 </body>
 </html>
