@@ -452,11 +452,11 @@ llvm::Value* ir_type_conver(llvm::Value* value, llvm::Type* to)
 //	tmp.push_back(token);
 //	ErrorExit("ERROR: 变量不存在", tmp);
 //}
-//读取变量值
-llvm::Value* ir_var_load(VARINFO& var_info)
-{
-	return ir_builder->CreateLoad(var_info.type, var_info.value);
-}
+////读取变量值
+//llvm::Value* ir_var_load(VARINFO& var_info)
+//{
+//	return ir_builder->CreateLoad(var_info.type, var_info.value);
+//}
 
 
 

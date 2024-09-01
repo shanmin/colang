@@ -12,7 +12,8 @@
 
 struct VARINFO
 {
-	std::string name;	//变量名称
+	TOKEN token;
+	//std::string name;	//变量名称
 	llvm::Type* type;	//变量类型
 	llvm::Value* value;
 	bool un;			//是否为unsigned类型
@@ -237,7 +238,7 @@ llvm::Value* ir_type_conver(llvm::Value* value, llvm::Type* to);
 
 void ir(std::vector<AST*>& ast_list, const char* filename);
 //VARINFO ir_var(std::string name, std::vector<VARLIST> var_list, TOKEN token);
-llvm::Value* ir_var_load(VARINFO& var_info);
+//llvm::Value* ir_var_load(VARINFO& var_info);
 
 
 

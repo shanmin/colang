@@ -102,7 +102,8 @@ llvm::Value* AST_value::codegen()
 
 	//²éÕÒ±äÁ¿
 	VARINFO vinfo = scope::get(value);
-	return ir_var_load(vinfo);
+	//return ir_var_load(vinfo);
+	return ir_builder->CreateLoad(vinfo.type, vinfo.value);
 
 	//if(current.right_value==NULL)
 

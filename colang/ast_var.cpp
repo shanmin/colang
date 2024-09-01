@@ -37,7 +37,7 @@ llvm::Value* AST_var::codegen()
 {
 	//创建声明变量的占位
 	VARINFO var_info;
-	var_info.name = name.Value;
+	var_info.token = name;
 	var_info.type = ir_type(type);
 	var_info.value = ir_builder->CreateAlloca(var_info.type);
 	scope::set(var_info);

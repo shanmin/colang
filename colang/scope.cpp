@@ -20,7 +20,11 @@ void scope::pop()
 //设置变量
 void scope::set(VARINFO vi)
 {
-	varlist[varlist.size() - 1].info[vi.name] = vi;
+	//varlist[varlist.size() - 1].info[vi.name] = vi;
+	if (varlist[varlist.size() - 1].info.find(vi.token.Value) == varlist[varlist.size() - 1].info.end())
+		varlist[varlist.size() - 1].info[vi.token.Value] = vi;
+	else
+		ErrorExit("ERROR: 变量重复定义",vi.token );
 }
 
 //获取变量
@@ -39,9 +43,7 @@ VARINFO scope::get(TOKEN token)
 			vi = 0;
 	}
 	//报错
-	std::vector<TOKEN> tmp;
-	tmp.push_back(token);
-	ErrorExit("ERROR: 变量不存在", tmp);
+	ErrorExit("ERROR: 变量不存在",token);
 }
 
 //	THE END

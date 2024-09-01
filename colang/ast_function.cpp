@@ -87,6 +87,7 @@ llvm::Value* AST_function::codegen()
 	std::string fname = name.Value;
 	std::vector<llvm::Type*> fatype;
 	std::vector<std::string> faname;
+	std::vector<TOKEN> fatoken; //这个与faname配对使用，用于生成变量时保存TOKEN信息
 	std::vector<bool> faun;
 	bool isVarArg = false;
 	while (!args.empty())
@@ -109,10 +110,14 @@ llvm::Value* AST_function::codegen()
 			if (!args.empty())
 			{
 				faname.push_back(args[0].Value);
+				fatoken.push_back(args[0]);
 				args.erase(args.begin());
 			}
 			else
-				faname.push_back("");
+				ErrorExit("ERROR: 变量名称未设置", args);
+			//这段没有看出用途，忘记之前为什么这么写了 20240902 shanmin
+			//else
+			//	faname.push_back("");
 		}
 	llvm::FunctionType* functionType = llvm::FunctionType::get(frtype, fatype, isVarArg);
 	llvm::Function* function = llvm::Function::Create(functionType, llvm::GlobalValue::ExternalLinkage, fname, ir_module);
@@ -169,7 +174,7 @@ llvm::Value* AST_function::codegen()
 		{
 			//创建声明变量的占位
 			VARINFO var_info;
-			var_info.name = faname[i];
+			var_info.token = fatoken[i];
 			var_info.type = fatype[i];
 			var_info.value = ir_builder->CreateAlloca(var_info.type);
 			ir_builder->CreateStore(args,var_info.value);
