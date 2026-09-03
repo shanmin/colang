@@ -88,6 +88,8 @@ AST* ast1(std::vector<TOKEN>& tokens)
 			if (tokens[0].Value == "if" && tokens[1].Value == "(") return new AST_if(tokens);
 			if (tokens[0].Value == "while" && tokens[1].Value == "(") return new AST_while(tokens);
 			if (tokens[0].Value == "return") return new AST_return(tokens);
+			if (tokens[0].Value == "struct" && tokens[1].type == TOKEN_TYPE::code && tokens[2].type == TOKEN_TYPE::opcode && tokens[2].Value == "{")
+				return new AST_struct(tokens);
 
 			if (tokens[0].type == TOKEN_TYPE::code && tokens[1].type == TOKEN_TYPE::opcode && tokens[1].Value == ":")
 				return new AST_label(tokens);

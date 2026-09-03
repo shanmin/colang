@@ -176,6 +176,16 @@ public:
 	AST_noncode(std::vector<TOKEN>& tokens);
 };
 
+class AST_struct :public AST
+{
+	TOKEN name;
+	std::vector<std::vector<TOKEN>> value;
+public:
+	llvm::Value* codegen() override;
+	void show(std::string pre) override;
+	AST_struct(std::vector<TOKEN>& tokens);
+};
+
 class AST_return :public AST
 {
 	TOKEN token;

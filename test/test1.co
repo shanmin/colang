@@ -195,6 +195,12 @@
 	}
 	printf("test8=%d\n",test8(1));
 	
+	struct struct1
+	{
+		int a;
+		int b;
+		int c;
+	}
 
 ?>
 </body>
