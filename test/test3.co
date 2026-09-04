@@ -1,0 +1,21 @@
+<?co
+
+public struct STRUCT3
+{
+    int a;
+    int b;
+}
+
+STRUCT3 s3;
+
+public class TEST3
+{
+
+    public void aa()
+    {
+        printf("TEST3.aa()\n");
+    }
+    
+}
+
+?>

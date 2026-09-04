@@ -27,11 +27,11 @@ llvm::Value* AST_noncode::codegen()
 	llvm::Function* function = ir_module->getFunction("printf");
 	if (function)
 	{
-		llvm::Value* args = ir_builder->CreateGlobalStringPtr(value.Value);
+		llvm::Value* args = ir_builder->CreateGlobalString(value.Value);
 		ir_builder->CreateCall(function, args);
 	}
 	else
-		ErrorExit("未找到非代码输出函数", value);
+		ErrorExit("non-code output function (printf) not found", value);
 	return NULL;
 }
 

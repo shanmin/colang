@@ -1,0 +1,119 @@
+noncode area
+<?co
+
+// test0001.co — 编译器冒烟测试（首行 noncode area 用于验证 <?co / ?> 界定符识别）
+//
+// 覆盖范围：
+//   - noncode 模板文本输出（第一行 "noncode area"，依赖 printf 预声明）
+//   - <?co / ?> 代码区界定符（首字符 noncode 区用于验证词法切换逻辑）
+//   - 有符号 / 无符号整型（char/short/int/long、byte/ushort/uint/ulong）基础声明与 printf 输出
+//   - 无符号 MAX 边界初值（0xFFFFFFFF、0xFFFFFFFFFFFFFFFF）
+//   - 整型回绕（ulong max + 2）与复合赋值（u32 += 10、ulong_max -= 3）
+//   - half / float / double 三种浮点的声明与 printf 输出（含 float printf 自动提升到 double）
+//
+// 运行策略：每次改完编译器核心（lexer / AST / IR）后首先跑本文件，
+// 若失败，再到 test_int.co / test_float.co 中定位是整型还是浮点路径出了问题。
+
+//  Colang基本功能测试
+
+printf("---- test0001 start ----\n");
+
+//验证基本类型操作
+
+char i8=8;
+short i16=16;
+int i32=32;
+long i64=64;
+
+printf("type echo\n");
+printf("\t  char i8  = %d\n",i8);
+printf("\t short i16 = %d\n",i16);
+printf("\t   int i32 = %d\n",i32);
+printf("\t  long i64 = %d\n",i64);
+
+byte u8=88;
+ushort u16=1616;
+uint u32=3232;
+ulong u64=6464;
+printf("\t  byte u8  = %u\n",u8);
+printf("\tushort u16 = %u\n",u16);
+printf("\t  uint u32 = %u\n",u32);
+printf("\t ulong u64 = %u\n",u64);
+
+printf("\n");
+
+u32=u32+10;
+printf("\t  u32 + 10 = %u\n",u32);
+
+u32+=10;
+printf("\t  u32 + 10 = %u\n",u32);
+
+printf("type MAX\n");
+
+uint uint_max=0xffffffff;
+ulong ulong_max=0xffffffffffffffff;
+printf("\t  uint  uint_max = %u\n",uint_max);
+printf("\t ulong ulong_max = %llu\n",ulong_max);
+
+ulong_max=ulong_max+2;
+printf("\t ulong ulong_max + 2 = %llu\n",ulong_max);
+
+ulong_max-=3;
+printf("\t ulong ulong_max - 3 = %llu\n",ulong_max);
+
+
+half f16=16;
+float f32=32;
+double f64=64;
+printf("\t   half f16 = %f\n",f16);
+printf("\t  float f32 = %f\n",f32);
+printf("\t double f64 = %f\n",f64);
+
+f16+=10;
+f32+=10;
+f64+=10;
+printf("\t   half f16 + 10 = %f\n",f16);
+printf("\t  float f32 + 10 = %f\n",f32);
+printf("\t double f64 + 10 = %f\n",f64);
+
+if(f16>10)
+    printf("f16>10\n");
+else
+    printf("f16!>10\n");
+
+int ii=12345678901234;
+printf("ii=%d\n",ii);
+
+
+printf("for...\n\t");
+for(int i=0;i<10;i++)
+    printf("%d ",i);
+printf("\n");
+
+int i11=-1;
+printf("\ti11=%d\n",i11);
+
+import * from "test1";
+aa();
+
+import * from test2;
+test2.aa();
+
+import * from test3;
+TEST3 *t3=new TEST3();
+t3.aa();
+
+test3.TEST3 *tt3=new test3.TEST3();
+
+STRUCT3 ss3;
+ss3.a=10;
+printf("\t ss3.a = %d\n",ss3.a);
+
+test3.STRUCT3 sss3;
+sss3.a=10;
+printf("\t sss3.a = %d\n",sss3.a);
+
+
+printf("---- test end ----\n");
+
+?>

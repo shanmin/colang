@@ -7,11 +7,11 @@
 
 AST_do::AST_do(std::vector<TOKEN>& tokens)
 {
-	//Ãû³Æ
+	//åç§°
 	name = tokens[0];
 	tokens.erase(tokens.begin());
 
-	//ÅĞ¶ÏºóĞøÊÇ·ñ´æÔÚº¯ÊıÌå
+	//åˆ¤æ–­åç»­æ˜¯å¦å­˜åœ¨å‡½æ•°ä½“
 	body = ast1(tokens);
 	if (tokens.empty())
 		return;
@@ -19,19 +19,22 @@ AST_do::AST_do(std::vector<TOKEN>& tokens)
 	if (tokens[0].type != TOKEN_TYPE::string && tokens[0].Value == ";")
 		tokens.erase(tokens.begin());
 
-	//²ÎÊı
+	//å‚æ•°
+	// FIXï¼ˆ2026-09-02ï¼ŒP0#1ï¼‰ï¼šä¸Šä¸€æ­¥ tokens[0] ä¸æ˜¯ ; ä¸”ç”¨æˆ·æ²¡å†™; tokens å¯èƒ½ç©º
+	if (tokens.empty()) ErrorExit("do: missing 'while(...)'", name);
 	if (tokens[0].Value == "while" && tokens.size() > 1 && tokens[1].Value == "(")
 	{
 		tokens.erase(tokens.begin());
 		tokens.erase(tokens.begin());
 	}
 	else
-		ErrorExit("do..while¶¨Òå²ÎÊı²¿·Ö½âÎö´íÎó", tokens);
+		ErrorExit("do..while: condition parse error", tokens);
 
-	//½âÎö²ÎÊı
+	//è§£æå‚æ•°
 	expr = ast_parse_expr(tokens);
 
-	if (tokens[0].Value == ";")
+	// FIXï¼ˆ2026-09-02ï¼ŒP0#1ï¼‰ï¼šast_parse_expr æ¶ˆè´¹åˆ° tokens ç©ºæ—¶è·³è¿‡åˆ†å·æ£€æŸ¥
+	if (!tokens.empty() && tokens[0].Value == ";")
 	{
 		tokens.erase(tokens.begin());
 	}
@@ -57,22 +60,29 @@ llvm::Value* AST_do::codegen()
 	//	 code;
 	// while(expr)
 	//
-	// start:
-	//	 code;
-	// if(expr)
-	//	 goto start;
-	// over:
+	// bbbody:
+	//	 code;                 <- break -> bbover  ; continue -> bbcond_expr (re-eval expr, ç­‰ä»·è·³ expr3 ä¹‹å‰)
+	// bbcond_expr:
+	//	 v = expr
+	//	 condbr v, bbbody, bbover
+	// bbover:
 
 	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
-	llvm::BasicBlock* bbbody = llvm::BasicBlock::Create(ir_context, "", func);
-	llvm::BasicBlock* bbover = llvm::BasicBlock::Create(ir_context, "", func);
+	llvm::BasicBlock* bbbody = llvm::BasicBlock::Create(ir_context, "do_body", func);
+	llvm::BasicBlock* bbcond = llvm::BasicBlock::Create(ir_context, "do_cond", func);
+	llvm::BasicBlock* bbover = llvm::BasicBlock::Create(ir_context, "do_over", func);
+
+	// do: continue è¯­ä¹‰ï¼šè·³åˆ° while æ¡ä»¶åˆ¤å®šä¹‹å‰ï¼ˆdo æ—  expr3ï¼Œ"ä¸‹ä¸€è½®å¾ªç¯" = é‡ç®—æ¡ä»¶ï¼‰
+	scope::push_loop_bb(bbover, bbcond);
 
 	ir_builder->CreateBr(bbbody);
 
 	ir_builder->SetInsertPoint(bbbody);
 	if (body)
 		body->codegen();
+	ir_builder->CreateBr(bbcond);
 
+	ir_builder->SetInsertPoint(bbcond);
 	if (expr)
 	{
 		llvm::Value* expr2v = ir_type_conver(expr->codegen(), llvm::Type::getInt1Ty(ir_context));
@@ -81,5 +91,6 @@ llvm::Value* AST_do::codegen()
 
 	ir_builder->SetInsertPoint(bbover);
 
+	scope::pop_loop_bb();
 	return nullptr;
 }

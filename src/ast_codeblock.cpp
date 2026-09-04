@@ -32,7 +32,7 @@ void AST_codeblock::show(std::string pre)
 
 llvm::Value* AST_codeblock::codegen()
 {
-	//ÉèÖÃµ±Ç°±äÁ¿×÷ÓÃÓò
+	//è®¾ç½®å½“å‰å˜é‡ä½œç”¨åŸŸ
 	scope::push("codeblock");
 
 	llvm::Value* ret = nullptr;

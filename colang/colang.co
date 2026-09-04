@@ -1,9 +1,0 @@
-<?
-//
-//	colang.co
-//
-
-int printf(char* str,...);
-
-//	THE END
-?>

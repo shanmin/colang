@@ -3,7 +3,7 @@
 //跨模块调用的函数必须显式 public（默认 private 仅模块内可见）
 public void aa()
 {
-    printf("test1.aa()\n");
+    printf("test2.aa()\n");
 }
 
 ?>

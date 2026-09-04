@@ -7,38 +7,23 @@
 
 AST_if::AST_if(std::vector<TOKEN>& tokens)
 {
-	//Ãû³Æ
+	//åç§°
 	name = tokens[0];
 	tokens.erase(tokens.begin());
-	//²ÎÊı
+	//å‚æ•°
+	// FIXï¼ˆ2026-09-02ï¼ŒP0#1ï¼‰ï¼štokens.erase(name) åç©ºï¼Œtokens[0] UB
+	if (tokens.empty()) ErrorExit("if: missing '('", name);
 	if (tokens[0].Value == "(")
 		tokens.erase(tokens.begin());
 	else
-		ErrorExit("if¶¨Òå²ÎÊı²¿·Ö½âÎö´íÎó", tokens);
+		ErrorExit("if: condition parse error", tokens);
 
-	//std::vector<TOKEN> e = get_tokens(tokens, ")");
-	//expr1 = ast_parse_expr(e);
-
-	//½âÎö²ÎÊı
+	//è§£æå‚æ•°
 	expr1 = ast_parse_expr(tokens);
-	//while (!tokens.empty())
-	//	if (tokens[0].Value == ")")
-	//	{
-	//		break;
-	//	}
-	//	else
-	//	{
-	//		expr1.push_back(tokens[0]);
-	//		tokens.erase(tokens.begin());
-	//	}
-	// 
-	////ÒÆ³ı)
-	//if (tokens[0].Value == ")")
-	//	tokens.erase(tokens.begin());
-	//else
-	//	ErrorExit("if¶¨Òå½áÊø²¿·Ö´íÎó", tokens);
 
-	//ÅĞ¶ÏºóĞøÊÇ·ñ´æÔÚº¯ÊıÌå
+	//åˆ¤æ–­åç»­æ˜¯å¦å­˜åœ¨å‡½æ•°ä½“
+	// FIXï¼ˆ2026-09-02ï¼ŒP0#1ï¼‰ï¼šast_parse_expr æ¶ˆè´¹åˆ° tokens ç©ºæ—¶å…ˆåˆ¤ç©º
+	if (tokens.empty()) return;
 	if (tokens[0].Value == ";")
 	{
 		tokens.erase(tokens.begin());
@@ -105,8 +90,10 @@ llvm::Value* AST_if::codegen()
 
 	}
 	llvm::Instruction* last_instruction;
-	//»ñÈ¡µ±Ç°´úÂë¿é×îºóÒ»ÌõÖ¸Áî£¬Èç¹ûÖ¸ÁîÊÇreturnÔò²»´´½¨ºóÃæµÄbrÖ¸Áî
-	last_instruction = ir_builder->GetInsertBlock()->getTerminator();
+	//è·å–å½“å‰ä»£ç å—æœ€åä¸€æ¡æŒ‡ä»¤ï¼Œå¦‚æœæŒ‡ä»¤æ˜¯returnåˆ™ä¸åˆ›å»ºåé¢çš„bræŒ‡ä»¤
+	//FIXï¼ˆ2026-09-01ï¼‰ï¼šLLVM 23 çš„ getTerminator() åœ¨å—æ—  terminator æ—¶è¿”å› &InstList.back()ï¼ˆéç©ºï¼ï¼‰ï¼Œ
+	//   åˆ¤ç©º/åˆ¤ terminator å¿…é¡»ç”¨ getTerminatorOrNull()ï¼›å¦åˆ™ç©ºå—è¿˜ä¼šè§¦å‘ UBã€‚
+	last_instruction = ir_builder->GetInsertBlock()->getTerminatorOrNull();
 	if(last_instruction!=NULL && last_instruction->getOpcode()== llvm::Instruction::TermOps::Ret)
 	{ }
 	else
@@ -117,13 +104,13 @@ llvm::Value* AST_if::codegen()
 	{
 		elsebody->codegen();
 	}
-	//»ñÈ¡µ±Ç°´úÂë¿é×îºóÒ»ÌõÖ¸Áî£¬Èç¹ûÖ¸ÁîÊÇreturnÔò²»´´½¨ºóÃæµÄbrÖ¸Áî
-	last_instruction = ir_builder->GetInsertBlock()->getTerminator();
+	//è·å–å½“å‰ä»£ç å—æœ€åä¸€æ¡æŒ‡ä»¤ï¼Œå¦‚æœæŒ‡ä»¤æ˜¯returnåˆ™ä¸åˆ›å»ºåé¢çš„bræŒ‡ä»¤
+	last_instruction = ir_builder->GetInsertBlock()->getTerminatorOrNull();
 	if (last_instruction != NULL && last_instruction->getOpcode() == llvm::Instruction::TermOps::Ret)
 	{
 	}
 	else
-		ir_builder->CreateBr(enddbb); //Õâ¸ö½áÊøÌø×ªÃ»ÓĞÒâÒåÁË
+		ir_builder->CreateBr(enddbb); //è¿™ä¸ªç»“æŸè·³è½¬æ²¡æœ‰æ„ä¹‰äº†
 
 	ir_builder->SetInsertPoint(enddbb);
 

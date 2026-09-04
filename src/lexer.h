@@ -1,31 +1,31 @@
 //
-//	lexer	´Ê·¨·ÖÎö
+//	lexer	è¯æ³•åˆ†æ
 //
 #pragma once
 
-//Ô´´úÂëÎÄ¼şĞÅÏ¢
+//æºä»£ç æ–‡ä»¶ä¿¡æ¯
 struct SRCINFO
 {
 	std::string filename;
-	char* src = NULL;	//Ô´´úÂëÄÚÈİ
+	char* src = NULL;	//æºä»£ç å†…å®¹
 };
 
 enum TOKEN_TYPE
 {
-	noncode,	//·Ç´úÂë
-	code,		//´úÂë
-	opcode,		//²Ù×÷·û£¬ÀıÈç+-()µÈ²Ù×÷·ûºÅ
-	string,		//×Ö·û´®
-	number,		//Êı×Ö
+	noncode,	//éä»£ç 
+	code,		//ä»£ç 
+	opcode,		//æ“ä½œç¬¦ï¼Œä¾‹å¦‚+-()ç­‰æ“ä½œç¬¦å·
+	string,		//å­—ç¬¦ä¸²
+	number,		//æ•°å­—
 };
 
 struct TOKEN
 {
-	std::string filename;	//ËùÊôÎÄ¼ş
-	int row_index;			//ËùÔÚĞĞ
-	int col_index;			//ËùÔÚÁĞ
-	TOKEN_TYPE type;		//ÀàĞÍ
-	std::string Value;		//ÄÚÈİ
+	std::string filename;	//æ‰€å±æ–‡ä»¶
+	int row_index;			//æ‰€åœ¨è¡Œ
+	int col_index;			//æ‰€åœ¨åˆ—
+	TOKEN_TYPE type;		//ç±»å‹
+	std::string Value;		//å†…å®¹
 };
 
 SRCINFO loadsrc(const char* filename);

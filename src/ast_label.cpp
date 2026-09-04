@@ -7,14 +7,16 @@
 
 AST_label::AST_label(std::vector<TOKEN>& tokens)
 {
-	//Ãû³Æ
+	//åç§°
 	name = tokens[0];
 	tokens.erase(tokens.begin());
-	//²ÎÊý
+	//å‚æ•°
+	// FIXï¼ˆ2026-09-02ï¼ŒP0#1ï¼‰ï¼štokens.erase(name) åŽç©ºï¼Œtokens[0] UB
+	if (tokens.empty()) ErrorExit("label: missing ':'", name);
 	if (tokens[0].Value == ":")
 		tokens.erase(tokens.begin());
 	else
-		ErrorExit("label¶¨Òå²ÎÊý²¿·Ö½âÎö´íÎó", tokens);
+		ErrorExit("label: parse error", tokens);
 }
 void AST_label::show(std::string pre)
 {
@@ -23,7 +25,7 @@ void AST_label::show(std::string pre)
 llvm::Value* AST_label::codegen()
 {
 	llvm::BasicBlock* bbstart;
-	//Èç¹ûgotoÔÚÇ°£¬ÔòÇ°ÃæÒÑ¾­´´½¨Õâ¸ö±êÇ©ÁË
+	//å¦‚æžœgotoåœ¨å‰ï¼Œåˆ™å‰é¢å·²ç»åˆ›å»ºè¿™ä¸ªæ ‡ç­¾äº†
 	LABEL_LIST labellist = ir_labellist.back();
 	if (labellist.info.find(name.Value) == labellist.info.end())
 	{
@@ -33,7 +35,7 @@ llvm::Value* AST_label::codegen()
 	}
 	else
 	{
-		bbstart = (llvm::BasicBlock*)labellist.info.find(name.Value)._Ptr;
+		bbstart = labellist.info[name.Value];
 	}
 	ir_builder->CreateBr(bbstart);
 	ir_builder->SetInsertPoint(bbstart);

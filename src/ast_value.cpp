@@ -5,7 +5,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 #include "colang.h"
 
-//ʮ�������ַ�ת��
+//十六进制字符转换
 char c2x(char c)
 {
 	switch (c)
@@ -52,13 +52,30 @@ void AST_value::show(std::string pre)
 }
 
 
+//运算数符号性：变量按其声明类型（VARINFO.un），字面量/字符串常量视为有符号
+bool AST_value::is_un()
+{
+	if (value.type == TOKEN_TYPE::code)
+	{
+		//true/false 是布尔字面量，不是变量，不查 scope（否则报"变量不存在"）
+		if (value.Value == "true" || value.Value == "false") return false;
+		return scope::get(value).un;
+	}
+	return false;
+}
+
+
 llvm::Value* AST_value::codegen()
 {
 	if (value.type == TOKEN_TYPE::string)
-		return ir_builder->CreateGlobalStringPtr(value.Value);
+		return ir_builder->CreateGlobalString(value.Value);
 
 	if (value.type == TOKEN_TYPE::number)
 	{
+		//浮点字面量（含小数点），按 double 生成，赋值/运算时再按目标类型转换
+		if (value.Value.find('.') != std::string::npos)
+			return llvm::ConstantFP::get(ir_context, llvm::APFloat(atof(value.Value.c_str())));
+
 		if (value.Value.size() > 1 && (value.Value[1] == 'X' || value.Value[1] == 'x'))
 		{
 			std::string str = value.Value.substr(2);
@@ -68,7 +85,9 @@ llvm::Value* AST_value::codegen()
 				tmp.push_back(value);
 				ErrorExit("too big", tmp);
 			}
-			long long data = 0;
+			//必须用 unsigned long long 移位：c2x 返回值若按 char→int 提升后左移，
+			//移位数超过 32 位是 UB（如 15 << 60）；无符号 64 位移位才是定义良好的
+			unsigned long long data = 0;
 			for (int i = 0; i < str.size(); i++)
 			{
 				long long c = c2x(str[i]);
@@ -78,7 +97,7 @@ llvm::Value* AST_value::codegen()
 					tmp.push_back(value);
 					ErrorExit("error", tmp);
 				}
-				data |= c << ((str.size() - i - 1) * 4);
+				data |= (unsigned long long)c << ((str.size() - i - 1) * 4);
 			}
 			return ir_builder->getInt64(data);
 		}
@@ -95,12 +114,20 @@ llvm::Value* AST_value::codegen()
 		//return _value;
 	}
 
-	//else if (current.right.value.empty()) //û��ֵ�ڵ�ģ������²�ڵ�
+	//else if (current.right.value.empty()) //没有值节点的，计算下层节点
 	//	current.right_value = ir_expr(current.right.body["body"], irinfo);
 	//else
 	//{
 
-	//���ұ���
+	//true/false 布尔字面量：code token，返回 i1 常量 1/0
+	//  放在"查找变量"之前，避免 true/false 被当作变量名查找
+	if (value.type == TOKEN_TYPE::code)
+	{
+		if (value.Value == "true")  return llvm::ConstantInt::getTrue(ir_context);
+		if (value.Value == "false") return llvm::ConstantInt::getFalse(ir_context);
+	}
+
+	//查找变量
 	VARINFO vinfo = scope::get(value);
 	//return ir_var_load(vinfo);
 	return ir_builder->CreateLoad(vinfo.type, vinfo.value);
@@ -109,7 +136,7 @@ llvm::Value* AST_value::codegen()
 
 //	std::vector<TOKEN> tmp;
 //	tmp.push_back(value);
-//			ErrorExit("δʶ��ı���ʽ����", tmp);
+//			ErrorExit("未识别的表达式类型", tmp);
 	//}
 	//return NULL;
 }

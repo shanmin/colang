@@ -7,19 +7,23 @@
 
 AST_while::AST_while(std::vector<TOKEN>& tokens)
 {
-	//Ãû³Æ
+	//åç§°
 	name = tokens[0];
 	tokens.erase(tokens.begin());
-	//²ÎÊı
+	//å‚æ•°
+	// FIXï¼ˆ2026-09-02ï¼ŒP0#1ï¼‰ï¼štokens.erase(name) åç©ºï¼Œå…ˆåˆ¤ç©º
+	if (tokens.empty()) ErrorExit("while: missing '('", name);
 	if (tokens[0].Value == "(")
 		tokens.erase(tokens.begin());
 	else
-		ErrorExit("while¶¨Òå²ÎÊı²¿·Ö½âÎö´íÎó", tokens);
+		ErrorExit("while: condition parse error", tokens);
 
-	//½âÎö²ÎÊı
+	//è§£æå‚æ•°
 	expr = ast_parse_expr(tokens);
 
-	//ÅĞ¶ÏºóĞøÊÇ·ñ´æÔÚº¯ÊıÌå
+	//åˆ¤æ–­åç»­æ˜¯å¦å­˜åœ¨å‡½æ•°ä½“
+	// FIXï¼ˆ2026-09-02ï¼ŒP0#1ï¼‰ï¼šast_parse_expr æ¶ˆè´¹åˆ° tokens ç©ºï¼Œtokens[0] UB
+	if (tokens.empty()) return;
 	if (tokens[0].Value == ";")
 	{
 		tokens.erase(tokens.begin());
@@ -51,16 +55,19 @@ llvm::Value* AST_while::codegen()
 	//while(expr)
 	//	code;
 	//
-	// start:
-	// if(expr)
+	// bbstart:                       <- continue -> bbstart (é‡ç®— expr)
+	//	 v = expr -> condbr bbbody, bbover
+	// bbbody:
 	//	 code;
-	//	 goto start;
-	// over:
+	//	 br bbstart
+	// bbover:                        <- break -> bbover
 
 	llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
-	llvm::BasicBlock* bbstart = llvm::BasicBlock::Create(ir_context, "", func);
-	llvm::BasicBlock* bbbody = llvm::BasicBlock::Create(ir_context, "", func);
-	llvm::BasicBlock* bbover = llvm::BasicBlock::Create(ir_context, "", func);
+	llvm::BasicBlock* bbstart = llvm::BasicBlock::Create(ir_context, "while_start", func);
+	llvm::BasicBlock* bbbody = llvm::BasicBlock::Create(ir_context, "while_body", func);
+	llvm::BasicBlock* bbover = llvm::BasicBlock::Create(ir_context, "while_over", func);
+
+	scope::push_loop_bb(bbover, bbstart);
 
 	ir_builder->CreateBr(bbstart);
 
@@ -75,5 +82,6 @@ llvm::Value* AST_while::codegen()
 
 	ir_builder->SetInsertPoint(bbover);
 
+	scope::pop_loop_bb();
 	return nullptr;
 }

@@ -8,20 +8,22 @@
 
 AST_goto::AST_goto(std::vector<TOKEN>& tokens)
 {
-	//·µ»ØÖµ
+	//è¿”å›žå€¼
 	tokens.erase(tokens.begin());
+	// FIXï¼ˆ2026-09-02ï¼ŒP0#1ï¼‰ï¼šerase(goto) åŽ tokens å¯èƒ½ä¸ºç©ºï¼ˆåªå†™äº† "goto" æ²¡å†™æ ‡ç­¾ï¼‰
+	if (tokens.empty()) ErrorExit("goto: missing label name", TOKEN{});
 	if (tokens[0].type == TOKEN_TYPE::code)
 	{
 		name = tokens[0];
 		tokens.erase(tokens.begin());
 	}
 	else
-		ErrorExit("goto²¿·Ö½âÎö´íÎó", tokens);
+		ErrorExit("goto: parse error", tokens);
 
 	//if (tokens[0].Value == ";")
 	//	tokens.erase(tokens.begin());
 	//else
-	//	ErrorExit("goto²¿·Ö½áÊø·û´íÎó", tokens);
+	//	ErrorExit("gotoéƒ¨åˆ†ç»“æŸç¬¦é”™è¯¯", tokens);
 }
 void AST_goto::show(std::string pre)
 {
@@ -32,7 +34,7 @@ void AST_goto::show(std::string pre)
 llvm::Value* AST_goto::codegen()
 {
 	llvm::BasicBlock* bbstart;
-	//Èç¹ûgotoÔÚÇ°£¬ÔòÇ°ÃæÒÑ¾­´´½¨Õâ¸ö±êÇ©ÁË
+	//å¦‚æžœgotoåœ¨å‰ï¼Œåˆ™å‰é¢å·²ç»åˆ›å»ºè¿™ä¸ªæ ‡ç­¾äº†
 	LABEL_LIST labellist = ir_labellist.back();
 	if (labellist.info.find(name.Value) == labellist.info.end())
 	{
@@ -46,7 +48,7 @@ llvm::Value* AST_goto::codegen()
 	}
 	ir_builder->CreateBr(bbstart);
 
-	//gotoºóÃæÒªÐÂ³£¼ûÒ»¸öbasic block£¬·ñÔò»á³öÏÖ¡°Terminator found in the middle of a basic block!¡±´íÎóÐÅÏ¢
+	//gotoåŽé¢è¦æ–°å¸¸è§ä¸€ä¸ªbasic blockï¼Œå¦åˆ™ä¼šå‡ºçŽ°â€œTerminator found in the middle of a basic block!â€é”™è¯¯ä¿¡æ¯
 	{
 		llvm::Function* func = ir_builder->GetInsertBlock()->getParent();
 		llvm::BasicBlock* bbstart1 = llvm::BasicBlock::Create(ir_context, "", func);
