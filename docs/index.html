@@ -1,11 +1,42 @@
 <!DOCTYPE html>
 <html>
 <head>
-	<meta charset="utf-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<title>Colang</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Colang Document</title>
+<link rel="stylesheet" type="text/css" href="index.css">
+<script src="jslib.min.js"></script>
+<script src="index.js"></script>
+<base target="main">
 </head>
 <body>
-Colang !!!
+	<div class="top_title">
+		<div>Colang Document</div>
+		<div style="font-size: 14px;">
+			<span lang="zh">语言选择</span>
+			<span lang="en">LANGUAGE</span>
+			<select id="slang">
+				<option value="zh">中文</option>
+				<option value="en">ENGLISH</option>
+			</select>
+		</div>
+	</div>
+	<div class="left"></div>
+	<div class="main"><iframe frameborder="0" name="main" src="intro.html"></iframe></div>
+	<script>
+		$js('.left').tree({selectleaf:true,data:[
+			{t:'INTRO',a:'intro.html'},
+			{t:'BASE',a:'base.html'},
+			// {t:'基础方法',c:[
+			// 	{t:'add',a:'docs/api.html#add'},
+			// 	{t:'trigger',a:'docs/api.html#trigger'},
+			// 	{t:'val',a:'docs/api.html#val'},
+			// ]},
+			// {t:'PHP',c:[
+			// 	{t:'upfile',a:'docs/php.html#upfile'},
+			// ]},
+			{t:'修改记录',a:'history.html'},
+		]});
+	</script>
 </body>
 </html>

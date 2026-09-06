@@ -35,22 +35,22 @@ static std::vector<TOKEN> collect_method_tokens(std::vector<TOKEN>& tokens)
 
 AST_class::AST_class(std::vector<TOKEN>& tokens)
 {
-	// 可选顶层访问修饰符 [public|private] class Name {
-	//   （注：顶层修饰符"类的可见性"当前等价于"类所有方法的默认可见性"：
-	//    public → import 方能 new + 方法调用；private → 仅当前模块可见。
-	//    实现方式：若顶层写了 public，类体内所有方法若未显式写 private/ public，
-	//    按顶层修饰符决定；若顶层写了 private 或未写，类方法默认 private。）
+	// 可选顶层访问修饰符：public class Name {
+	//   private 关键字已移除（2026-09-06）：不写修饰符默认即为私有（类仅当前模块可见）；
+	//   显式写 private 由 ast1() 分派入口统一拦截报错，这里做防御性检查。
+	//   （顶层 public 的用途：作为 scope::mark_struct_import_public 的开关，决定 import 方能否通过类型名访问。）
 	toplevel_public = false;
-	if (tokens.size() >= 1 && tokens[0].type == TOKEN_TYPE::code
-		&& (tokens[0].Value == "public" || tokens[0].Value == "private"))
+	if (!tokens.empty() && tokens[0].type == TOKEN_TYPE::code
+		&& tokens[0].Value == "private")
 	{
-		toplevel_public = (tokens[0].Value == "public");
+		ErrorExit("'private' 关键字已移除：class 默认即为私有（仅当前模块内可见）；需要跨模块公开时请使用 'public class'", tokens[0]);
+	}
+	if (!tokens.empty() && tokens[0].type == TOKEN_TYPE::code
+		&& tokens[0].Value == "public")
+	{
+		toplevel_public = true;
 		tokens.erase(tokens.begin());
 	}
-	// （目前 toplevel_public 有两个用途：
-	//   A) 作为 scope::mark_struct_import_public 的开关，决定 import 方能否通过类型名访问；
-	//   B) 保留作将来"类方法默认 public"的默认可见性来源；
-	//   A 已在 codegen() 内落地；B 暂未落地，需要时再把它传给 AST_function 构造。）
 
 	// eat "class"
 	if (tokens.empty() || tokens[0].Value != "class")
@@ -80,22 +80,26 @@ AST_class::AST_class(std::vector<TOKEN>& tokens)
 			return;
 		}
 
-		// 可选访问修饰符 public/private（类方法/构造函数用，字段暂不支持但也不报语法错）
-		//   保存下来：AST_function 构造器自己认识 [public|private] 前缀；
-		//   构造函数场景也要把修饰符插进 method_tokens 开头。
+		// 可选访问修饰符 public（类方法/构造/析构/字段前缀；private 关键字已移除——
+		//   不写修饰符默认即为私有：方法 InternalLinkage 仅模块内可见）。
+		//   保存下来：AST_function 构造器自己认识 public 前缀；
+		//   构造/析构场景也要把修饰符插进 method_tokens 开头。
 		bool has_vis = false;
-		bool vis_is_private = true;
 		TOKEN vis_tok;
 		if (tokens.size() >= 1 && tokens[0].type == TOKEN_TYPE::code
-			&& (tokens[0].Value == "public" || tokens[0].Value == "private"))
+			&& tokens[0].Value == "private")
+		{
+			ErrorExit("'private' 关键字已移除：类成员默认即为私有（仅当前模块内可见）；需要公开时请使用 'public'，并删掉 private 修饰符", tokens[0]);
+		}
+		if (tokens.size() >= 1 && tokens[0].type == TOKEN_TYPE::code
+			&& tokens[0].Value == "public")
 		{
 			has_vis = true;
-			vis_is_private = (tokens[0].Value == "private");
 			vis_tok = tokens[0];
 			tokens.erase(tokens.begin());
 		}
 
-		// 检测构造函数：[public|private] ClassName(
+		// 检测构造函数：[public] ClassName(
 		//   无修饰：tokens[0]=name tokens[1]='('
 		//   有修饰：tokens[0]=name tokens[1]='('（修饰符已在上方消费）
 		if (tokens.size() >= 2
@@ -124,7 +128,7 @@ AST_class::AST_class(std::vector<TOKEN>& tokens)
 			continue;
 		}
 
-		// 检测析构函数：[public|private] ~ ClassName (
+		// 检测析构函数：[public] ~ ClassName (
 		//   tokens 形式：[~] ClassName [( ... ] { body }
 		//   有修饰：修饰符已在上方消费，tokens[0]=~ tokens[1]=ClassName tokens[2]=(
 		//   无修饰：tokens[0]=~ tokens[1]=ClassName tokens[2]=(
@@ -262,7 +266,7 @@ llvm::Value* AST_class::codegen()
 	scope::register_struct_type(structType, name);
 	scope::set_struct_field_indexes(structType, field_names);
 	// 登记 import 侧类型可见性：仅显式 `public class X` → 允许 import 模块 forward 类型名
-	//   未写 / private class → import 方查不到类型名 → 报 "未定义的类型名"
+	//   未写修饰符（默认私有）→ import 方查不到类型名 → 报 "未定义的类型名"
 	scope::mark_struct_import_public(name.Value, toplevel_public);
 
 	// 2. 预声明 malloc/free 外部函数（若尚未声明）

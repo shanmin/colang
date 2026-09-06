@@ -130,7 +130,7 @@ llvm::Value* AST_new::codegen()
 	// 1. 获取类的 StructType
 	llvm::StructType* st = scope::get_struct_type(class_name_tok.Value);
 	if (!st)
-		ErrorExit(("new: class definition not found: " + class_name_tok.Value).c_str(), class_name_tok);
+		ErrorExit(("new: type definition not found: " + class_name_tok.Value).c_str(), class_name_tok);
 
 	// 2. malloc(sizeof(class))
 	llvm::Function* malloc_fn = ir_module->getFunction("malloc");
@@ -258,8 +258,8 @@ llvm::Value* AST_new::codegen()
 	}
 	else if (!args.empty())
 	{
-		// 有参数但无构造函数 → 报错
-		ErrorExit(("new: class '" + class_name_tok.Value + "' has no constructor, but arguments were provided").c_str(), class_name_tok);
+		// 有参数但无构造函数 → 报错（struct 无构造函数，class 未定义构造函数时均走此分支）
+		ErrorExit(("new: '" + class_name_tok.Value + "' has no constructor, but arguments were provided").c_str(), class_name_tok);
 	}
 
 	return obj;

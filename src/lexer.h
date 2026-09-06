@@ -17,6 +17,7 @@ enum TOKEN_TYPE
 	opcode,		//操作符，例如+-()等操作符号
 	string,		//字符串
 	number,		//数字
+	array,		//数组
 };
 
 struct TOKEN

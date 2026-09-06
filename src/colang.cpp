@@ -10,7 +10,7 @@
 //版本号（与 PROJECT.md 的"当前版本"字段保持同步：升版本时同步修改此处）
 //	只含 MAJOR.MINOR.PATCH，不含阶段标签（阶段标签只在 PROJECT.md 文档里管理，不在 CLI 显示）
 //	变动条件见 PROJECT.md 维护规则第 4 条
-static const char* COLANG_VERSION = "v0.0.4";
+static const char* COLANG_VERSION = "v0.0.5";
 
 //多字节字符只由首字节贡献列宽，与 lexer 中的列计数逻辑保持一致（copy from lexer.cpp）
 static inline bool diag_is_utf8_continue(char c)

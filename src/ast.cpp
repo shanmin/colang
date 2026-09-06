@@ -116,6 +116,15 @@ AST* ast1(std::vector<TOKEN>& tokens)
 				return new AST_import(tokens);
 			}
 
+			// private 关键字已移除（2026-09-06）：class/struct/函数 默认即为私有
+			//   （InternalLinkage，仅当前模块内可见；import 侧不可见），
+			//   唯一合法的可见性修饰符是 public（标记跨模块公开）。
+			//   显式写 private 时在此直接报错并给出修改指引，避免被当成类型名/函数名产生难懂的下游报错。
+			if (tokens[0].type == TOKEN_TYPE::code && tokens[0].Value == "private")
+			{
+				ErrorExit("'private' 关键字已移除：默认即为私有（仅当前模块内可见）；需要跨模块/跨文件公开时请使用 'public'，并删掉 private 修饰符", tokens[0]);
+			}
+
 			if (tokens[0].Value == "do") return new AST_do(tokens);
 			// FIX（2026-09-02，P0#1）：tokens[n] 访问前统一加 size 守卫，避免 UB 崩溃
 			if (tokens.size() >= 2 && tokens[0].Value == "for" && tokens[1].Value == "(") return new AST_for(tokens);
@@ -128,13 +137,13 @@ AST* ast1(std::vector<TOKEN>& tokens)
 			// delete 语句：delete 表达式; → 先调析构（若定义）再 free
 			if (tokens[0].Value == "delete" && tokens.size() >= 2)
 				return new AST_delete(tokens);
-			// struct 定义（含可选 public/private 修饰符，与 AST_class 对称；方案 B 对 struct 也启用 import 可见性过滤）
+			// struct 定义（可选 public 修饰符；private 关键字已移除——不写修饰符默认即为私有）
 			//   无修饰：struct NAME { → 3 tokens
-			//   有修饰：[public|private] struct NAME { → 4 tokens
+			//   有修饰：public struct NAME { → 4 tokens
 			{
 				bool s_has_vis = (tokens.size() >= 1
 					&& tokens[0].type == TOKEN_TYPE::code
-					&& (tokens[0].Value == "public" || tokens[0].Value == "private"));
+					&& tokens[0].Value == "public");
 				int s_ti_kw   = s_has_vis ? 1 : 0;  // "struct" keyword 索引
 				int s_ti_name = s_has_vis ? 2 : 1;  // struct NAME 的 NAME 索引
 				int s_ti_lb   = s_has_vis ? 3 : 2;  // "{" 索引
@@ -148,13 +157,13 @@ AST* ast1(std::vector<TOKEN>& tokens)
 				}
 			}
 
-			// class 定义（含可选 public/private 修饰符）
+			// class 定义（可选 public 修饰符；private 关键字已移除——不写修饰符默认即为私有）
 			//   无修饰：class Name { → 3 tokens
-			//   有修饰：[public|private] class Name { → 4 tokens
+			//   有修饰：public class Name { → 4 tokens
 			{
 				bool class_has_vis = (tokens.size() >= 1
 					&& tokens[0].type == TOKEN_TYPE::code
-					&& (tokens[0].Value == "public" || tokens[0].Value == "private"));
+					&& tokens[0].Value == "public");
 				int c_ti_class = class_has_vis ? 1 : 0;  // "class" keyword 索引
 				int c_ti_name  = class_has_vis ? 2 : 1;  // class Name 的 Name 索引
 				int c_ti_lb    = class_has_vis ? 3 : 2;  // "{" 索引
@@ -182,31 +191,35 @@ AST* ast1(std::vector<TOKEN>& tokens)
 				return new AST_label(tokens);
 
 			//Function
-			//	Ex:  [public|private] int function_name(int arg1)
-			//		 |             |		|              + args
-			//       |             |      + 函数名称
-			//       |             +  返回值类型
-			//       + 访问修饰符（可选；缺省=private）
-			//判断依据：
-			//   无修饰：code(ret_type) code(func_name) '('  → 3 tokens
-			//   有修饰："public"|"private"(code) code(ret_type) code(func_name) '('  → 4 tokens
+		//	Ex:  [public] int function_name(int arg1)
+		//		 |            |		|              + args
+		//       |            |      + 函数名称
+		//       |            +  返回值类型（可带指针 *：char* malloc(...) / void* f(...)）
+		//       + 访问修饰符（可选；仅 public——private 关键字已移除，缺省即私有）
+		//判断依据：
+		//   无修饰：code(ret_type) [*…] code(func_name) '('
+		//   有修饰："public"(code) code(ret_type) [*…] code(func_name) '('
+		{
+			bool has_vis = tokens.size() >= 1
+				&& tokens[0].type == TOKEN_TYPE::code
+				&& tokens[0].Value == "public";
+			int ti_type = has_vis ? 1 : 0;   // 返回类型 token 索引
+			// 跳过返回类型与函数名之间可选的指针标记（* / &），定位函数名
+			int ti_name = ti_type + 1;
+			while (ti_name < (int)tokens.size()
+				&& tokens[ti_name].type != TOKEN_TYPE::string
+				&& (tokens[ti_name].Value == "*" || tokens[ti_name].Value == "&"))
+				ti_name++;
+			int ti_lp = ti_name + 1;         // '(' token 索引
+			if (ti_lp < (int)tokens.size()
+				&& tokens[ti_type].type == TOKEN_TYPE::code
+				&& tokens[ti_name].type == TOKEN_TYPE::code
+				&& tokens[ti_lp].type   == TOKEN_TYPE::opcode
+				&& tokens[ti_lp].Value  == "(")
 			{
-				bool has_vis = tokens.size() >= 1
-					&& tokens[0].type == TOKEN_TYPE::code
-					&& (tokens[0].Value == "public" || tokens[0].Value == "private");
-				int need_sz = has_vis ? 4 : 3;
-				int ti_type = has_vis ? 1 : 0;   // 返回类型 token 索引
-				int ti_name = has_vis ? 2 : 1;   // 函数名 token 索引
-				int ti_lp   = has_vis ? 3 : 2;   // '(' token 索引
-				if (tokens.size() >= need_sz
-					&& tokens[ti_type].type == TOKEN_TYPE::code
-					&& tokens[ti_name].type == TOKEN_TYPE::code
-					&& tokens[ti_lp].type   == TOKEN_TYPE::opcode
-					&& tokens[ti_lp].Value  == "(")
-				{
-					return new AST_function(tokens);
-				}
+				return new AST_function(tokens);
 			}
+		}
 
 			//模块限定函数调用
 			//Ex:	m1.aa("abc");
@@ -792,6 +805,27 @@ llvm::Type* ir_type(std::vector<TOKEN>& tokens)
 	else if (code == "float") type = llvm::Type::getFloatTy(ir_context);
 	else if (code == "double") type = llvm::Type::getDoubleTy(ir_context);
 	else if (code == "half") type = llvm::Type::getHalfTy(ir_context); //16位半精度浮点
+	else if (tokens.size() >= 2 && code == "int" && tokens[1].type == TOKEN_TYPE::array && tokens[1].Value == "[]")
+	{
+		// int[] 数组类型
+		type = llvm::ArrayType::get(llvm::Type::getInt32Ty(ir_context), 0); // 动态数组
+		tokens.erase(tokens.begin()); // int
+		tokens.erase(tokens.begin()); // []
+	}
+	else if (tokens.size() >= 2 && code == "float" && tokens[1].type == TOKEN_TYPE::array && tokens[1].Value == "[]")
+	{
+		// float[] 数组类型
+		type = llvm::ArrayType::get(llvm::Type::getFloatTy(ir_context), 0); // 动态数组
+		tokens.erase(tokens.begin()); // float
+		tokens.erase(tokens.begin()); // []
+	}
+	else if (tokens.size() >= 2 && code == "char" && tokens[1].type == TOKEN_TYPE::array && tokens[1].Value == "[]")
+	{
+		// char[] 数组类型
+		type = llvm::ArrayType::get(llvm::Type::getInt8Ty(ir_context), 0); // 动态数组
+		tokens.erase(tokens.begin()); // char
+		tokens.erase(tokens.begin()); // []
+	}
 	else if (code == "struct")
 	{
 		// struct T 两-token 类型：当前 tokens[0] 是 struct，tokens[1] 必须是 struct 名
@@ -865,8 +899,7 @@ llvm::Value* ir_type_conver(llvm::Value* value, llvm::Type* to, bool is_src_un)
 			return ir_builder->CreateICmpNE(value, i0);
 		}
 		//任意整型宽度间转换（截断/扩展），保证 store 与调用参数的类型合法
-		if (to->isIntegerTy())
-		{
+		if (to->isIntegerTy())		{
 			// FIX（2026-09-01）：i1 是比较/逻辑运算结果，语义为布尔 0/1，扩宽必须零扩展。
 			//   旧代码 CreateIntCast(value, to, true) 统一 sext，把 true(1) 扩成 -1：
 			//   printf("%d", 1<2) 输出 -1、(1<2)==1 恒为 0。
@@ -899,6 +932,16 @@ llvm::Value* ir_type_conver(llvm::Value* value, llvm::Type* to, bool is_src_un)
 				return ir_builder->CreateFCmpONE(value, f0);
 			}
 			return ir_builder->CreateFPToSI(value, to);
+		}
+	}
+
+	// StructType 兼容性检查：如果 src 和 to 都是 struct 且 body 相同（只是名字可能有 .N 后缀），
+	//   直接 return value（同一 context + 同 body 的 StructType，LLVM 不认为是同一指针，但实际兼容）
+	if (src->isStructTy() && to->isStructTy()) {
+		auto* sst = llvm::cast<llvm::StructType>(src);
+		auto* tst = llvm::cast<llvm::StructType>(to);
+		if (!sst->isOpaque() && !tst->isOpaque() && sst->elements() == tst->elements()) {
+			return value;
 		}
 	}
 

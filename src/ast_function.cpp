@@ -8,20 +8,14 @@
 
 AST_function::AST_function(std::vector<TOKEN>& tokens)
 {
-	// 访问修饰符：[public|private] + 返回类型 + 函数名 + ( …
-	//   未指定时按用户规则默认 private（is_private=true）
-	if (!tokens.empty() && tokens[0].type == TOKEN_TYPE::code)
+	// 访问修饰符：可选 public + 返回类型 + 函数名 + ( …
+	//   private 关键字已移除（2026-09-06）：不写修饰符默认即为私有（is_private=true，InternalLinkage）；
+	//   写了 private 会在 ast1() 分派入口被拦截报错，不会走到这里。
+	if (!tokens.empty() && tokens[0].type == TOKEN_TYPE::code
+		&& tokens[0].Value == "public")
 	{
-		if (tokens[0].Value == "public")
-		{
-			is_private = false;
-			tokens.erase(tokens.begin());
-		}
-		else if (tokens[0].Value == "private")
-		{
-			is_private = true;
-			tokens.erase(tokens.begin());
-		}
+		is_private = false;
+		tokens.erase(tokens.begin());
 	}
 	//返回值
 	// FIX（2026-09-02，P0#1）：修饰符 erase 后 tokens 可能为空，判空再取返回类型 token
@@ -29,7 +23,8 @@ AST_function::AST_function(std::vector<TOKEN>& tokens)
 	rett.push_back(tokens[0]);
 	tokens.erase(tokens.begin());
 	// FIX（2026-09-02，P0#1）：tokens.erase(rett 首项) 后 tokens 可能为空，判空再访问 tokens[0]
-	if (!tokens.empty() && tokens[0].type != TOKEN_TYPE::string && (tokens[0].Value == "*" || tokens[0].Value == "&"))
+	// 指针返回类型可带多级 *（char* / char** / void*），与 ast1 分派时跳过 [*…] 的逻辑对齐
+	while (!tokens.empty() && tokens[0].type != TOKEN_TYPE::string && (tokens[0].Value == "*" || tokens[0].Value == "&"))
 	{
 		rett.push_back(tokens[0]);
 		tokens.erase(tokens.begin());
@@ -57,6 +52,17 @@ AST_function::AST_function(std::vector<TOKEN>& tokens)
 		if (tokens[0].Value == ")")
 		{
 			break;
+		}
+		else if (tokens[0].Value == "...")
+		{
+			// 可变参数省略号：C 语义要求它前面至少有一个命名参数，且它必须是参数列表最后一项（后面只能是 ')'）
+			//   codegen / 重载登记循环靠 args 中的 "..." token 识别 isVarArg，这里只需把好语法关
+			if (args.empty())
+				ErrorExit("function definition: '...' (variadic) requires at least one named parameter before it", tokens[0]);
+			if (tokens.size() < 2 || tokens[1].Value != ")")
+				ErrorExit("function definition: '...' (variadic) must be the last parameter", tokens[0]);
+			args.push_back(tokens[0]);
+			tokens.erase(tokens.begin());
 		}
 		else
 		{

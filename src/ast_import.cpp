@@ -93,25 +93,45 @@ static bool path_exists(const std::string& p) {
 	catch (...) { return false; }
 }
 
+
+// 解析 import 语句中的目标文件路径
+// 支持两种文件格式：.co 和 .bc
+// 查找优先级：有扩展名时直接使用，无扩展名时先找 .co，找不到再找 .bc
+// 
+// 参数：
+//   - cur_source_file: 当前源文件路径（用于确定相对路径的基准目录）
+//   - import_target: import 语句中指定的目标文件名（可包含相对路径）
+//   - diag_tok: 用于错误诊断的 token
+// 
+// 返回值：
+//   解析后的绝对文件路径，如果文件不存在则返回空字符串
 std::string import_resolve_path(const char* cur_source_file, const std::string& import_target, const TOKEN& diag_tok) {
-	//1. 若无扩展名 → 补 .co
+	//1. 解析目标文件：
+	//   - 已有 .co/.bc 扩展名 → 直接用
+	//   - 无扩展名 → 先找 .co，找不到再找 .bc
 	std::string target = import_target;
+	std::string cur_dir = path_dirname(path_to_abs(cur_source_file));
+	std::string result;
 	{
 		std::filesystem::path tp(target);
-		if (tp.extension().empty())
-			target += ".co";
+		std::string ext = tp.extension().string();
+		if (ext == ".co" || ext == ".bc") {
+			std::string candidate = path_normalize_backslash(path_to_abs(cur_dir + "\\" + target));
+			if (path_exists(candidate)) result = candidate;
+		} else if (ext.empty()) {
+			std::string co_cand = path_normalize_backslash(path_to_abs(cur_dir + "\\" + target + ".co"));
+			if (path_exists(co_cand)) {
+				result = co_cand;
+			} else {
+				std::string bc_cand = path_normalize_backslash(path_to_abs(cur_dir + "\\" + target + ".bc"));
+				if (path_exists(bc_cand)) result = bc_cand;
+			}
+		}
 	}
-	//2. 相对 cur_source_file 的目录解析
-	std::string cur_dir = path_dirname(path_to_abs(cur_source_file));
-	std::string candidate = cur_dir + "\\" + target;
-	candidate = path_normalize_backslash(candidate);
-	candidate = path_to_abs(candidate);
-	if (!path_exists(candidate)) {
-		// 也允许相对于启动目录（主 .co 所在），但以 cur 目录优先
-		// 找不到就报错
-		ErrorExit(("import file not found: " + candidate).c_str(), diag_tok);
+	if (result.empty()) {
+		ErrorExit(("import file not found: " + target).c_str(), diag_tok);
 	}
-	return path_normalize_backslash(candidate);
+	return result;
 }
 
 std::string import_module_name(const std::string& co_path) {
@@ -244,7 +264,8 @@ llvm::Function* ir_find_function_or_nul(const std::string& call_name) {
 }
 
 void ir_import_external_decls(llvm::Module& src, llvm::Module& dst,
-    const std::vector<import_name_entry>& names, bool star, const TOKEN& diag_tok) {
+    const std::vector<import_name_entry>& names, bool star, const TOKEN& diag_tok,
+    bool relaxed) {
 	llvm::LLVMContext& ctx = dst.getContext();
 	// 构建白名单原名集合 + 别名映射(原名→别名)
 	std::set<std::string> want_set;
@@ -257,16 +278,20 @@ void ir_import_external_decls(llvm::Module& src, llvm::Module& dst,
 
 	for (llvm::Function& sf : src) {
 		if (sf.isDeclaration()) continue;
-		if (!sf.hasExternalLinkage()) continue;
+		// relaxed 模式(.bc 直接加载):放宽 linkage 检查(允许 internal 函数,llvm-link 会自动提升)
+		if (!relaxed && !sf.hasExternalLinkage()) continue;
 		std::string sname = sf.getName().str();
 		if (is_reserved_c_extern(sname)) continue;
 		if (sname == "main") continue;
-		// 原名 = mangled 名最后一个 '.' 后半段;无 '.' → 顶层函数,不导入
+		// 提取原名:
+		//   - 有 mangling(mod.fn):原名 = '.' 后半段
+		//   - relaxed 模式:允许无 mangling,原名 = sname 本身
+		//   - 正常模式:无 '.' → 跳过(顶层函数)
 		std::string orig = sname;
 		auto dot = sname.rfind('.');
 		if (dot != std::string::npos && dot + 1 < sname.size())
 			orig = sname.substr(dot + 1);
-		else
+		else if (!relaxed)
 			continue;  // 无 mangling(顶层函数),不导入
 		// selective 模式:只处理白名单里的原名
 		if (!star) {
@@ -448,40 +473,50 @@ struct IRStateSaver {
 llvm::Value* AST_import::codegen() {
 	std::string mod_name = import_module_name(filename);
 	bool first_time = !import_has_processed(filename);
+	// .bc 预编译模块：跳过嵌套编译，直接读 bc 提取函数声明 + struct 类型
+	bool is_bc = filename.size() > 3 && filename.compare(filename.size() - 3, 3, ".bc") == 0;
 
-	// === 第一次 import 该模块:嵌套编译 .co + merge struct/class + 加 .bc 到链接清单 ===
-	//   后续同模块多次 selective import 跳过编译,只重复注入函数 decl(按本次白名单)
-	if (first_time) {
-		import_mark_processed(filename);
-		void* struct_snap = nullptr;
-		// 保存当前 ir 全局状态,开始嵌套编译
-		{
-			IRStateSaver saver;
-			ir_set_nested_mode(true);             // ir() 结尾:不建 main / 不写清单 / 仍写 .bc
-			ir_set_current_module_name(mod_name); // 该 module 内所有用户符号加前缀
-			co2bc(filename.c_str());              // 递归:会生成 filename 的 .bc + .ll
-			// 嵌套编译结束:此时 scope 仍是 inner scope(saver 析构才 restore)
-			//  → 快照 inner 中的 struct/class 类型注册,稍后 merge 回 outer
-			struct_snap = scope::snapshot_struct_scope_from_current();
-		}
-		// 此时 saver 析构已恢复主模块的 ir_module / ir_builder / 作用域
-		// merge import 模块的 struct/class 类型注册到主模块作用域(按白名单+别名)
-		//   必须在 saver 析构后做,否则 merge 的结果会被 restore 覆盖掉
-		//   注:struct merge 只在第一次做(快照来自嵌套编译);后续同模块 import 的 struct
-		//      白名单不再生效——若需导入多个 struct,应一次性写全(如 import A, B from "x";)
-		scope::merge_imported_struct_scope(struct_snap, import_tok, names, star);
-		struct_snap = nullptr;
-		// 加 .bc 到链接清单(只第一次,后续同模块已在清单)
-		std::string bc_path = co_base(filename.c_str()) + ".bc";
-		bc_path = path_normalize_backslash(path_to_abs(bc_path));
-		import_add_bc_to_link_list(bc_path);
+	// bc_path：.bc 文件直接用；.co 文件把扩展名替换为 .bc
+	std::string bc_path;
+	if (is_bc)
+		bc_path = path_normalize_backslash(path_to_abs(filename));
+	else {
+		bc_path = path_normalize_backslash(path_to_abs(co_base(filename.c_str()) + ".bc"));
 	}
 
-	// === 每次都注入函数声明(支持同模块多次 selective import,按本次白名单+别名)===
-	//   从 .bc 读回 Module,ir_import_external_decls 按白名单筛选注入 + 注册表 key 用别名
+	// === 第一次 import 该模块 ===
+	//   .co：嵌套编译 + merge struct/class + 加 .bc 到链接清单
+	//   .bc：跳过嵌套编译，加 .bc 到链接清单；struct 注册和函数声明在下方统一 parseBitcodeFile 里完成
+	if (first_time) {
+		import_mark_processed(filename);
+		if (is_bc) {
+			import_add_bc_to_link_list(bc_path);
+		} else {
+			// === .co：嵌套递归编译 ===
+			void* struct_snap = nullptr;
+			{
+				IRStateSaver saver;
+				ir_set_nested_mode(true);             // ir() 结尾:不建 main / 不写清单 / 仍写 .bc
+				ir_set_current_module_name(mod_name); // 该 module 内所有用户符号加前缀
+				co2bc(filename.c_str());              // 递归:会生成 filename 的 .bc + .ll
+				// 嵌套编译结束:此时 scope 仍是 inner scope(saver 析构才 restore)
+				//  → 快照 inner 中的 struct/class 类型注册,稍后 merge 回 outer
+				struct_snap = scope::snapshot_struct_scope_from_current();
+			}
+			// 此时 saver 析构已恢复主模块的 ir_module / ir_builder / 作用域
+			// merge import 模块的 struct/class 类型注册到主模块作用域(按白名单+别名)
+			//   必须在 saver 析构后做,否则 merge 的结果会被 restore 覆盖掉
+			//   注:struct merge 只在第一次做(快照来自嵌套编译);后续同模块 import 的 struct
+			//      白名单不再生效——若需导入多个 struct,应一次性写全(如 import A, B from "x";)
+			scope::merge_imported_struct_scope(struct_snap, import_tok, names, star);
+			struct_snap = nullptr;
+			import_add_bc_to_link_list(bc_path);
+		}
+	}
+
+	// === 每次都 parseBitcodeFile + 注入函数声明（支持同模块多次 selective import）===
+	//   只 parse 一次，.bc 场景的 struct 注册也在这里做（避免两次 parse 导致 LLVM uniquify 后缀）
 	{
-		std::string bc_path = co_base(filename.c_str()) + ".bc";
-		bc_path = path_normalize_backslash(path_to_abs(bc_path));
 		llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> mbOrErr = llvm::MemoryBuffer::getFile(bc_path);
 		if (!mbOrErr) {
 			std::string msg = "import 模块 .bc 打开失败: " + bc_path + " (" + mbOrErr.getError().message() + ")";
@@ -499,7 +534,22 @@ llvm::Value* AST_import::codegen() {
 			ErrorExit((msg + " " + errstr).c_str(), import_tok);
 		}
 		std::unique_ptr<llvm::Module> imported = std::move(*importedOrErr);
-		ir_import_external_decls(*imported, *ir_module, names, star, import_tok);
+
+		// .bc 场景：第一次 import 时从 bc Module 提取 struct 类型注册到 scope
+		if (first_time && is_bc) {
+			for (llvm::StructType* bc_st : imported->getIdentifiedStructTypes()) {
+				if (!bc_st->hasName()) continue;
+				std::string sname = bc_st->getName().str();
+				if (sname.compare(0, 7, "struct.") == 0) continue;
+				// 在 ir_context 里通过名字拿到权威 StructType（就是 bc_st 本身，因为同 context）
+				llvm::StructType* st = llvm::StructType::getTypeByName(ir_context, sname);
+				if (!st) st = bc_st;
+				scope::register_struct_type_forward(st, sname, import_tok);
+			}
+		}
+
+		// 注入函数声明（relaxed=true 允许 .bc 里的 internal linkage + 无 mangling 顶层函数）
+		ir_import_external_decls(*imported, *ir_module, names, star, import_tok, is_bc);
 	}
 
 	// === 模块别名/模块名登记(供 AST_var/AST_new/AST_call 限定调用校验)===

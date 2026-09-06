@@ -8,18 +8,19 @@
 
 AST_struct::AST_struct(std::vector<TOKEN>& tokens)
 {
-	// 可选顶层可见性修饰符：[public|private] struct NAME {
-	//   解析（与 AST_class 构造函数同样规则）：显式 public → toplevel_public=true；显式 private/不写 → false
-	//   （方案 B 默认不写视为 private：import 方不能用，与 class 行为对称）
-	if (!tokens.empty() && tokens[0].type == TOKEN_TYPE::code)
+	// 可选顶层可见性修饰符：public struct NAME {
+	//   private 关键字已移除（2026-09-06）：不写修饰符默认即为私有（import 侧不可见）；
+	//   显式写 private 由 ast1() 分派入口统一拦截报错，这里做防御性检查。
+	if (!tokens.empty() && tokens[0].type == TOKEN_TYPE::code
+		&& tokens[0].Value == "private")
 	{
-		if (tokens[0].Value == "public") {
-			toplevel_public = true;
-			tokens.erase(tokens.begin());
-		} else if (tokens[0].Value == "private") {
-			toplevel_public = false;
-			tokens.erase(tokens.begin());
-		}
+		ErrorExit("'private' 关键字已移除：struct 默认即为私有（仅当前模块内可见）；需要跨模块公开时请使用 'public struct'", tokens[0]);
+	}
+	if (!tokens.empty() && tokens[0].type == TOKEN_TYPE::code
+		&& tokens[0].Value == "public")
+	{
+		toplevel_public = true;
+		tokens.erase(tokens.begin());
 	}
 	tokens.erase(tokens.begin());           // eat "struct"
 	// FIX（2026-09-02，P0#1）："struct" 后没名字，tokens[0] UB
@@ -135,9 +136,9 @@ llvm::Value* AST_struct::codegen()
 	// 再入正式表：structType 与 forward 登记的指针相同 → register_struct_type 同指针 noop；重名时若不同指针会已报错
 	scope::register_struct_type(structType, name);
 	scope::set_struct_field_indexes(structType, field_names);
-	// struct 与 class 对称（方案 B）：
+	// struct 与 class 对称：
 	//   写了 public struct NAME → toplevel_public=true → import 侧类型名可见；
-	//   没写 或 private struct NAME → toplevel_public=false → import 侧类型名隐藏，报 undefined type name。
+	//   没写修饰符（默认私有）→ toplevel_public=false → import 侧类型名隐藏，报 undefined type name。
 	scope::mark_struct_import_public(name.Value, toplevel_public);
 	return nullptr;
 }

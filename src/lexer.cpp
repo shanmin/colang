@@ -281,13 +281,36 @@ void lexer(std::vector<TOKEN>& tokens, SRCINFO& srcinfo)
 			if (current.empty())
 			{
 				while (is_opcode1(src[0]))
+			{
+				// 可变参数省略号：三个连续 '.' 合并为单个 "..." token（函数变参原型，如 printf(char* fmt, ...)）
+				//   必须先于浮点小数点判断（"..." 第二位是 '.' 不是数字，本不会触发小数点分支，放最前仅为清晰）
+				if (src[0] == '.' && src[1] == '.' && src[2] == '.')
 				{
-					// 特殊：如果当前符号是 '.' 且紧跟数字字符 → 不是字段符，这是浮点数字面量的小数点（如 .25）
-					//   跳过 opcode 分支 → 交给下面「读取标识符/数字」分支，isdigit 不成立，但后面拼接数字时会把 "." 并入 number 字符串。
-					//   同时也要处理 "3.25" 的场景：数字分支先拼 "3" 遇到 "."，此处如果 current.empty()+下一位数字→仍归 number（但 current.empty() 场景 current="3" 已经在上面分支）。
-					// 更稳妥处理：. is_opcode1 成立但下一位 isdigit → 当前不要把 . 当 opcode，跳出 while，交给通用"标识符/数字"分支时若 current 起始 '.' 后跟 digits 当数字。
-					if (src[0] == '.' && isdigit((unsigned char)src[1]))
-						goto NOT_OPCODE1;
+					current += "...";
+					src += 3;
+					current_col_index += 3;
+					break;
+				}
+
+				// 特殊：如果当前符号是 '.' 且紧跟数字字符 → 不是字段符，这是浮点数字面量的小数点（如 .25）
+				//   跳过 opcode 分支 → 交给下面「读取标识符/数字」分支，isdigit 不成立，但后面拼接数字时会把 "." 并入 number 字符串。
+				//   同时也要处理 "3.25" 的场景：数字分支先拼 "3" 遇到 "."，此处如果 current.empty()+下一位数字→仍归 number（但 current.empty() 场景 current="3" 已经在上面分支）。
+				// 更稳妥处理：. is_opcode1 成立但下一位 isdigit → 当前不要把 . 当 opcode，跳出 while，交给通用"标识符/数字"分支时若 current 起始 '.' 后跟 digits 当数字。
+				if (src[0] == '.' && isdigit((unsigned char)src[1]))
+					goto NOT_OPCODE1;
+
+				// 数组语法：识别 "[]" 作为数组类型标记
+				if (src[0] == '[' && src[1] == ']')
+					{
+						current += src[0];
+						src++;
+						current_col_index++;
+						current += src[0];
+						src++;
+						current_col_index++;
+						break;
+					}
+					
 					current += src[0];
 					src++;
 					current_col_index++;
@@ -328,7 +351,17 @@ NOT_OPCODE1:
 					token.filename = srcinfo.filename;
 					token.row_index = current_row_index;
 					token.col_index = current_col_index;
-					token.type = TOKEN_TYPE::opcode;
+					
+					// 检查是否是数组语法 "[]"
+					if (current == "[]")
+					{
+						token.type = TOKEN_TYPE::array;
+					}
+					else
+					{
+						token.type = TOKEN_TYPE::opcode;
+					}
+					
 					token.Value = current;
 					tokens.push_back(token);
 

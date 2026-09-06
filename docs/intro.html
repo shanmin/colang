@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title></title>
+<link rel="stylesheet" type="text/css" href="common.css">
+<script src="common.js"></script>
+<script src="../dist/jslib.min.js"></script>
+</head>
+<body>
+	<h1>前言</h1>
+	<p>本文档是Co语言的一个基本说明。在阅读本文件前，请确认您已经具有其他语言的编程基础，也就是说本书不是一个编程启蒙的文档。</p>
+	Co语言属于类C语言，很多基本的语法结构与C语言是一致的，简单的可以理解为Co=C+object，也就是支持对象的C语言。
+	在整个语言的设计中，我们参考了其他语言的一些也行，例如C、C++、C#、PHP、JavaScript等，在整个语言使用中您会逐渐看到这些语言的影子。</p>
+	<p>如果在学习过程中遇到任何问题或有什么想法，请发到 <a href="https://github.com/shanmin/jslib/issues" target="_blank">https://github.com/shanmin/jslib/issues</a> 进行交流。如果提交issue不方便，也可以直接给我们发送邮件进行交流 Email: <a href="mailto:0123@163.com">0123@163.com</a> 。</p>
+	<p>查看文档请前往： <a href="https://shanmin.github.io/jslib/" target="_blank">https://shanmin.github.io/jslib/</a> 或直接使用浏览器打开项目中的index.html文件。</p>
+
+	<h1>引用文件</h1>
+	<p>在使用$js时，一定要引用dist/jslib.min.js文件。</p>
+	<fieldset>
+		<legend>HTML引用示例</legend>
+		<pre>
+&lt;html&gt;
+&lt;head&gt;
+	&lt;script src="jslib.min.js">&lt;/script>
+&lt;/head&gt;
+&lt;body&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</pre>
+	</fieldset>
+	<p>jslib.min.js文件的存放位置不做任何限定，可根据项目自身的需要把dist目录下jslib.min.js文件进行任意存放（其他分包文件如果使用了，建议与jslib.min.js放到同一目录，如果未放置同一目录则需要设置$js.PATH属性）。</p>
+	<h2>分包文件</h2>
+	<p>因为本JSLib库比较大，所以当主文件大于1M时我们会考虑拆包的问题。通常，我们会按照不同功能进行拆包，例如与中文相关的操作，我们已经拆出一个jslib.zh.min.js的独立文件。在使用这类方法时，需要这个分包文件在jslib.min.js同目录下保存，但不需要手工进行引用，库会在调用时自动进行加载操作（按需加载）。</p>
+	<p>分包文件使用的建议：正常情况下由$js自动加载分包文件没有什么问题，但是由于按需加载分包文件会导致相关方法调用的延时，如果介意这个延时则可以使用主动加载分包文件的方式，例如：</p>
+	<fieldset><legend>分包手工引用示例</legend>
+	<pre>
+&lt;html&gt;
+&lt;head&gt;
+	&lt;script src="jslib.min.js">&lt;/script>
+	&lt;script src="jslib.zh.min.js">&lt;/script>
+&lt;/head&gt;
+&lt;body&gt;
+&lt;/body&gt;
+&lt;/html&gt;</pre>
+	</fieldset>
+	需要注意的是，这个分包文件一定要在主文件jslib.min.js后面加载，否则会出现功能不完整的情况。
+	<h1>调用示例</h1>
+	<fieldset>
+		<legend>HTML</legend>
+		<pre>&lt;script src="jslib.min.js">&lt;/script>
+&lt;script>
+	let js=$js('div');
+&lt;/script></pre>
+	</fieldset>
+	<fieldset>
+		<legend>JavaScript链式调用示例</legend>
+		<pre>$js('div').find('.a1').html('&lt;div>abc&lt;/div>');</pre>
+	</fieldset>
+
+	<h1>发布说明</h1>
+	<p>实际使用时，仅需要部署dist目录下文件即可。本项目中的其他文件仅做为JSLib文档及示例使用。</p>
+
+	<h1>版本说明</h1>
+	<p>正常情况下JSLib版本号分为三部分：a.b.c。</p>
+	<p>如果a有变化，则表示整个库架构有所变化，对之前调用的兼容性会带来比较大的影响，升级时需要重新测试所有的接口调用。</p>
+	<p>如果b有变化，则表示部分接口有所变化，对之前调用的指定功能兼容性会带来一定影响，升级时需要重新测试升级接口的调用。</p>
+	<p>如果c有变化，则表示小幅度更改或新功能添加。一般来说不会对之前的调用造成实质影响。</p>
+	<p>需要注意的是JSLib的版本号规则与通常的版本号规则的差异，因为做为库类项目，接口兼容性比功能性更重要，所以JSLib的版本号是根据接口变化程度修改的。例如，我们在新增功能或接口时，一般只会更改此版本号c，而之前某个接口的参数或功能变更会修改版本号b，这点与通常意义上的版本号不一样。</p>
+</body>
+</html>

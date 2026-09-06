@@ -11,6 +11,7 @@ AST_var::AST_var(std::vector<TOKEN>& tokens)
 	//变量声明现在的形态：
 	//   <type> <name>;              — type = 单 token code（int/float/Vec 等 struct 名）
 	//   <type>* <name>; / <type>** <name>; — 1+ 颗 *
+	//   <type>[] <name>; — 数组类型
 	//   <mod>.<type> <name> / <mod>.<type>* <name>; — 模块限定类型名（mod 必须是已 import 的模块）
 	// 不支持 "struct T name" 两 token（按用户规则），所以 type 里没有「struct + NAME」双 token 分支；
 	//   struct NAME 字段类型专用（self forward）只在 AST_struct 字段解析阶段出现，不会走这里的 AST_var 入口。
@@ -36,6 +37,12 @@ AST_var::AST_var(std::vector<TOKEN>& tokens)
 	// 可选 pointer-star(s)：* 或 &（此处 & 仅用于星号式兼容，原代码当 * 处理）
 	while (tokens.size() >= 1 && tokens[0].type != TOKEN_TYPE::string &&
 		   (tokens[0].Value == "*" || tokens[0].Value == "&"))
+	{
+		type.push_back(tokens[0]);
+		tokens.erase(tokens.begin());
+	}
+	// 可选 array brackets：[]
+	if (tokens.size() >= 1 && tokens[0].type == TOKEN_TYPE::array && tokens[0].Value == "[]")
 	{
 		type.push_back(tokens[0]);
 		tokens.erase(tokens.begin());

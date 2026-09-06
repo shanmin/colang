@@ -93,9 +93,10 @@ public:
 	//返回字段序号：若字段不存在，返回 (unsigned)-1 供调用方判断是否 ErrorExit
 	static unsigned                 get_struct_field_index(llvm::StructType* st, const std::string& field_name);
 	static bool                     has_var_any_scope(const std::string& name);
-	// 标记某个 struct/class 的 import 侧可见性：true=public（import 方 forward 注册），false/private 不可见
-	//   - AST_class codegen：顶层写 public class → 标 true；private class 或省略 → 标 false
-	//   - struct 默认 false（保持旧行为，不自动跨 import 可见）；若将来支持 public struct，再入口写 true
+	// 标记某个 struct/class 的 import 侧可见性：true=public（import 方 forward 注册），false=私有不可见
+	//   - AST_class codegen：顶层写 public class → 标 true；省略修饰符（默认私有）→ 标 false
+	//   - AST_struct codegen：显式 public struct → 标 true；省略修饰符（默认私有）→ 标 false
+	//   - private 关键字已移除（2026-09-06）：不写 public 即为私有
 	static void                     mark_struct_import_public(const std::string& sname, bool is_public);
 	static bool                     is_struct_import_public (const std::string& sname);
 	// true iff 当前 Module 已有名为 name 的 GlobalValue（function 或 global var），用于 struct 注册时与"已存在的全局函数名"冲突检测
@@ -263,7 +264,8 @@ class AST_function :public AST
 	std::vector<TOKEN> args;
 	//std::vector<AST*> body;
 	AST* body=NULL;
-	// 访问修饰符：true = private（默认，InternalLinkage 仅模块内可见），false = public（ExternalLinkage 跨模块可见）
+	// 访问修饰符：true = 私有（默认，InternalLinkage 仅模块内可见），false = public（ExternalLinkage 跨模块可见）
+	//   private 关键字已移除（2026-09-06）：不写修饰符即为私有；写 public 才公开
 	//   main 入口函数强制 ExternalLinkage，不受此字段影响（入口点必须对外可见）
 	bool is_private = true;
 public:
@@ -306,8 +308,8 @@ public:
 class AST_struct :public AST
 {
 	TOKEN name;
-	// 顶层可见性修饰符：方案 B 与 class 对称；没写/private → import 侧不可见；显式 public → import 侧可见
-	//   （由 AST_struct 构造函数解析 tokens 开头的 public/private；没有修饰符时默认 false，与 B 方案保持一致。）
+	// 顶层可见性修饰符：与 class 对称；不写修饰符（默认私有）→ import 侧不可见；显式 public → import 侧可见
+	//   （private 关键字已移除（2026-09-06）：由 AST_struct 构造函数只解析 tokens 开头的 public；没有修饰符时默认 false。）
 	bool toplevel_public = false;
 public:
 	//字段类型 token 列表（每字段 1 个 vector<TOKEN>；ir_type() 可直接消费：支持 int / int* / struct T / struct T*）
@@ -457,7 +459,8 @@ public:
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-//解析 import 路径：相对当前源文件所在目录解析目标文件名；若目标无扩展名自动补 .co
+//解析 import 路径：相对当前源文件所在目录解析目标文件名
+//	已有 .co/.bc 扩展名 → 直接用；无扩展名 → 先找 .co 再找 .bc
 //	cur_source_file：当前执行 import 的 .co 路径（绝对或相对均可）
 //	import_target  ：import 语句字符串 token 内容（不含引号）
 //	diag_tok       ：用于报错定位的 token（建议传字符串 token）
@@ -551,8 +554,10 @@ llvm::Function* ir_find_function_or_nul(const std::string& call_name);
 //    （不复制 body，只声明 —— 链接时 llvm-link 会合并 body）
 //    names/star: selective 模式白名单（star=true 忽略白名单全量导入）；
 //    注册表 key = 别名(若有)否则原名；selective 模式找不到的原名会 ErrorExit
+//    relaxed=true 时放宽过滤（.bc 直接加载场景）：允许 internal linkage 函数 + 无 mangling 的顶层函数名
 void ir_import_external_decls(llvm::Module& src, llvm::Module& dst,
-    const std::vector<import_name_entry>& names, bool star, const TOKEN& diag_tok);
+    const std::vector<import_name_entry>& names, bool star, const TOKEN& diag_tok,
+    bool relaxed = false);
 
 // import 模块名注册表：AST_import codegen 成功加载模块后登记模块名（含去重），
 //  供 AST_var / AST_new 中遇到 "模块名.类型名" 限定写法时校验"模块前缀真的 import 过"。
