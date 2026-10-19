@@ -1,0 +1,18 @@
+.lang-toggle-button {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 10px;
+  margin: 0 4px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--fg-color, #333);
+  font-size: 14px;
+  line-height: 32px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.lang-toggle-button:hover {
+  background: rgba(0, 0, 0, 0.1);
+  text-decoration: none;
+}

@@ -1,0 +1,66 @@
+name: Deploy docs to GitHub Pages
+
+on:
+  # push 到 main 分支时自动构建并发布
+  push:
+    branches: [main]
+  # 允许在 Actions 页面手动触发
+  workflow_dispatch:
+
+# 赋予 GITHUB_TOKEN 发布 Pages 所需权限
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只跑一个部署；不过度加 group，取消进行中的部署会中断发布
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 安装预编译的 mdbook（无需 cargo/Rust 工具链）
+      - name: Setup mdBook
+        uses: peaceiris/actions-mdbook@v3
+        with:
+          mdbook-version: 'latest'
+
+      # 分别构建 zh / en 两套 book（产物在 docs/zh/book、docs/en/book）
+      - name: Build with mdBook (zh + en)
+        run: |
+          mdbook build docs/zh
+          mdbook build docs/en
+
+      # 合并到同一站点：/colang/zh/、/colang/en/，根目录放语言选择落地页
+      - name: Assemble site
+        run: |
+          mkdir -p site/zh site/en
+          cp -r docs/zh/book/* site/zh/
+          cp -r docs/en/book/* site/en/
+          cp docs/index.html site/index.html
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      # 上传合并后的 site/ 作为 Pages artifact
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

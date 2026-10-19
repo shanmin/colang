@@ -1,0 +1,18 @@
+[book]
+authors = ["shanmin"]
+language = "en"
+multilingual = false
+src = "src"
+title = "The Co Programming Language"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+site-url = "/colang/en/"
+git-repository-url = "https://github.com/shanmin/colang"
+git-repository-icon = "fa-github"
+edit-url-template = "https://github.com/shanmin/colang/edit/main/docs/en/{path}"
+additional-css = ["lang-toggle.css"]
+additional-js = ["lang-toggle.js"]

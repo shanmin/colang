@@ -1,0 +1,3 @@
+# mdBook 构建产物（由 mdbook build 生成，不入库）
+zh/book/
+en/book/
