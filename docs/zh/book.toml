@@ -11,7 +11,7 @@ create-missing = false
 [output.html]
 site-url = "/colang/zh/"
 git-repository-url = "https://github.com/shanmin/colang"
-git-repository-icon = "fa-github"
+git-repository-icon = "fab-github"
 edit-url-template = "https://github.com/shanmin/colang/edit/main/docs/zh/{path}"
 additional-css = ["lang-toggle.css"]
 additional-js = ["lang-toggle.js"]
