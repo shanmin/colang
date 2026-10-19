@@ -1,7 +1,6 @@
 [book]
 authors = ["shanmin"]
 language = "zh"
-multilingual = false
 src = "src"
 title = "Co程序设计"
 
