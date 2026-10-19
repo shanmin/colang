@@ -43,7 +43,7 @@ jobs:
             echo "$out"
             if [ $code -ne 0 ]; then
               status=$code
-              msg=$(echo "$out" | grep -iE 'error|panic|fail|couldn|not find|missing|invalid|toml' | tail -6 | tr '\n' ' ')
+              msg=$(echo "$out" | tr '\r' ' ' | tail -25 | tr '\n' '|')
               msg=${msg//%/%25}
               echo "::error title=mdbook $book build::${msg}"
             fi
