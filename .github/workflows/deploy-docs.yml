@@ -36,16 +36,17 @@ jobs:
       - name: Build with mdBook (zh + en)
         shell: bash
         run: |
+          set +e
           status=0
           for book in zh en; do
             echo "===== building docs/$book ====="
-            out=$(mdbook build "docs/$book" 2>&1); code=$?
+            out=$(mdbook build "docs/$book" 2>&1)
+            code=$?
             echo "$out"
-            if [ $code -ne 0 ]; then
+            if [ "$code" -ne 0 ]; then
               status=$code
-              msg=$(echo "$out" | tr '\r' ' ' | tail -25 | tr '\n' '|')
-              msg=${msg//%/%25}
-              echo "::error title=mdbook $book build::${msg}"
+              msg=$(printf '%s' "$out" | tr '\r\n' '  ' | sed 's/%/%25/g')
+              echo "::error::mdbook-$book-exit-$code-OUTPUT- ${msg}"
             fi
           done
           exit $status
