@@ -27,7 +27,7 @@ jobs:
 
       # 安装预编译的 mdbook（无需 cargo/Rust 工具链）
       - name: Setup mdBook
-        uses: peaceiris/actions-mdbook@v3
+        uses: peaceiris/actions-mdbook@v2
         with:
           mdbook-version: 'latest'
 
