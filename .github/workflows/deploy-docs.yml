@@ -32,24 +32,10 @@ jobs:
           mdbook-version: 'latest'
 
       # 分别构建 zh / en 两套 book（产物在 docs/zh/book、docs/en/book）
-      # 捕获 mdBook 报错并通过 ::error:: 写成 annotation，便于远程定位（日志需 admin 权限无法直读）
       - name: Build with mdBook (zh + en)
-        shell: bash
         run: |
-          set +e
-          status=0
-          for book in zh en; do
-            echo "===== building docs/$book ====="
-            out=$(mdbook build "docs/$book" 2>&1)
-            code=$?
-            echo "$out"
-            if [ "$code" -ne 0 ]; then
-              status=$code
-              msg=$(printf '%s' "$out" | tr '\r\n' '  ' | sed 's/%/%25/g')
-              echo "::error::mdbook-$book-exit-$code-OUTPUT- ${msg}"
-            fi
-          done
-          exit $status
+          mdbook build docs/zh
+          mdbook build docs/en
 
       # 合并到同一站点：/colang/zh/、/colang/en/，根目录放语言选择落地页
       - name: Assemble site
