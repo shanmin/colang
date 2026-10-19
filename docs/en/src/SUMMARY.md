@@ -1,6 +1,6 @@
 # Co Language Documentation · Summary
 
-- [Introduction](intro.md)
+- [Introduction](README.md)
 
 <!--
   Add English documentation pages here; paths are relative to the src/ directory.
