@@ -1,0 +1,52 @@
+/* expr_control.co — 基础自校验测试
+ *
+ * 覆盖：整型算术 / 函数调用 / while / for + continue / switch-case-default。
+ * 约定：全部通过则 main 返回 0；首个失败项返回其编号（>= 1），
+ *       由 run_tests.ps1 以退出码判定。
+ */
+int printf(const char *fmt, ...);
+
+int add(int a, int b)
+{
+    return a + b;
+}
+
+int main(void)
+{
+    /* 1) 算术 + 函数调用 */
+    if (add(2, 3) != 5) { return 1; }
+    int x = 10;
+    x = x * 3 - 4;             /* 26 */
+    if (x != 26) { return 2; }
+    if (7 / 2 != 3) { return 3; }
+    if (7 % 2 != 1) { return 4; }
+
+    /* 2) while 累加 1..10 = 55 */
+    int sum = 0;
+    int i = 1;
+    while (i <= 10) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    if (sum != 55) { return 5; }
+
+    /* 3) for + continue：奇数和 1+3+5+7+9 = 25 */
+    int csum = 0;
+    for (int j = 0; j < 10; j = j + 1) {
+        if (j % 2 == 0) continue;
+        csum = csum + j;
+    }
+    if (csum != 25) { return 6; }
+
+    /* 4) switch / case / default：26 % 5 = 1 -> 200 */
+    int r = 0;
+    switch (x % 5) {
+        case 0: r = 100; break;
+        case 1: r = 200; break;
+        default: r = 999; break;
+    }
+    if (r != 200) { return 7; }
+
+    printf("expr_control: OK\n");
+    return 0;
+}

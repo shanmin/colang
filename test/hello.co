@@ -1,0 +1,12 @@
+/* hello.co — 端到端冒烟用例
+ *
+ * 目标：colang 编译 -> clang 链接 -> 运行，输出 "Hello, World!" 且 main 返回 0。
+ * 判定：run_tests.ps1 以进程退出码为准（0 = 通过）。
+ */
+int printf(const char *fmt, ...);
+
+int main(void)
+{
+    printf("Hello, World!\n");
+    return 0;
+}
