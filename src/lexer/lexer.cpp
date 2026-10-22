@@ -134,6 +134,9 @@ bool is_keyword(const std::string &word)
 		"alignas", "alignof", "asm", "bool", "constexpr", "false", "nullptr",
 		"static_assert", "thread_local", "true", "typeof", "typeof_unqual",
 		"_BitInt",
+		// P211 Co 层：单一存储类位关键字——标记顶层函数/全局为模块接口 + DLL 导出。
+		//   本批：纯存储类位，不改默认 linkage（非 public 仍 ExternalLinkage）。
+		"public",
 	};
 	return keywords.count(word) != 0;
 }

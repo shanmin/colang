@@ -16,6 +16,12 @@
 typedef long long time_t;   /* 8 字节，对齐 UCRT __int64 */
 typedef long clock_t;       /* 4 字节，对齐 UCRT long */
 
+/* POSIX 扩展：UCRT 亦在 <time.h> 提供该结构（tv_sec 为 8 字节 time_t） */
+struct timespec {
+    time_t tv_sec;   /* 秒 */
+    long   tv_nsec;  /* 纳秒 */
+};
+
 struct tm {
     int tm_sec;    /* 秒 [0,60] */
     int tm_min;    /* 分 [0,59] */

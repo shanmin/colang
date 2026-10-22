@@ -176,6 +176,13 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 	{
 		return env.var_type(e->name);
 	}
+	// 复合字面量 (type){...}：类型由 parser 直接写入 InitList::type；
+	// 缺失此项会让成员访问/取址解析拿不到基础类型，进而按空 tag 造出 opaque struct
+	// （GEP into unsized type）。
+	if (e->kind == ExprKind::InitList)
+	{
+		return e->type;
+	}
 	if (e->kind == ExprKind::Member)
 	{
 		// 获取基础表达式类型 → 查找成员名对应类型
@@ -190,7 +197,8 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 	if (e->kind == ExprKind::Unary && e->op == "*")
 	{
 		CTypePtr pt = resolve_expr_type(e->lhs, env);
-		if (pt && pt->kind == TypeKind::Pointer) return pt->base;
+		// 数组在 * 下按衰减后的指针处理（§6.5.3.2p3）：*arr 是「少一维的数组」，类型为其元素。
+		if (pt && (pt->kind == TypeKind::Pointer || pt->kind == TypeKind::Array)) return pt->base;
 		return nullptr;
 	}
 	if (e->kind == ExprKind::Unary && e->op == "&")
@@ -264,8 +272,37 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		}
 		return nullptr;
 	}
+	// 赋值表达式的结果类型 = 左值类型（C §6.5.16）；复合赋值同理（ptr += 2 → 指针）。
+	//   缺此项使 (obj1 = obj2).array[3]、(ptr1 = ptr2)->array[3] 取不到结构体 tag，
+	//   成员访问按空 tag 造出 opaque %struct.（GEP into unsized type，CTS 0044/0054 族）。
+	if (e->kind == ExprKind::Assign)
+	{
+		return resolve_expr_type(e->lhs, env);
+	}
+	// 逗号表达式结果类型 = 最后一个子表达式（§6.5.17）；空列表回退 nullptr。
+	if (e->kind == ExprKind::Comma)
+	{
+		if (e->args.empty()) return nullptr;
+		return resolve_expr_type(e->args.back(), env);
+	}
+	// 三元表达式（§6.5.15）：两臂同 tag 的 struct/union → 该类型；同型指针 → 该指针；
+	//   其余仅在两臂类型兼容时采纳首臂，否则维持旧 nullptr 行为（最小 blast radius）。
+	if (e->kind == ExprKind::Ternary)
+	{
+		CTypePtr a = e->args.size() > 0 ? resolve_expr_type(e->args[0], env) : nullptr;
+		CTypePtr b = e->args.size() > 1 ? resolve_expr_type(e->args[1], env) : nullptr;
+		if (!a) return b;
+		if (!b) return a;
+		if (a->kind == TypeKind::Struct || a->kind == TypeKind::Union)
+			return (a->kind == b->kind && !a->tag.empty() && a->tag == b->tag) ? a : nullptr;
+		if (types_compatible(a, b)) return a;
+		return nullptr;
+	}
 	if (e->kind == ExprKind::Call)
 	{
+		// va_arg(ap, T)：结果类型由 parser 直接写入 e->type；成员访问/取址需据此解析
+		//   （缺失时 (va_arg(ap, test_t)).i 会按空 tag 造出 opaque %struct.，CTS 0043 族）。
+		if (e->name == "va_arg" && e->type) return e->type;
 		// C23 stdckdint 内建返回 bool（此处以 i32 0/1 承载）：报告 Int 供转换使用
 		if (e->name == "ckd_add" || e->name == "ckd_sub" || e->name == "ckd_mul")
 			return make_type(TypeKind::Int);
@@ -291,8 +328,17 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 				return ct->base;
 			return nullptr;
 		}
-		// 函数调用: 查返回类型
-		return env.func_return(e->name);
+		// 函数调用: 查返回类型；未命中时把同名形参（函数类型参数，如 `int f4(union t f(void))`）
+		//   按间接调用处理，取其返回类型（缺此项 f().i 的成员访问拿不到 tag，CTS 0169 族）。
+		if (CTypePtr rt = env.func_return(e->name))
+			return rt;
+		if (CTypePtr vt = env.var_type(e->name))
+		{
+			if (vt->kind == TypeKind::Function) return vt->base;
+			if (vt->kind == TypeKind::Pointer && vt->base && vt->base->kind == TypeKind::Function)
+				return vt->base->base;
+		}
+		return nullptr;
 	}
 	if (e->kind == ExprKind::StringLiteral)
 		return make_pointer(make_type(TypeKind::Char));

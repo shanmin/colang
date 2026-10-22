@@ -51,6 +51,9 @@ enum class TypeKind
 struct CType;
 using CTypePtr = std::shared_ptr<CType>;
 
+struct Expr;
+using ExprPtr = std::shared_ptr<Expr>;   // 前置声明：CType 需携带 VLA 维度表达式
+
 struct CType
 {
 	TypeKind kind = TypeKind::Int;
@@ -61,6 +64,11 @@ struct CType
 
 	// Array：元素数量（0 = 未指定）
 	std::size_t array_size = 0;
+
+	// Array（C99 VLA，§6.7.2.1）：维度为非常量表达式时置位，vla_dim 供 codegen 运行期求值。
+	// 与 array_size==0（未指定/柔性）区分开：柔性数组无维度表达式，VLA 有运行期个数。
+	bool is_vla = false;
+	ExprPtr vla_dim;
 
 	// Function：返回类型用 base；参数列表 + 是否变参
 	std::vector<CTypePtr> params;
@@ -207,6 +215,7 @@ struct Stmt
 	std::string var_name;
 	ExprPtr var_init;
 	bool is_static = false;  // 局部 static
+	bool is_extern = false;  // 块作用域 extern 声明（引用文件作用域对象）
 	unsigned var_align = 0;  // C23 _Alignas 强制对齐（字节；0 = 未指定）
 
 	// Compound: 仅真块 {...} 为 true；parser 把多声明符折成的合成 Compound 为 false
@@ -242,6 +251,7 @@ struct FuncDecl
 	std::vector<Param> params;
 	bool is_variadic = false;
 	bool is_static = false;  // static 函数 (InternalLinkage)
+	bool is_public = false;  // P211 Co 层：public 标记 → DLL 导出（不改 linkage）
 	StmtPtr body; // CompoundStmt if definition; nullptr if declaration only
 	SourceLoc loc;
 };
@@ -253,6 +263,7 @@ struct GlobalVar
 	ExprPtr init; // nullptr = 无显式初始化
 	bool is_static = false;  // InternalLinkage
 	bool is_extern = false;  // 纯声明（无定义）
+	bool is_public = false;  // P211 Co 层：public 标记 → DLL 导出（不改 linkage）
 	unsigned align = 0;      // C23 _Alignas 强制对齐（字节；0 = 未指定）
 	SourceLoc loc;
 };
@@ -272,6 +283,7 @@ struct StructDef
 {
 	std::string tag;     // struct Name 的 Name
 	bool is_union = false;
+	bool is_definition = false; // 带 { ... } 的完整定义（false = 仅前置引用，成员表为空不代表空类型）
 	std::vector<StructMember> members;
 	SourceLoc loc;
 };
@@ -299,6 +311,9 @@ struct TranslationUnit
 	std::vector<StructDef> structs;
 	std::vector<EnumDef> enums;
 	// P3+: union decls (folded into structs with is_union flag)
+	// P211 Co 层入口模型：文件作用域的裸语句序列（printf/if/for/return/...）
+	//   按源码顺序保留，codegen 在合成 main 中依序发射。
+	std::vector<StmtPtr> top_level_body;
 };
 
 using TUPtr = std::shared_ptr<TranslationUnit>;

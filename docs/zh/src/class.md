@@ -51,7 +51,7 @@ Co 里 class 变量持有的是对象的**引用（句柄）**：类名本身就
 
 ### 创建与使用
 
-下面是一个端到端最小示例（构造/析构、方法、`this`、`static` 与 `::`、默认 `private`）：
+下面是一个端到端最小示例（构造/析构、方法、`this`、`static` 与 `::`、未标 `public` 的成员）：
 
 ```
 class Counter
@@ -61,13 +61,13 @@ class Counter
     public void inc()        { count = count + 1; }
     public int  value()      { return this.count; }      // this 指代当前对象
     public static int twice(int x) { return x * 2; }     // static 成员
-    int count;                                           // 未标 public，默认 private
+    int count;                                           // 未标 public，仅类内可见
 }
 
 Counter c = new Counter();            // 在堆上创建，由 c（引用/句柄）持有
 c.inc();                              // 用点号调用实例方法
 c.inc();
-printf("%d\n", c.value());            // 输出 2（private 的 count 经 public 方法读出）
+printf("%d\n", c.value());            // 输出 2（仅类内可见的 count 经 public 方法读出）
 printf("%d\n", Counter::twice(21));   // static 通过类名加 :: 访问，输出 42
 // c 离开作用域后自动回收，无需手动释放
 ```
@@ -75,8 +75,8 @@ printf("%d\n", Counter::twice(21));   // static 通过类名加 :: 访问，输�
 ### 成员与方法
 
 - **实例方法**：通过隐式的 `this` 指代当前对象，读写其自身的数据。
-- **static 成员/方法**：属于类本身而非某个实例；在本模块内以零初始化的状态存在，通过类名加 `::` 访问，如 `C::m()`。
-- **可访问性**：成员/方法默认为 `private`（仅类内可见）；只有显式 `public` 修饰才对外可见。
+- **static 成员/方法**：属于类本身而非某个实例；在本模块内以零初始化的状态存在，通过类名加 `::` 访问，如 `C::m()`。这里的 `static` 仅修饰**类成员**，与 C 里文件作用域的 `static`（限定符号仅在单个翻译单元内可见）不是同一回事；Co 的模块内部可见性以**省略 `public`** 表达（见「模块」章节）。
+- **可访问性**：`public` 是 Co 唯一的可见性关键字（没有 `private`，也不另设 `export`）。成员/方法未标 `public` 即仅在类内可见，只有显式标 `public` 才对外可见。
 
 ### 生命周期（对外行为）
 

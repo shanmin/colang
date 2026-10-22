@@ -44,15 +44,92 @@ struct Parser
 	// 当前 TU 指针（parse_decl_specifiers 存 struct/enum 用）
 	TranslationUnit *cur_tu_ = nullptr;
 	bool last_auto_ = false; // parse_decl_specifiers 返回 nullptr 且因 auto
+	// parse_decl_specifiers 期间消费到的存储类说明符（说明符可任意顺序，调用方读取后合并）
+	bool last_static_ = false;
+	bool last_extern_ = false;
+	bool last_typedef_ = false;
+	bool last_public_ = false; // P211 Co 层：public 存储类位（仅顶层函数/全局有意义）
 	unsigned last_alignas_ = 0; // parse_decl_specifiers 捕获的 _Alignas 强制对齐（字节；0=未指定）
 	// 函数名 -> 返回类型（auto 推断用）
 	std::unordered_map<std::string, CTypePtr> func_return_types_;
 	// 局部变量名 -> 类型（typeof/auto 推断用，作用域简化为全局累积）
 	std::unordered_map<std::string, CTypePtr> local_var_types_;
+	// struct/union/enum 标签的块作用域栈：块内重定义同名 tag 时重命名为唯一 tag，
+	//   避免覆盖文件作用域的同名定义（C §6.2.1p4：tag 是有作用域的标识符）。
+	//   每层 map：块内写的 tag → 实际 tag（无重命名时与写名相同）。
+	std::vector<std::unordered_map<std::string, std::string>> tag_scope_;
+	int block_depth_ = 0;
+	unsigned tag_rename_seq_ = 0;
+	// 块作用域的普通标识符（局部变量/形参）名字栈：parser 把 enum 常量折叠成字面量，
+	//   需先判断该名是否被内层变量声明隐藏（C 同名空间，内层声明隐藏外层 enumerator）。
+	std::vector<std::unordered_set<std::string>> var_scope_;
+	// 函数形参名：进入函数体复合语句时注入新作用域
+	std::vector<std::string> pending_param_names_;
 
 	Parser(const std::vector<Token> &tokens, std::vector<Error> &errors)
 		: toks(tokens), errs(errors)
 	{
+	}
+
+	// 把源码写的 tag 解析为实际 tag（由内向外查块作用域栈；未命中即原样）
+	std::string resolve_tag(const std::string &tag)
+	{
+		for (auto it = tag_scope_.rbegin(); it != tag_scope_.rend(); ++it)
+		{
+			auto f = it->find(tag);
+			if (f != it->end()) return f->second;
+		}
+		return tag;
+	}
+
+	// 登记局部声明的名字（供 enum 常量遮蔽判定）
+	void note_local_name(const std::string &n)
+	{
+		if (!var_scope_.empty()) var_scope_.back().insert(n);
+	}
+
+	// 该名是否被内层局部声明（变量或形参）占用
+	bool name_in_scope(const std::string &n) const
+	{
+		for (auto it = var_scope_.rbegin(); it != var_scope_.rend(); ++it)
+			if (it->count(n)) return true;
+		return false;
+	}
+
+	// 生成块作用域 tag 的内部唯一名：块内定义/首次声明一律独立于文件作用域同名 tag。
+	std::string fresh_block_tag(const std::string &tag)
+	{
+		return tag + ".__blk" + std::to_string(++tag_rename_seq_);
+	}
+
+	// 块作用域内的 struct/union 定义：先决定实际 tag，并在解析成员之前登记前置声明，
+	//   使成员中的递归自引用（如 struct tnode *left）落到同一 tag。
+	//   同块内已声明过 → 沿用映射；否则一律取唯一内部名（C §6.2.1p4：块内定义遮蔽外层同名 tag，
+	//   且文件作用域中后出现的同名定义不得覆盖它）。空 tag（匿名）不参与。
+	std::string begin_definition_tag(const std::string &tag, bool is_union)
+	{
+		if (tag.empty()) return tag;
+		std::string actual = tag;
+		if (block_depth_ > 0 && !tag_scope_.empty())
+		{
+			auto cur = tag_scope_.back().find(tag);
+			if (cur != tag_scope_.back().end())
+				actual = cur->second;
+			else
+			{
+				actual = fresh_block_tag(tag);
+				tag_scope_.back()[tag] = actual;
+			}
+		}
+		if (!struct_tags_.count(actual))
+		{
+			StructDef fwd;
+			fwd.tag = actual;
+			fwd.is_union = is_union;
+			cur_tu_->structs.push_back(std::move(fwd));
+			struct_tags_[actual] = cur_tu_->structs.size() - 1;
+		}
+		return actual;
 	}
 
 	// —— token 导航 ——
@@ -117,8 +194,25 @@ struct Parser
 		cur_tu_ = tu.get();
 		while (!at_end())
 		{
-			if (!parse_global_decl_or_func(*tu))
-				skip_to_semi();
+			// P211 Co 层入口模型：顶层先试声明/函数定义，失败则回滚后按裸语句入 top_level_body。
+			//   回滚需同时恢复 errs（防 expect_punct("(") 等推测性报错污染）。
+			const std::size_t save_pos = pos;
+			const std::size_t save_errs = errs.size();
+			if (parse_global_decl_or_func(*tu))
+				continue;
+			pos = save_pos;
+			errs.resize(save_errs);
+			if (!is_type_start() && !check_punct("}"))
+			{
+				StmtPtr s = parse_stmt();
+				if (s)
+				{
+					tu->top_level_body.push_back(std::move(s));
+					continue;
+				}
+			}
+			error(peek().loc, "expected declaration or statement");
+			skip_to_semi();
 		}
 		return tu;
 	}
@@ -230,6 +324,8 @@ struct Parser
 				e->type->kind == TypeKind::Int)) return e->type;
 			return make_type(TypeKind::Int);
 		case ExprKind::FloatLiteral:
+			// f/F 后缀字面量已在构造处标 TypeKind::Float，优先采用（与 codegen 分派一致）。
+			if (e->type && e->type->kind == TypeKind::Float) return e->type;
 			return make_type(TypeKind::Double);
 		case ExprKind::StringLiteral:
 			return make_pointer(make_type(TypeKind::Char));
@@ -448,6 +544,40 @@ struct Parser
 		return natural;
 	}
 
+	// 判定数组维度是否为整型常量表达式（C99 VLA 判据，§6.5.2.1p1/§6.7.2.1）。
+	// 口径与 clang 实测一致：含 VarRef / Call 即非常量——C 里 `const int n = 5; int a[n];`
+	// 仍是 VLA（const 限定的变量不是整数常量表达式，与 C++ 不同）。
+	// 枚举常量已折成 IntLiteral；sizeof/_Alignof 结果为 size_t 常量（其操作数为 VLA 的
+	// 罕见形式不在此细分）；二元/三元/转换递归判定。
+	bool is_const_int_expr(const ExprPtr &e)
+	{
+		if (!e) return false;
+		switch (e->kind)
+		{
+		case ExprKind::IntLiteral:
+		case ExprKind::CharLiteral:
+			return true;
+		case ExprKind::VarRef:
+		case ExprKind::Call:
+		case ExprKind::Member:
+		case ExprKind::Assign:
+		case ExprKind::StringLiteral:
+			return false;
+		case ExprKind::Unary:
+			if (e->op == "sizeof" || e->op == "alignof") return true;
+			return is_const_int_expr(e->lhs);
+		case ExprKind::Cast:
+			return is_const_int_expr(e->lhs);
+		case ExprKind::Binary:
+			return is_const_int_expr(e->lhs) && is_const_int_expr(e->rhs);
+		case ExprKind::Ternary:
+			return is_const_int_expr(e->lhs) && is_const_int_expr(e->args.empty() ? nullptr : e->args[0])
+				&& is_const_int_expr(e->args.size() < 2 ? nullptr : e->args[1]);
+		default:
+			return false;
+		}
+	}
+
 	int64_t eval_const_int(const ExprPtr &e)
 	{
 		if (!e) return 0;
@@ -456,15 +586,60 @@ struct Parser
 		case ExprKind::IntLiteral:
 		case ExprKind::CharLiteral:
 			return e->int_val;
+		case ExprKind::Cast:
+		{
+			// 显式类型转换常量：递归求值源值后按目标类型做 C 值转换（§6.3.1.3）。
+			// 旧缺本分支 → (char)/(short)/(unsigned) 等 cast case 标签落 default 折成 0，
+			// 使 `switch((char)1){case (char)1:...}` 匹配不到（CTS 0150/0054/0149 declarator 矩阵族）。
+			// 截断/重解读须与 codegen fold_int_const 一致：按目标位宽 mod 2^N、有符号且最高位
+			// 置位则回绕为负；指针/浮点/struct 等非标量目标不截断透传。
+			int64_t v = eval_const_int(e->lhs);
+			if (e->type)
+			{
+				if (e->type->kind == TypeKind::Bool) return v ? 1 : 0;
+				unsigned bits = 0;
+				bool uns = e->type->is_unsigned;
+				switch (e->type->kind)
+				{
+				case TypeKind::Char: case TypeKind::Char8: bits = 8; break;
+				case TypeKind::Short: case TypeKind::Char16: case TypeKind::WChar: bits = 16; break;
+				case TypeKind::Int: case TypeKind::Long: case TypeKind::Char32: bits = 32; break;
+				case TypeKind::LongLong: bits = 64; break;
+				case TypeKind::BitInt: bits = e->type->bit_width; break;
+				default: bits = 0; break;
+				}
+				switch (e->type->kind) // wchar_t/char8_t/16/32 恒无符号
+				{
+				case TypeKind::WChar: case TypeKind::Char8: case TypeKind::Char16: case TypeKind::Char32: uns = true; break;
+				default: break;
+				}
+				if (bits > 0 && bits < 64)
+				{
+					uint64_t m = static_cast<uint64_t>(v) & ((1ull << bits) - 1);
+					if (!uns && (m >> (bits - 1)) != 0)
+						v = static_cast<int64_t>(m) - static_cast<int64_t>(1ull << bits);
+					else
+						v = static_cast<int64_t>(m);
+				}
+			}
+			return v;
+		}
 		case ExprKind::Unary:
 		{
 			if (e->op == "sizeof")
 			{
 				// 编译期 sizeof: 简化平台大小 (LLP64 Windows)
+				// 类型式 sizeof(T)：parser 已填 e->type。
 				if (e->type) return const_sizeof_type(e->type);
-				if (e->lhs && e->lhs->type && e->lhs->type->kind == TypeKind::BitInt)
-					return const_sizeof_type(e->lhs->type); // sizeof(位精确字面量)
-				if (e->lhs) return 4; // sizeof(expr) 默认按 int
+				// 表达式式 sizeof(expr)：按操作数表达式的类型求大小。
+				// 旧此路仅 BitInt 字面量特判、其余一律 return 4，令 `char s[sizeof(arr)+1]` 等
+				// sizeof(数组/结构/指针) 在数组维度/枚举/static_assert 语境误折成 int 大小 4（CTS 0119/0011 暴露）。
+				if (e->lhs)
+				{
+					CTypePtr ot = infer_auto_type(e->lhs);
+					if (ot) return const_sizeof_type(ot);
+					return 4; // sizeof(expr) 未能定型：默认按 int
+				}
 				return 4;
 			}
 			if (e->op == "alignof")
@@ -530,12 +705,20 @@ struct Parser
 				error(loc, "static assertion failed: " + (msg.empty() ? "" : msg));
 			return true;
 		}
-		// 存储类说明符
+		// 存储类说明符（前置消费 + parse_decl_specifiers 期间消费的任意顺序部分）
+		// P211 Co 层：允许 public 与 static/extern 任意顺序混用，顶层存储类位。
+		bool is_public = match_keyword("public");
 		bool is_static = match_keyword("static");
 		bool is_extern = match_keyword("extern");
+		// 后置顺序的 public（例如 `static public int x;`）在 parse_decl_specifiers 中消费。
+		if (match_keyword("public")) is_public = true;
 		// typedef 检测
 		bool is_typedef = match_keyword("typedef");
 		CTypePtr base_type = parse_decl_specifiers();
+		is_static = is_static || last_static_;
+		is_extern = is_extern || last_extern_;
+		is_typedef = is_typedef || last_typedef_;
+		is_public = is_public || last_public_;
 		unsigned ga = last_alignas_; // 本声明的 _Alignas（需在任何后续递归解析前捕获）
 		if (!base_type) return false;
 		// 纯类型定义（struct/enum 无变量名）: 后面跟 ';'
@@ -562,25 +745,30 @@ struct Parser
 			fn.name = std::move(name);
 			fn.return_type = std::move(dtype);
 			fn.is_static = is_static;
+			fn.is_public = is_public;
 			expect_punct("(");
 			parse_param_list(fn.params, fn.is_variadic);
 			expect_punct(")");
 			if (check_punct("{"))
+			{
+				pending_param_names_.clear();
+				for (const auto &p : fn.params) pending_param_names_.push_back(p.name);
 				fn.body = parse_compound_stmt();
+			}
 			else if (!check_punct(","))
 				match_punct(";");
 			func_return_types_[fn.name] = fn.return_type;
 			tu.funcs.push_back(std::move(fn));
 			// 多声明符续接（如 int f(int a), g(int a), a;）：其余声明符经 Decorator
 			while (match_punct(","))
-				parse_global_declarator_item(tu, base_type, is_static, is_extern, ga, loc);
+				parse_global_declarator_item(tu, base_type, is_static, is_extern, ga, loc, is_public);
 			match_punct(";");
 			return true;
 		}
 		// —— 对象/分组/函数指针对象声明符（可多个，逗号分隔）——
 		do
 		{
-			parse_global_declarator_item(tu, base_type, is_static, is_extern, ga, loc);
+			parse_global_declarator_item(tu, base_type, is_static, is_extern, ga, loc, is_public);
 		} while (match_punct(","));
 		match_punct(";");
 		return true;
@@ -588,13 +776,28 @@ struct Parser
 
 	CTypePtr parse_decl_specifiers()
 	{
-		// 先消费前置存储类关键字（不影响类型）
+		// 声明说明符可任意顺序出现（C §6.7.1p1：如 `volatile static int` / `struct S static x`）。
+		// 存储类在此统一消费并记入 last_*_，由调用方与前置已消费的存储类合并。
+		last_static_ = false;
+		last_extern_ = false;
+		last_typedef_ = false;
+		last_public_ = false;
+		bool cnst_front = false;
 		// register：C23 仍保留该关键字（存储类），但不保证真实寄存器绑定；按 clang 默认作 no-op 消费
-		while (match_keyword("register") ||
-			match_keyword("inline") || match_keyword("restrict") || match_keyword("_Inline") ||
-			match_keyword("_Noreturn") || match_keyword("_Thread_local") ||
-			match_keyword("thread_local") || match_keyword("_Atomic"))
-			;
+		for (;;)
+		{
+			if (match_keyword("static")) { last_static_ = true; continue; }
+			if (match_keyword("extern")) { last_extern_ = true; continue; }
+			if (match_keyword("typedef")) { last_typedef_ = true; continue; }
+			if (match_keyword("public")) { last_public_ = true; continue; }
+			if (match_keyword("register") || match_keyword("inline") || match_keyword("restrict") ||
+				match_keyword("_Inline") || match_keyword("_Noreturn") || match_keyword("_Thread_local") ||
+				match_keyword("thread_local") || match_keyword("_Atomic") || match_keyword("volatile"))
+				continue;
+			if (match_keyword("const") || match_keyword("constexpr")) { cnst_front = true; continue; }
+			break;
+		}
+		const bool sc_static = last_static_, sc_extern = last_extern_, sc_typedef = last_typedef_;
 		// C23 _Alignas(...)：§6.7.2.1p6 多个取最大；类型形式取 _Alignof，常量形式取该常量。
 		// 前缀在此消费，避免后续类型解析（struct/typeof 递归）覆盖本声明的对齐值。
 		unsigned acc = 0;
@@ -624,16 +827,92 @@ struct Parser
 				acc = static_cast<unsigned>(a);
 		}
 		CTypePtr r = parse_decl_specifiers_core();
-		// C23 §6.7：限定符可出现在类型说明符之后（int const x / enum E const *e2 / struct S const *s2）。
+		if (cnst_front && r)
+			r->is_const = true;
+		// C23 §6.7：限定符/存储类可出现在类型说明符之后（int const x / struct S static s2）。
 		//   指针限定符（int * const p）的 const 在 * 之后、不在此路径，仍由 parse_declarator_rec/parse_pointer_suffix 处理。
 		for (;;)
 		{
 			if (match_keyword("const")) { if (r) r->is_const = true; continue; }
+			if (match_keyword("static")) { last_static_ = true; continue; }
+			if (match_keyword("extern")) { last_extern_ = true; continue; }
+			if (match_keyword("typedef")) { last_typedef_ = true; continue; }
 			if (match_keyword("volatile") || match_keyword("restrict") || match_keyword("_Atomic")) continue;
 			break;
 		}
+		last_static_ = last_static_ || sc_static;
+		last_extern_ = last_extern_ || sc_extern;
+		last_typedef_ = last_typedef_ || sc_typedef;
 		last_alignas_ = acc; // 本声明的 _Alignas（覆盖递归期间对 last_alignas_ 的改写）
 		return r;
+	}
+
+	// 类型说明符组合允许任意顺序（C §6.7.2p2，如 `int long unsigned`）。
+	// 既有实现按 canonical 顺序线性匹配；此处在进入 core 前探测连续类型关键字个数，
+	// ≥2 则整体收集后归一化，否则仍走原线性分支（单关键字组合行为不变）。
+	int type_combo_len() const
+	{
+		int n = 0;
+		for (std::size_t i = 0; i < 8; ++i)
+		{
+			const Token &t = peek(i);
+			if (t.kind != TokKind::Keyword && t.kind != TokKind::Identifier)
+				break;
+			const std::string &s = t.text;
+			if (s == "const" || s == "volatile" || s == "restrict" || s == "_Atomic" ||
+				s == "register" || s == "inline")
+				continue;
+			if (s == "void" || s == "_Bool" || s == "bool" || s == "char" || s == "short" ||
+				s == "int" || s == "long" || s == "float" || s == "double" ||
+				s == "signed" || s == "unsigned")
+			{
+				++n;
+				continue;
+			}
+			break;
+		}
+		return n;
+	}
+
+	CTypePtr parse_type_specifier_combo(bool cnst)
+	{
+		bool saw_void = false, saw_bool = false, saw_char = false, saw_short = false;
+		bool saw_int = false, saw_float = false, saw_double = false;
+		bool saw_signed = false, saw_unsigned = false;
+		int long_count = 0;
+		for (;;)
+		{
+			if (match_keyword("void")) saw_void = true;
+			else if (match_keyword("_Bool") || match_keyword("bool")) saw_bool = true;
+			else if (match_keyword("char")) saw_char = true;
+			else if (match_keyword("short")) saw_short = true;
+			else if (match_keyword("int")) saw_int = true;
+			else if (match_keyword("long")) ++long_count;
+			else if (match_keyword("float")) saw_float = true;
+			else if (match_keyword("double")) saw_double = true;
+			else if (match_keyword("signed")) saw_signed = true;
+			else if (match_keyword("unsigned")) saw_unsigned = true;
+			else if (match_keyword("const")) cnst = true;
+			else if (match_keyword("volatile") || match_keyword("restrict") ||
+				match_keyword("_Atomic") || match_keyword("register") || match_keyword("inline"))
+				;
+			else break;
+		}
+		// 归一化（§6.7.2p2 组合表）：先定底层类型，再叠加符号
+		TypeKind k = TypeKind::Int;
+		if (saw_void) k = TypeKind::Void;
+		else if (saw_bool) k = TypeKind::Bool;
+		else if (saw_char) k = TypeKind::Char;
+		else if (long_count >= 2) k = TypeKind::LongLong;
+		else if (saw_double) k = TypeKind::Double;
+		else if (long_count == 1) k = TypeKind::Long;
+		else if (saw_float) k = TypeKind::Float;
+		else if (saw_short) k = TypeKind::Short;
+		else if (saw_int) k = TypeKind::Int;
+		auto t = make_type(k, cnst);
+		if (saw_unsigned) t->is_unsigned = true;
+		else if (saw_signed) t->is_unsigned = false;
+		return t;
 	}
 
 	CTypePtr parse_decl_specifiers_core()
@@ -648,14 +927,30 @@ struct Parser
 		// C23 [[attribute]] 跳过（不影响类型解析）
 		skip_attributes();
 		bool cnst = false;
-		while (match_keyword("const") || match_keyword("constexpr"))
-			cnst = true;
+		// volatile 仅为限定符：colang CType 未建模该属性，消费后不改变类型/布局。
+		for (;;)
+		{
+			if (match_keyword("const") || match_keyword("constexpr")) { cnst = true; continue; }
+			if (match_keyword("volatile")) continue;
+			break;
+		}
+		if (type_combo_len() >= 2)
+			return parse_type_specifier_combo(cnst);
 		if (match_keyword("void"))
 			return make_type(TypeKind::Void, cnst);
 		if (match_keyword("auto"))
 		{
-			last_auto_ = true; // C23 auto: 类型由初始化式推断
-			return nullptr;
+			// C23 auto 类型推断仅在 auto 后不再跟类型说明符时启用；
+			// 旧式 C 的 auto 是存储类（如 `auto volatile const char a1;`），此时按 no-op 继续解析类型。
+			if (!is_type_start())
+			{
+				last_auto_ = true; // C23 auto: 类型由初始化式推断
+				return nullptr;
+			}
+			CTypePtr t = parse_decl_specifiers_core();
+			if (t && cnst)
+				t->is_const = true;
+			return t;
 		}
 		// C23 typeof(expr) / typeof(type) / typeof_unqual(type)
 		if (check_keyword("typeof") || check_keyword("typeof_unqual"))
@@ -776,8 +1071,11 @@ struct Parser
 				// 完整定义
 				advance(); // consume '{'
 				StructDef sd;
+				// 先定 tag 并登记前置声明，成员中的自引用才能命中同一 tag
+				tag = begin_definition_tag(tag, is_union);
 				sd.tag = tag;
 				sd.is_union = is_union;
+				sd.is_definition = true; // 带 { ... }：空成员表也是完整（空）类型，区别于前置引用
 				sd.loc = peek().loc;
 				while (!check_punct("}") && !at_end())
 				{
@@ -825,10 +1123,15 @@ struct Parser
 						continue;
 					}
 					do {
+						// 每个声明符都从声明说明符给出的基础类型重新包裹指针/数组。
+						// 旧写法在循环内改写 mtype：第二个及以后的成员声明符会叠加成
+						// 「指针的指针」，且合成指针类型的 struct tag 为空 → 成员访问按空 tag
+						// 造出 opaque %struct.（GEP into unsized type，CTS 0011/0151 族）。
+						CTypePtr dtype = mtype;
 						// 函数指针成员: int (*fp)(int, int)
 						if (is_funcptr_declarator())
 						{
-							auto [fp_name, fp_type] = parse_funcptr_declarator(mtype);
+							auto [fp_name, fp_type] = parse_funcptr_declarator(dtype);
 							StructMember m;
 							m.name = fp_name;
 							m.type = fp_type;
@@ -836,12 +1139,14 @@ struct Parser
 							sd.members.push_back(std::move(m));
 							break; // funcptr 不支持逗号分隔多个声明符
 						}
-						mtype = parse_pointer_suffix(mtype);
+						dtype = parse_pointer_suffix(dtype);
 						StructMember m;
 						if (!check_punct(":")) // 匿名位域（type : width，无成员名，§6.7.2.1p5）
 							m.name = expect_identifier().text;
-						m.type = parse_array_suffix(mtype);
+						m.type = parse_array_suffix(dtype);
 						m.align = mal;
+						if (is_void_object_type(m.type))
+							error(peek().loc, "field has incomplete type 'void'");
 						// 位域: name : width
 						if (check_punct(":"))
 						{
@@ -861,17 +1166,40 @@ struct Parser
 						+ std::to_string(cur_tu_->structs.size());
 					sd.tag = tag;
 				}
-				// 注册到 struct_tags_
+				// 块作用域内重定义同名 tag 已在解析成员前改名为唯一 tag（见 begin_definition_tag）
+				sd.tag = tag;
+				// 前置声明已由 begin_definition_tag 登记：原地补全，避免同一 tag 出现两条定义，
+				// 使按 tag 取首个匹配的成员查找（offsetof/sizeof/成员访问）读到空壳。
+				bool completed_in_place = false;
 				if (!tag.empty())
-					struct_tags_[tag] = 0;
-				// 存入 TU
-				cur_tu_->structs.push_back(std::move(sd));
-				if (!tag.empty())
-					struct_tags_[tag] = cur_tu_->structs.size() - 1;
+				{
+					auto it = struct_tags_.find(tag);
+					if (it != struct_tags_.end())
+					{
+						cur_tu_->structs[it->second] = std::move(sd);
+						completed_in_place = true;
+					}
+				}
+				if (!completed_in_place)
+				{
+					cur_tu_->structs.push_back(std::move(sd));
+					if (!tag.empty())
+						struct_tags_[tag] = cur_tu_->structs.size() - 1;
+				}
 			}
 			else
 			{
-				// 引用已有 tag（未定义也先记录）
+				// 引用已有 tag（未定义也先记录）；先按块作用域解析到实际 tag。
+				// 本块内首次出现且外层无同名可见 tag → 属本块的 tag 声明，记入本层映射（取唯一内部名），
+				// 后续同块定义据此沿用同一 tag（如 typedef struct tnode TNODE; 后随定义）。
+				std::string resolved = resolve_tag(tag);
+				if (block_depth_ > 0 && !tag_scope_.empty() &&
+					!tag_scope_.back().count(tag) && resolved == tag && !struct_tags_.count(tag))
+				{
+					resolved = fresh_block_tag(tag);
+					tag_scope_.back()[tag] = resolved;
+				}
+				tag = resolved;
 				if (!struct_tags_.count(tag))
 				{
 					StructDef fwd;
@@ -956,6 +1284,15 @@ struct Parser
 		return base;
 	}
 
+	// void 仅可作函数返回类型、void* 的基类型与形参表标记；作对象/数组元素/成员类型即不完整类型。
+	static bool is_void_object_type(const CTypePtr &t)
+	{
+		if (!t) return false;
+		if (t->kind == TypeKind::Void) return true;
+		if (t->kind == TypeKind::Array) return is_void_object_type(t->base);
+		return false;
+	}
+
 	void parse_param_list(std::vector<Param> &params, bool &variadic)
 	{
 		// (void)
@@ -977,6 +1314,7 @@ struct Parser
 				variadic = true;
 				break;
 			}
+			SourceLoc ploc = peek().loc; // 形参声明起点（诊断用）
 			Param p;
 			CTypePtr base = parse_decl_specifiers();
 			if (!base)
@@ -1008,6 +1346,8 @@ struct Parser
 			if (t && t->kind == TypeKind::Function)
 				t = make_pointer(t);
 			p.type = t;
+			if (is_void_object_type(p.type))
+				error(ploc, "argument has incomplete type 'void'");
 			params.push_back(std::move(p));
 			if (!match_punct(","))
 			{
@@ -1023,6 +1363,14 @@ struct Parser
 		stmt->is_block_scope = true; // 真块 {...}：sema/codegen 据此压弹块级作用域
 		stmt->loc = peek().loc;
 		expect_punct("{");
+		// 块级标签作用域：块内定义的 struct/union tag 只在本块可见（同名则改名，见 scope_definition_tag）
+		++block_depth_;
+		tag_scope_.emplace_back();
+		var_scope_.emplace_back();
+		// 函数体：形参在本块可见（须先于 enumerator 判定）
+		for (const auto &pn : pending_param_names_)
+			if (!pn.empty()) var_scope_.back().insert(pn);
+		pending_param_names_.clear();
 		while (!check_punct("}") && !at_end())
 		{
 			auto inner = parse_stmt();
@@ -1035,6 +1383,9 @@ struct Parser
 				skip_to_semi_or_brace();
 			}
 		}
+		var_scope_.pop_back();
+		tag_scope_.pop_back();
+		--block_depth_;
 		expect_punct("}");
 		return stmt;
 	}
@@ -1259,11 +1610,15 @@ struct Parser
 	{
 		// C23 [[attribute]] 跳过
 		skip_attributes();
-		// 存储类说明符
+		// 存储类说明符（前置消费 + parse_decl_specifiers 期间消费的任意顺序部分）
 		bool is_static = match_keyword("static");
+		bool is_extern = match_keyword("extern");
 		// 块级 typedef
 		bool is_td = match_keyword("typedef");
 		CTypePtr base_type = parse_decl_specifiers();
+		is_static = is_static || last_static_;
+		is_extern = is_extern || last_extern_;
+		is_td = is_td || last_typedef_;
 		unsigned al = last_alignas_; // 本声明的 _Alignas（在后续递归解析前捕获）
 		if (!base_type && !last_auto_) return nullptr;
 		// C23 auto 类型推断: 解析 name + init，然后推断类型
@@ -1285,6 +1640,7 @@ struct Parser
 			// 推断类型
 			s->var_type = infer_auto_type(s->var_init);
 			local_var_types_[s->var_name] = s->var_type;
+			note_local_name(s->var_name);
 			match_punct(";");
 			return s;
 		}
@@ -1325,12 +1681,24 @@ struct Parser
 			DeclaratorFn d = parse_declarator_rec(nm);
 			s->var_type = d(base_type);
 			s->var_name = nm;
+			if (is_void_object_type(s->var_type))
+				error(s->loc, "variable has incomplete type 'void'");
 			s->is_static = is_static;
+			s->is_extern = is_extern;
 			s->var_align = al;
 			if (match_punct("="))
 				s->var_init = check_punct("{") ? parse_init_list() : parse_assign();
+			// 块内函数定义（C 不允许）：函数体只能出现在文件作用域。
+			// 此前被当作「块作用域函数声明 + 紧跟的裸复合语句」静默接受。
+			SourceLoc bl = peek().loc;
+			if (s->var_type && s->var_type->kind == TypeKind::Function && check_punct("{"))
+			{
+				error(bl, "function definition is not allowed here");
+				parse_compound_stmt(); // 消费函数体，避免后续级联误报
+			}
 			deduce_array_size(s->var_type, s->var_init);
 			local_var_types_[s->var_name] = s->var_type;
+			note_local_name(s->var_name);
 			compound->body.push_back(std::move(s));
 		} while (match_punct(","));
 		match_punct(";");
@@ -1356,6 +1724,7 @@ struct Parser
 			s->var_init = parse_assign();
 			s->var_type = infer_auto_type(s->var_init);
 			local_var_types_[s->var_name] = s->var_type;
+			note_local_name(s->var_name);
 			return s;
 		}
 		// 简单声明: type name = expr
@@ -1365,10 +1734,13 @@ struct Parser
 		s->var_type = parse_pointer_suffix(base_type);
 		s->var_name = expect_identifier().text;
 		s->var_type = parse_array_suffix(s->var_type);
+		if (is_void_object_type(s->var_type))
+			error(s->loc, "variable has incomplete type 'void'");
 		if (match_punct("="))
 			s->var_init = check_punct("{") ? parse_init_list() : parse_assign();
 		deduce_array_size(s->var_type, s->var_init);
 		local_var_types_[s->var_name] = s->var_type;
+		note_local_name(s->var_name);
 		return s;
 	}
 	
@@ -1457,7 +1829,8 @@ struct Parser
 
 	// 解析连续的数组后缀 [ ... ]，返回各维大小（<=0 表示未定/柔性）。消费所有前导 [..]。
 	// C99：[ static qual-list? N ]、VLA [ * ] / [ qual * ]；qualifier 列表（const/volatile/restrict/_Atomic）跳过。
-	std::vector<std::size_t> parse_bracket_dims()
+	// vla_dims（可选出参）与 dims 一一对应：非空 = 该维为非常量表达式（VLA），供 codegen 运行期求维度。
+	std::vector<std::size_t> parse_bracket_dims(std::vector<ExprPtr>* vla_dims = nullptr)
 	{
 		std::vector<std::size_t> dims;
 		while (check_punct("["))
@@ -1469,6 +1842,7 @@ struct Parser
 			{
 			}
 			std::size_t sz = 0;
+			ExprPtr vla;
 			if (!check_punct("]"))
 			{
 				if (check_punct("*"))
@@ -1479,12 +1853,23 @@ struct Parser
 				{
 					// 维度为一般常量表达式：字面量(含 0x/0b/0o/八/十)、sizeof/offsetof/枚举/算术等
 					ExprPtr dim = parse_assign();
-					int64_t v = dim ? eval_const_int(dim) : -1;
-					sz = (v > 0) ? static_cast<std::size_t>(v) : 0; // <=0 视为柔性/未定大小
+					if (dim && !is_const_int_expr(dim))
+					{
+						// 非常量维度 = VLA（P208）：旧实现 eval_const_int 落 default 返 0 →
+						// sz=0 → LLVM `alloca [0 x T]`（零存储）→ 写入即越界 AV。
+						// 尺寸改由 codegen 运行期求值（携 vla_dim）。
+						vla = dim;
+					}
+					else
+					{
+						int64_t v = dim ? eval_const_int(dim) : -1;
+						sz = (v > 0) ? static_cast<std::size_t>(v) : 0; // <=0 视为柔性/未定大小
+					}
 				}
 			}
 			expect_punct("]");
 			dims.push_back(sz);
+			if (vla_dims) vla_dims->push_back(vla);
 		}
 		return dims;
 	}
@@ -1492,13 +1877,19 @@ struct Parser
 	// 数组后缀薄封装: [N] [N][M] ... → Array(N, Array(M, elem))（反向构建，最内层维先）
 	CTypePtr parse_array_suffix(CTypePtr elem_type)
 	{
-		std::vector<std::size_t> dims = parse_bracket_dims();
+		std::vector<ExprPtr> vlads;
+		std::vector<std::size_t> dims = parse_bracket_dims(&vlads);
 		for (int i = static_cast<int>(dims.size()) - 1; i >= 0; --i)
 		{
 			auto arr = std::make_shared<CType>();
 			arr->kind = TypeKind::Array;
 			arr->base = elem_type;
 			arr->array_size = dims[i];
+			if (i < static_cast<int>(vlads.size()) && vlads[i])
+			{
+				arr->is_vla = true;
+				arr->vla_dim = vlads[i];
+			}
 			elem_type = arr;
 		}
 		return elem_type;
@@ -1558,9 +1949,10 @@ struct Parser
 		{
 			if (check_punct("["))
 			{
-				std::vector<std::size_t> dims = parse_bracket_dims();
+				std::vector<ExprPtr> vlads;
+				std::vector<std::size_t> dims = parse_bracket_dims(&vlads);
 				DeclaratorFn prev = cur;
-				cur = [prev, dims](CTypePtr X) -> CTypePtr
+				cur = [prev, dims, vlads](CTypePtr X) -> CTypePtr
 				{
 					CTypePtr t = X;
 					for (int i = static_cast<int>(dims.size()) - 1; i >= 0; --i)
@@ -1569,6 +1961,11 @@ struct Parser
 						arr->kind = TypeKind::Array;
 						arr->base = t;
 						arr->array_size = dims[i];
+						if (i < static_cast<int>(vlads.size()) && vlads[i])
+						{
+							arr->is_vla = true;   // VLA（P208）：维度交 codegen 运行期求值
+							arr->vla_dim = vlads[i];
+						}
 						t = arr;
 					}
 					return prev(t);
@@ -1619,7 +2016,8 @@ struct Parser
 	// 解析一个全局声明符项（对象 / 数组 / 函数指针对象 / 函数原型），登记入 tu。
 	// 不消费分隔 ',' 或结尾 ';'（由调用方循环处理）。
 	void parse_global_declarator_item(TranslationUnit &tu, CTypePtr base_type,
-		bool is_static, bool is_extern, unsigned ga, const SourceLoc &loc)
+		bool is_static, bool is_extern, unsigned ga, const SourceLoc &loc,
+		bool is_public = false)
 	{
 		std::string nm;
 		std::vector<Param> own; // 紧邻标识符的具名参数（分组/返回函数指针的函数定义用）
@@ -1643,9 +2041,14 @@ struct Parser
 				}
 			fn.is_variadic = type->is_variadic;
 			fn.is_static = is_static;
+			fn.is_public = is_public;
 			func_return_types_[fn.name] = fn.return_type;
 			if (check_punct("{")) // 函数定义：消费函数体（原型/声明以 ; 结尾，不进此分支）
+			{
+				pending_param_names_.clear();
+				for (const auto &p : fn.params) pending_param_names_.push_back(p.name);
 				fn.body = parse_compound_stmt();
+			}
 			tu.funcs.push_back(std::move(fn));
 			return;
 		}
@@ -1653,9 +2056,12 @@ struct Parser
 		gv.loc = loc;
 		gv.name = std::move(nm);
 		gv.type = type;
+		if (is_void_object_type(gv.type))
+			error(loc, "variable has incomplete type 'void'");
 		gv.align = ga;
 		gv.is_static = is_static;
 		gv.is_extern = is_extern;
+		gv.is_public = is_public;
 		if (match_punct("="))
 			gv.init = check_punct("{") ? parse_init_list() : parse_assign();
 		deduce_array_size(gv.type, gv.init);
@@ -1713,6 +2119,21 @@ struct Parser
 				if (ae && (ae->desig_index >= 0 || !ae->desig_field.empty())) { has_desig = true; break; }
 			if (!has_desig)
 			{
+				// §6.7.9p14/p19：单字符串元素的花括号 char s[] = {"str"} ≡ = "str"，
+				// 大小按字符串内容 +1（'\0'）；否则会落到下方 args.size()=1。
+				// 仅字符型元素生效（排除指针数组 char *p[]={"abc"} → 应 size=1、非 strlen+1）。
+				if (init->args.size() == 1 && init->args[0] &&
+					init->args[0]->kind == ExprKind::StringLiteral &&
+					ty->base && (ty->base->kind == TypeKind::Char || ty->base->kind == TypeKind::Char8 ||
+								  ty->base->kind == TypeKind::WChar || ty->base->kind == TypeKind::Char16 ||
+								  ty->base->kind == TypeKind::Char32))
+				{
+					const int64_t ew = ty->base ? const_sizeof_type(ty->base) : 1;
+					if (ew >= 4)      ty->array_size = static_cast<int64_t>(co_decode_utf32(init->args[0]->str_val).size() + 1);
+					else if (ew >= 2) ty->array_size = static_cast<int64_t>(co_decode_utf16(init->args[0]->str_val).size() + 1);
+					else              ty->array_size = static_cast<int64_t>(co_decode_string(init->args[0]->str_val).size() + 1);
+					return;
+				}
 				// brace elision 计数（P173）：元素为聚合且首项非花括号 → 扁平标量按每元素 L 个叶子分组。
 				std::size_t L = leaves_per_type(ty->base);
 				if (L > 1 && !init->args.empty() && init->args[0]->kind != ExprKind::InitList)
@@ -1759,7 +2180,7 @@ struct Parser
 			t.text == "short" ||
 			t.text == "int" || t.text == "long" || t.text == "float" ||
 			t.text == "double" || t.text == "signed" || t.text == "unsigned" ||
-			t.text == "const" || t.text == "struct" || t.text == "union" ||
+			t.text == "const" || t.text == "volatile" || t.text == "struct" || t.text == "union" ||
 			t.text == "enum" || t.text == "typedef" ||
 			t.text == "static" || t.text == "extern" || t.text == "register" ||
 			t.text == "_Bool" || t.text == "inline" || t.text == "restrict" ||
@@ -1769,7 +2190,7 @@ struct Parser
 			t.text == "_Static_assert" || t.text == "_Atomic" ||
 			t.text == "auto" || t.text == "bool" || t.text == "constexpr" ||
 			t.text == "typeof" || t.text == "typeof_unqual" || t.text == "_BitInt" ||
-			t.text == "thread_local")
+			t.text == "thread_local" || t.text == "public")
 			return true;
 		// typedef 名
 		return typedefs_.count(t.text) > 0;
@@ -1786,7 +2207,7 @@ struct Parser
 			t.text == "short" ||
 			t.text == "int" || t.text == "long" || t.text == "float" ||
 			t.text == "double" || t.text == "signed" || t.text == "unsigned" ||
-			t.text == "const" || t.text == "struct" || t.text == "union" ||
+			t.text == "const" || t.text == "volatile" || t.text == "struct" || t.text == "union" ||
 			t.text == "enum" || t.text == "_Bool" || t.text == "bool" ||
 			t.text == "_BitInt" || t.text == "typeof" || t.text == "typeof_unqual" ||
 			t.text == "constexpr" || t.text == "_Atomic")
@@ -2446,9 +2867,11 @@ struct Parser
 		}
 		if (t.kind == TokKind::Identifier)
 		{
-			// enum 常量名优先匹配
+			// enum 常量名优先匹配——但内层同名局部变量/形参隐藏外层 enumerator（C §6.2.1：同一命名空间）。
+			//   缺此判定时 `int tks04 = 0; tks04++;` 被折叠成字面量 103，store 到常量触发 verifier
+			//   「Store operand must be a pointer」（CTS 0151 族）。
 			auto ec = enum_constants_.find(t.text);
-			if (ec != enum_constants_.end())
+			if (ec != enum_constants_.end() && !name_in_scope(t.text))
 			{
 				advance();
 				auto e = std::make_shared<Expr>();

@@ -51,7 +51,7 @@ A class variable holds a **reference (handle)** to the object: the class name it
 
 ### Creating and using
 
-A minimal end-to-end example (constructor/destructor, methods, `this`, `static` with `::`, and default `private`):
+A minimal end-to-end example (constructor/destructor, methods, `this`, `static` with `::`, and a member without `public`):
 
 ```
 class Counter
@@ -61,13 +61,13 @@ class Counter
     public void inc()        { count = count + 1; }
     public int  value()      { return this.count; }      // this refers to the current object
     public static int twice(int x) { return x * 2; }     // static member
-    int count;                                           // no public -> private by default
+    int count;                                           // no public -> visible only inside the class
 }
 
 Counter c = new Counter();            // created on the heap, held by c (a reference/handle)
 c.inc();                              // call instance method with a dot
 c.inc();
-printf("%d\n", c.value());            // prints 2 (private count read via a public method)
+printf("%d\n", c.value());            // prints 2 (count, visible only inside the class, read via a public method)
 printf("%d\n", Counter::twice(21));   // static accessed via class name + ::, prints 42
 // once c leaves scope the object is reclaimed automatically; no manual release needed
 ```
@@ -75,8 +75,8 @@ printf("%d\n", Counter::twice(21));   // static accessed via class name + ::, pr
 ### Members and methods
 
 - **Instance methods** refer to the current object via the implicit `this` and read/write its own data.
-- **static members / methods** belong to the class itself rather than any instance; they exist within the module in a zero-initialized state and are accessed through the class name with the `::` operator, e.g. `C::m()`.
-- **Accessibility**: members/methods are `private` by default (visible only inside the class); only those explicitly marked `public` are visible from outside.
+- **static members / methods** belong to the class itself rather than any instance; they exist within the module in a zero-initialized state and are accessed through the class name with the `::` operator, e.g. `C::m()`. The `static` here modifies **class members** only; it is not the file-scope `static` of C (which restricts a symbol to a single translation unit). Module-internal visibility in Co is expressed by **omitting `public`** (see the "Module" chapter).
+- **Accessibility**: `public` is Co's only visibility keyword (there is no `private`, and no separate `export`). Members/methods that are not marked `public` are visible only inside the class; only those explicitly marked `public` are visible from outside.
 
 ### Lifetime (observable behavior)
 

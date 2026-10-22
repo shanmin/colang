@@ -9,6 +9,8 @@
 //   1 未声明标识符  2 给不可修改值赋值  3 成员访问类别错  4 下标作用于非指针/数组
 //   5 已知原型调用实参个数不符  6 break/continue 越界  7 case/default 越界
 //   8 goto 目标缺失/标签重复  9 return 形态错误
+//   10 同一 TU 函数重复定义  11 函数名与文件作用域对象同名  12 原型/定义返回类型冲突
+//   （另：非 void 函数漏 return 发 warning，不阻断编译）
 // 保守原则：凡类型推断拿不准（resolve_type 返回 null）即跳过，绝不误伤合法方言。
 // ============================================================
 
@@ -35,16 +37,69 @@ public:
 	void run(const TUPtr &tu)
 	{
 		// 建全局符号表（指针指向 ast 内部，parse 后 vector 不再变动，稳定）
-		for (const auto &f : tu->funcs) funcs_[f.name] = &f;
+		for (const auto &f : tu->funcs)
+		{
+			auto it = funcs_.find(f.name);
+			if (it == funcs_.end())
+			{
+				funcs_[f.name] = &f;
+				continue;
+			}
+			// 同一 TU 内重复函数定义（无论参数是否相同）：C 约束违例
+			if (it->second->body && f.body)
+				report(f.loc, "redefinition of '" + f.name + "'");
+			// 原型与定义的返回类型冲突
+			else if (!same_type(it->second->return_type, f.return_type))
+				report(f.loc, "conflicting types for '" + f.name + "'");
+			// 调用元数检查须看带定义的条目
+			if (f.body && !it->second->body)
+				funcs_[f.name] = &f;
+		}
 		for (const auto &g : tu->globals) globals_[g.name] = g.type;
 		for (const auto &s : tu->structs)
 			if (!s.tag.empty()) structs_[s.tag] = &s;
+		// 函数名与文件作用域对象同名：不同种类符号的重定义（局部同名遮蔽合法，不查）
+		std::unordered_set<std::string> clash_reported;
+		for (const auto &f : tu->funcs)
+			if (globals_.count(f.name) && clash_reported.insert(f.name).second)
+				report(f.loc, "redefinition of '" + f.name + "' as different kind of symbol");
 
 		// 仅检查函数体（全局初始化器暂不查，降低误伤面）
+		compute_dead_ends();
 		for (const auto &f : tu->funcs)
 		{
 			if (f.body) check_func(f);
 		}
+		// P211 Co 层入口模型：顶层裸语句需检查（break/continue 无围比上下文一时报错，
+		//   表达式引用未声明符号同样拒收）。cur_func_=nullptr，Return 已自然旁路“void 函数不应
+		//   返回值”类检查（见 check_stmt 中 Return 分支的 cur_func_ 守卫）。
+		check_top_level(tu);
+	}
+
+	// P211：顶层语句序列检查 + 无入口警告（仅对 .co 后缀、且 link_output 时发警告）
+	void check_top_level(const TUPtr &tu)
+	{
+		// 先检查顶层裸语句（循环围比传 0/0，break/continue 自然报错）
+		cur_func_ = nullptr;
+		scopes_.clear();
+		scopes_.emplace_back(); // 文件作用域（全局变量已入 globals_，本层仅充局部声明用）
+		for (const auto &s : tu->top_level_body)
+			if (s) check_stmt(s, 0, 0);
+		// 无入口警告：.co 文件，且既无裸指令又无 user main 定义，且链接为 exe 目标
+		const bool is_co = [&]
+		{
+			const std::string &p = opts_.source_path;
+			return p.size() >= 3 && (p.compare(p.size() - 3, 3, ".co") == 0 ||
+									 p.compare(p.size() - 3, 3, ".CO") == 0);
+		}();
+		if (!is_co) return;
+		if (opts_.compile_only || opts_.emit_llvm || !opts_.link_output) return;
+		bool has_bare = !tu->top_level_body.empty();
+		bool has_user_main = false;
+		for (const auto &f : tu->funcs)
+			if (f.body && f.name == "main") { has_user_main = true; break; }
+		if (!has_bare && !has_user_main)
+			warn(SourceLoc{}, "colang: warning: no entry point (no top-level commands and no main); generating empty executable");
 	}
 
 	bool ok() const { return !has_error_; }
@@ -63,6 +118,18 @@ private:
 		has_error_ = true;
 	}
 
+	// 告警：不置 has_error_，编译继续（与 main.cpp 的 is_warning 口径一致）
+	void warn(const SourceLoc &loc, const std::string &msg)
+	{
+		Error e;
+		e.file = loc.file.empty() ? opts_.source_path : loc.file;
+		e.pos.line = loc.line;
+		e.pos.column = loc.column;
+		e.message = msg;
+		e.is_warning = true;
+		errors_.push_back(std::move(e));
+	}
+
 	// —— 类型谓词 ——
 	static bool is_struct_like(const CTypePtr &t)
 	{
@@ -71,6 +138,198 @@ private:
 	static bool is_ptr_or_array(const CTypePtr &t)
 	{
 		return t && (t->kind == TypeKind::Pointer || t->kind == TypeKind::Array);
+	}
+
+	// 返回类型同一性判定：忽略限定符拼写，只比结构（原型/定义冲突检查用）
+	static bool same_type(const CTypePtr &a, const CTypePtr &b)
+	{
+		if (!a || !b) return !a && !b;
+		if (a->kind != b->kind) return false;
+		switch (a->kind)
+		{
+		case TypeKind::Pointer:
+		case TypeKind::Array:
+			return same_type(a->base, b->base);
+		case TypeKind::Function:
+			if (a->is_variadic != b->is_variadic || a->params.size() != b->params.size())
+				return false;
+			if (!same_type(a->base, b->base)) return false;
+			for (std::size_t i = 0; i < a->params.size(); ++i)
+				if (!same_type(a->params[i], b->params[i])) return false;
+			return true;
+		case TypeKind::Struct:
+		case TypeKind::Union:
+		case TypeKind::Enum:
+			return a->tag == b->tag;
+		case TypeKind::BitInt:
+			return a->bit_width == b->bit_width && a->is_unsigned == b->is_unsigned;
+		default:
+			return a->is_unsigned == b->is_unsigned;
+		}
+	}
+
+	// —— 控制流可达性（「非 void 函数漏 return」告警用）——
+	// falls_through：语句执行完能否落到其后的语句（false = 必然 return/无限循环/不返回调用）。
+	// 保守建模：拿不准一律按「可能落穿」处理，避免误伤合法程序。
+	bool falls_through(const StmtPtr &s)
+	{
+		if (!s) return true;
+		switch (s->kind)
+		{
+		case StmtKind::Return:
+			return false;
+		case StmtKind::ExprStmt:
+			return !is_noreturn_call(s->expr);
+		case StmtKind::Compound:
+			for (const auto &b : s->body)
+				if (!falls_through(b)) return false;
+			return true;
+		case StmtKind::If:
+			if (!s->else_branch) return true;
+			return falls_through(s->then_branch) || falls_through(s->else_branch);
+		case StmtKind::While:
+		case StmtKind::DoWhile:
+		case StmtKind::For:
+			// 常量真条件且循环体内无本层 break → 永不落穿
+			return !const_true_cond(s->expr) || has_break(s->then_branch);
+		case StmtKind::Switch:
+			return switch_falls_through(s);
+		default:
+			return true;
+		}
+	}
+
+	bool is_noreturn_call(const ExprPtr &e)
+	{
+		if (!e || e->kind != ExprKind::Call || e->name.empty()) return false;
+		static const char *const kNoreturn[] = {
+			"exit", "_Exit", "quick_exit", "abort", "longjmp", "thrd_exit"
+		};
+		for (const char *n : kNoreturn)
+			if (e->name == n) return true;
+		return dead_ends_.count(e->name) > 0;
+	}
+
+	// 本 TU 内「永不返回调用者」的函数（末尾 exit/abort/无限循环，或转调同类函数）。
+	// 迭代到不动点：先认内建 noreturn，再逐轮并入「body 不返回」的函数（如 `noreturn void finish(){exit(0);}`）。
+	void compute_dead_ends()
+	{
+		for (bool changed = true; changed; )
+		{
+			changed = false;
+			for (const auto &kv : funcs_)
+			{
+				const FuncDecl *f = kv.second;
+				if (!f->body || dead_ends_.count(f->name)) continue;
+				if (never_returns(f->body))
+				{
+					dead_ends_.insert(f->name);
+					changed = true;
+				}
+			}
+		}
+	}
+
+	// 语句是否永不正常返回调用者：所有出口都是 noreturn 调用 / 无限循环。
+	// 与 falls_through 互补——`return` 属「返回」，故 Return 分支为 false。
+	bool never_returns(const StmtPtr &s)
+	{
+		if (!s) return false;
+		switch (s->kind)
+		{
+		case StmtKind::ExprStmt:
+			return is_noreturn_call(s->expr);
+		case StmtKind::Compound:
+			for (const auto &b : s->body)
+				if (never_returns(b)) return true;
+			return false;
+		case StmtKind::If:
+			return s->else_branch && never_returns(s->then_branch) &&
+			       never_returns(s->else_branch);
+		case StmtKind::While:
+		case StmtKind::DoWhile:
+		case StmtKind::For:
+			return const_true_cond(s->expr) && !has_break(s->then_branch);
+		default:
+			return false; // 含 Return：正常返回到调用者
+		}
+	}
+
+	static bool const_true_cond(const ExprPtr &e)
+	{
+		if (!e) return true; // for(;;)
+		return e->kind == ExprKind::IntLiteral && e->int_val != 0;
+	}
+
+	// 本层循环体内是否有 break（嵌套循环/switch 的 break 归内层，不下探）
+	static bool has_break(const StmtPtr &s)
+	{
+		if (!s) return false;
+		switch (s->kind)
+		{
+		case StmtKind::Break:
+			return true;
+		case StmtKind::Compound:
+			for (const auto &b : s->body)
+				if (has_break(b)) return true;
+			return false;
+		case StmtKind::If:
+			return has_break(s->then_branch) || has_break(s->else_branch);
+		case StmtKind::Label:
+			return has_break(s->then_branch);
+		case StmtKind::Case:
+		case StmtKind::Default:
+			if (has_break(s->then_branch)) return true;
+			for (const auto &b : s->body)
+				if (has_break(b)) return true;
+			return false;
+		default:
+			return false;
+		}
+	}
+
+	// switch 是否可能落穿到其后：无 default 必可能；本层 break 必可能；
+	// 否则由体内最后一条语句是否落穿决定（各组按源码顺序线性合并）。
+	bool switch_falls_through(const StmtPtr &s)
+	{
+		if (!has_default_label(s->then_branch)) return true;
+		if (has_break(s->then_branch)) return true;
+		bool completes = true;
+		std::vector<StmtPtr> seq;
+		flatten_switch_body(s->then_branch, seq);
+		for (const auto &b : seq)
+		{
+			if (b->kind == StmtKind::Case || b->kind == StmtKind::Default)
+				completes = falls_through(b->then_branch);
+			else
+				completes = completes && falls_through(b);
+		}
+		return completes;
+	}
+
+	static void flatten_switch_body(const StmtPtr &s, std::vector<StmtPtr> &out)
+	{
+		if (!s) return;
+		if (s->kind == StmtKind::Compound)
+		{
+			for (const auto &b : s->body) out.push_back(b);
+			return;
+		}
+		out.push_back(s);
+	}
+
+	static bool has_default_label(const StmtPtr &s)
+	{
+		if (!s) return false;
+		if (s->kind == StmtKind::Default) return true;
+		if (s->kind == StmtKind::Switch) return false; // 内层 switch 的 default 不算
+		if (has_default_label(s->then_branch)) return true;
+		if (has_default_label(s->else_branch)) return true;
+		if (has_default_label(s->for_init)) return true;
+		if (has_default_label(s->init_stmt)) return true;
+		for (const auto &b : s->body)
+			if (has_default_label(b)) return true;
+		return false;
 	}
 
 	// nullptr：parser 以 Void* 建模的零字面量（int_val==0 且 type 为 Pointer）
@@ -371,6 +630,11 @@ private:
 			if (!p.name.empty()) scopes_.back()[p.name] = p.type;
 		labels_.clear();
 		collect_labels(f.body);
+		// 非 void 函数可能执行到末尾而无 return（C 为 UB，clang 默认 -Wreturn-type 告警）。
+		// main 例外：C11 §5.1.2.2.3 规定 main 落到 } 等价于 return 0，clang 亦不告警。
+		if (f.return_type && f.return_type->kind != TypeKind::Void &&
+			f.name != "main" && falls_through(f.body))
+			warn(f.loc, "non-void function does not return a value in all control paths");
 		check_stmt(f.body, 0, 0);
 		cur_func_ = nullptr;
 	}
@@ -384,6 +648,7 @@ private:
 	std::unordered_map<std::string, const StructDef *> structs_;
 	std::vector<std::unordered_map<std::string, CTypePtr>> scopes_; // 末位为最内层
 	std::unordered_set<std::string> labels_;
+	std::unordered_set<std::string> dead_ends_; // 永不返回调用者的函数
 	const FuncDecl *cur_func_ = nullptr;
 };
 

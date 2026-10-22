@@ -32,6 +32,30 @@ extern void srand(unsigned int seed);
 
 extern int system(const char *cmd);
 extern div_t div(int numer, int denom);
+extern ldiv_t ldiv(long numer, long denom);
+
+/* 环境变量（getenv 此前缺失：隐式声明按 int 返回 → 64 位指针被截 → 解引用崩溃） */
+extern char *getenv(const char *name);
+
+/* abs / 绝对值家族 */
+extern int abs(int x);
+extern long labs(long x);
+extern long long llabs(long long x);
+
+/* 字符串转数值补全 */
+extern long long atoll(const char *s);
+extern unsigned long strtoul(const char *s, char **end, int base);
+extern long long strtoll(const char *s, char **end, int base);
+extern unsigned long long strtoull(const char *s, char **end, int base);
+
+/* 标准 qsort / bsearch / atexit（比较器/回调形参以 typedef 表达，同 Annex K 处理：
+ * colang 尚不能解析内联函数指针形参 `int (*compar)(...)`） */
+typedef int (*_colang_compar)(const void *, const void *);
+typedef void (*_colang_atexit_cb)(void);
+extern void qsort(void *base, size_t nmemb, size_t size, _colang_compar compar);
+extern void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+                    _colang_compar compar);
+extern int atexit(_colang_atexit_cb func);
 
 /* Annex K（§K.3，P9.30 务实子集）：
  * 约束处理三件套 set_constraint_handler_s/abort_handler_s/ignore_handler_s 本机 UCRT 无 ISO 符号，

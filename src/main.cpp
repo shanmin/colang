@@ -357,8 +357,11 @@ int main(int argc, char **argv)
 #ifdef _WIN32
 		// colang 直建 IR、不经 clang C 前端，故按公共名引用 CRT stdio（printf/sprintf…）。
 		// 本机 MSVC/UCRT 默认导入库不导出 sprintf（在 legacy_stdio_definitions.lib）→ LNK2019（修 plct 00186）。
-		// 该 lib 仅含把公共名转发到 __stdio_common_* 的薄封装；未被引用则不拉入目标文件，对无 sprintf 的产物无副作用。
+		// 该 lib 仅含把公共名转发到 __stdio_common_* 的薄封装；未被引用则不拉入目标文件、对无 sprintf 的产物无副作用。
 		inner += " -llegacy_stdio_definitions";
+		// CTS 0202/0041/0096/0008 等大局部多维数组（int b[100][100][100]=4MB）超出 MSVC 默认 1MB 栈→0xC00000FD。
+		// 参考机（Linux glibc）默认 8MB；16MB 虚拟保留、按需 commit，零运行时开销。
+		inner += " -Wl,/STACK:16777216";
 #endif
 		for (const auto &bc : opts.link_inputs)
 			inner += " \"" + bc + "\"";
@@ -414,6 +417,10 @@ int main(int argc, char **argv)
 		return has_fatal(errors) ? 1 : 0;
 	}
 
+	// 编译成功：诊断列表中只剩非致命项（warning），照常呈现，不改变退出码
+	if (!errors.empty())
+		print_errors(errors);
+
 	// 链接：clang 把 .bc 编为可执行文件
 	if (opts.link_output && !state.bc_path.empty())
 	{
@@ -431,6 +438,7 @@ int main(int argc, char **argv)
 		std::string inner = "\"" + clang + "\" -Wno-override-module \"" + state.bc_path + "\"";
 #ifdef _WIN32
 		inner += " -llegacy_stdio_definitions"; // 公共名 CRT stdio 兜底（修 plct 00186 sprintf LNK2019）
+		inner += " -Wl,/STACK:16777216";        // 大局部数组栈溢出兜底（CTS 0202/0041/0096/0008 等）
 #endif
 		for (const auto &bc : opts.link_inputs)
 			inner += " \"" + bc + "\"";

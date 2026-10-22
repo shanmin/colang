@@ -41,6 +41,9 @@ typedef _Atomic unsigned int atomic_uint;
 typedef struct { int _Lock; } atomic_flag;
 #define ATOMIC_FLAG_INIT { 0 }
 
+/* ATOMIC_VAR_INIT：C11 静态初始化辅助宏，C17 起弃用（直接初始化等价），此处保留兼容 */
+#define ATOMIC_VAR_INIT(value) (value)
+
 /* atomic_* / atomic_flag_* 自由函数：codegen 按名内建 lowering，不在此声明。 */
 
 #endif /* _COLANG_STDATOMIC_H */
