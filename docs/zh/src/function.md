@@ -111,9 +111,9 @@ printf("%d\n", total(3, 10, 20, 30)); // 60
 
 ### 当前边界（编译器实装状态）
 
-自 **0.2.0** 起：
+自 **0.3.0** 起：
 
-- **`public` 修饰顶层函数/全局变量已实装**：词法/语法/语义已接入，产物为动态库时写入导出表（`DLLExportStorageClass`）；`static public` 混序合法。本阶段 `public` **不改变 linkage**、也**不参与跨模块可见性**（属 `import` 层）；现阶段对同一产物内其他文件的可见性仍沿用 C 链接规则（`static` 限本翻译单元、其余对外可见）。在 Co 目标模型里，“模块内部”仍为**省略 `public`**（详见「模块」章节）。
+- **`public` 修饰顶层函数/全局变量已实装**：词法/语法/语义已接入，产物为动态库时写入导出表（`DLLExportStorageClass`）；`static public` 混序合法。**自 0.3.0 起 `public` 同时作为跨模块可见性的唯一闸门**：未标 `public` 的符号不可被 `import`（具名/star 命中均报 `cannot import non-public symbol`）；imported 非 `public` 符号在 codegen 强制 `InternalLinkage`。本批 `public` 仍 **不改变同 TU 内的 linkage**（非 public 默认仍为 ExternalLinkage，同 P211）；“模块内部”仍为**省略 `public`**（详见「模块」与「import」章节）。
 - **顶层命令按顺序执行已实装**（入口分派、`main` 可选、顶层 `return` 与退出码）——完整模型见「程序入口与执行」章节。
 
 ### 保留名

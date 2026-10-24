@@ -6,6 +6,6 @@
 
 #include <stddef.h>
 
-extern void *alloca(size_t n);
+extern void* alloca(size_t n);
 
 #endif /* _COLANG_ALLOCA_H */

@@ -34,7 +34,7 @@ cmake --build build --config Release
 
 产物：`build\Release\colang.exe`（多配置生成器）/ `build\colang.exe`（单配置）。
 
-运行测试（需 PATH 上有 `clang` 用于链接）：
+运行测试（链接由 colang 内置的进程内 lld 完成，**无需外部 `clang`**）：
 
 ```bat
 powershell -ExecutionPolicy Bypass -File test\run_tests.ps1

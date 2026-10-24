@@ -28,29 +28,29 @@ typedef unsigned int mbstate_t;
 
 /* —— 宽字符串/内存操作（符号由宿主 UCRT 提供）—— */
 extern size_t wcslen(const wchar_t *s);
-extern wchar_t *wcscpy(wchar_t *dst, const wchar_t *src);
-extern wchar_t *wcsncpy(wchar_t *dst, const wchar_t *src, size_t n);
-extern wchar_t *wcscat(wchar_t *dst, const wchar_t *src);
+extern wchar_t* wcscpy(wchar_t *dst, const wchar_t *src);
+extern wchar_t* wcsncpy(wchar_t *dst, const wchar_t *src, size_t n);
+extern wchar_t* wcscat(wchar_t *dst, const wchar_t *src);
 extern int wcscmp(const wchar_t *a, const wchar_t *b);
 extern int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n);
-extern wchar_t *wcschr(const wchar_t *s, wchar_t c);
-extern wchar_t *wcsrchr(const wchar_t *s, wchar_t c);
-extern wchar_t *wcsstr(const wchar_t *haystack, const wchar_t *needle);
-extern wchar_t *wcstok(wchar_t *s, const wchar_t *delim, wchar_t **ptr);
+extern wchar_t* wcschr(const wchar_t *s, wchar_t c);
+extern wchar_t* wcsrchr(const wchar_t *s, wchar_t c);
+extern wchar_t* wcsstr(const wchar_t *haystack, const wchar_t *needle);
+extern wchar_t* wcstok(wchar_t *s, const wchar_t *delim, wchar_t **ptr);
 extern int wcscoll(const wchar_t *a, const wchar_t *b);
 extern size_t wcsxfrm(wchar_t *dst, const wchar_t *src, size_t n);
 
-extern void *wmemcpy(wchar_t *dst, const wchar_t *src, size_t n);
-extern void *wmemmove(wchar_t *dst, const wchar_t *src, size_t n);
-extern void *wmemset(wchar_t *dst, wchar_t c, size_t n);
+extern void* wmemcpy(wchar_t *dst, const wchar_t *src, size_t n);
+extern void* wmemmove(wchar_t *dst, const wchar_t *src, size_t n);
+extern void* wmemset(wchar_t *dst, wchar_t c, size_t n);
 extern int wmemcmp(const wchar_t *a, const wchar_t *b, size_t n);
-extern void *wmemchr(const wchar_t *s, wchar_t c, size_t n);
+extern void* wmemchr(const wchar_t *s, wchar_t c, size_t n);
 
 /* —— 宽字符 I/O —— */
 extern int fwide(FILE *stream, int mode);
 extern wint_t fgetwc(FILE *stream);
 extern wint_t fputwc(wchar_t c, FILE *stream);
-extern wchar_t *fgetws(wchar_t *s, int n, FILE *stream);
+extern wchar_t* fgetws(wchar_t *s, int n, FILE *stream);
 extern int fputws(const wchar_t *s, FILE *stream);
 extern wint_t getwc(FILE *stream);
 extern wint_t getwchar(void);

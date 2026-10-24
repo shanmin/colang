@@ -198,6 +198,27 @@ inline std::string co_decode_string(const std::string &raw)
 	return out;
 }
 
+// 字符串字面量前缀 → 元素字节宽度（跨层单一真值源，与 co_decode_string 的剥前缀口径完全一致）。
+// 前缀集对齐 co_decode_string/co_decode_char：u8→1、u→2、U→4、L→2（本机 wchar_t=2 字节 UTF-16，
+// ADR-104）、无前缀→1。识别方式同 co_decode_string：取首个双引号前的子串判定。供 codegen 右值
+// StringLiteral 按 C §6.4.5「前缀决定字面量元素类型」三路编码发射与类型解析据此分派。
+inline int co_str_lit_width(const std::string &raw)
+{
+	if (!raw.empty() && raw.front() != '"')
+	{
+		const std::size_t q = raw.find('"');
+		if (q != std::string::npos)
+		{
+			const std::string pre = raw.substr(0, q);
+			if (pre == "u8") return 1;
+			if (pre == "u")  return 2;
+			if (pre == "U")  return 4;
+			if (pre == "L")  return 2; // 本机 wchar_t = 2 字节 UTF-16（ADR-104）
+		}
+	}
+	return 1; // 无前缀：char 数组（UTF-8 字节）
+}
+
 // 宽字符串字面量解码为 UTF-16 码元（跨层单一真值源，供 wchar_t[] 初始化；parser/codegen 共用）。
 // 先经 co_decode_string 取剥前缀/解转义后的 UTF-8 内容字节，再按标准 UTF-8 变长解码得码点，
 // 重编为 UTF-16：码点 <= 0xFFFF 直接一个码元；> 0xFFFF 生成高低代理对（0xD800..0xDFFF）。

@@ -137,6 +137,12 @@ bool is_keyword(const std::string &word)
 		// P211 Co 层：单一存储类位关键字——标记顶层函数/全局为模块接口 + DLL 导出。
 		//   本批：纯存储类位，不改默认 linkage（非 public 仍 ExternalLinkage）。
 		"public",
+		// P212 Co 层：跨模块导入与模块声明头关键字。
+		//   `import` 与 `from`/`as` 共同构成导入语法（`from`/`as` 不作保留字、
+		//   仅靠上下文词法识别、保留对旧 C 代码中同名标识符的兼容）。
+		//   `module` 作为本文件模块名声明头，本版保留关键字位、不强制使用
+		//   （模块名默认取文件名去扩展名，见 plan N4）。
+		"import", "module",
 	};
 	return keywords.count(word) != 0;
 }

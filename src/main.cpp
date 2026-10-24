@@ -23,6 +23,7 @@
 #include "colang/common.h"
 #include "colang/driver.h"
 #include "colang/lexer.h"
+#include "colang/link.h"
 #include "colang/version.h"
 
 namespace
@@ -39,7 +40,7 @@ void print_usage(const char *program)
 	std::printf("  --dump-tokens     list every token found in the source\n");
 	std::printf("  --dump-ast        parse the source and print the syntax tree\n");
 	std::printf("  --emit-llvm       emit LLVM IR text (.ll)\n");
-	std::printf("  -c                compile only, produce .bc object file\n");
+	std::printf("  -c                compile only, produce COFF .obj file\n");
 	std::printf("  -o <file>         write output to <file>\n");
 	std::printf("  -I <dir>          add header search directory (also -I<dir>)\n");
 }
@@ -66,56 +67,6 @@ bool read_source(const std::string &path, std::string &out)
 		out.erase(0, 3);
 	}
 	return true;
-}
-
-// 定位 clang：从编译器自身目录向上搜 llvm*/build/{Release,Debug}/bin/clang；
-// 未找到则回退为 PATH 中的 "clang"。
-std::string find_clang(const std::string &program_path)
-{
-	namespace fs = std::filesystem;
-#ifdef _WIN32
-	const char *clang_bin = "clang.exe";
-	const char *cfgs[] = {"Release", "Debug"};
-#else
-	const char *clang_bin = "clang";
-	const char *cfgs[] = {"Release", "Debug", ""};
-#endif
-	fs::path dir;
-	{
-		std::error_code ec;
-		dir = fs::absolute(fs::path(program_path), ec).parent_path();
-	}
-	for (int depth = 0; depth < 8 && !dir.empty(); ++depth)
-	{
-		std::error_code ec;
-		if (fs::is_directory(dir, ec))
-		{
-			for (const auto &entry : fs::directory_iterator(dir, ec))
-			{
-				if (!entry.is_directory(ec))
-				{
-					continue;
-				}
-				const std::string name = entry.path().filename().string();
-				if (name.rfind("llvm", 0) != 0)
-				{
-					continue;
-				}
-				for (const char *cfg : cfgs)
-				{
-					fs::path cand = entry.path() / "build";
-					if (cfg[0] != '\0') cand /= cfg;
-					cand = cand / "bin" / clang_bin;
-					if (fs::exists(cand, ec))
-					{
-						return cand.string();
-					}
-				}
-			}
-		}
-		dir = dir.parent_path();
-	}
-	return "clang";
 }
 
 // 定位 colang 自制标准头目录 <...>/stdlib/include：
@@ -314,20 +265,12 @@ int main(int argc, char **argv)
 			std::fprintf(stderr, "colang: error: unknown option '%s'\n", arg.c_str());
 			return 1;
 		}
-		// 位置参数：源文件或 .bc 对象文件
-		std::string ext = std::filesystem::path(arg).extension().string();
-		if (ext == ".bc")
-		{
-			opts.link_inputs.push_back(arg);
-		}
-		else
-		{
-			opts.source_path = arg;
-			have_input = true;
-		}
+		// 位置参数：唯一源文件（多 .bc 合并链接的残留路径已移除）
+		opts.source_path = arg;
+		have_input = true;
 	}
 
-	if (!have_input && opts.link_inputs.empty())
+	if (!have_input)
 	{
 		print_usage(argv[0]);
 		return 1;
@@ -340,44 +283,6 @@ int main(int argc, char **argv)
 		{
 			opts.include_dirs.push_back(stdlib_dir);
 		}
-	}
-
-	// 纯链接模式：只有 .bc 输入，无源文件需编译
-	if (!have_input && !opts.link_inputs.empty())
-	{
-		std::string exe_path = opts.output;
-		if (exe_path.empty())
-#ifdef _WIN32
-			exe_path = "a.exe";
-#else
-			exe_path = "a.out";
-#endif
-		const std::string clang = find_clang(argv[0]);
-		std::string inner = "\"" + clang + "\" -Wno-override-module";
-#ifdef _WIN32
-		// colang 直建 IR、不经 clang C 前端，故按公共名引用 CRT stdio（printf/sprintf…）。
-		// 本机 MSVC/UCRT 默认导入库不导出 sprintf（在 legacy_stdio_definitions.lib）→ LNK2019（修 plct 00186）。
-		// 该 lib 仅含把公共名转发到 __stdio_common_* 的薄封装；未被引用则不拉入目标文件、对无 sprintf 的产物无副作用。
-		inner += " -llegacy_stdio_definitions";
-		// CTS 0202/0041/0096/0008 等大局部多维数组（int b[100][100][100]=4MB）超出 MSVC 默认 1MB 栈→0xC00000FD。
-		// 参考机（Linux glibc）默认 8MB；16MB 虚拟保留、按需 commit，零运行时开销。
-		inner += " -Wl,/STACK:16777216";
-#endif
-		for (const auto &bc : opts.link_inputs)
-			inner += " \"" + bc + "\"";
-		inner += " -o \"" + exe_path + "\"";
-#ifdef _WIN32
-		const std::string cmd = "\"" + inner + "\"";
-#else
-		const std::string cmd = inner;
-#endif
-		const int rc = std::system(cmd.c_str());
-		if (rc != 0)
-		{
-			std::fprintf(stderr, "colang: error: linking failed (exit %d)\n", rc);
-			return 1;
-		}
-		return 0;
 	}
 
 	if (!read_source(opts.source_path, opts.source_text))
@@ -421,39 +326,26 @@ int main(int argc, char **argv)
 	if (!errors.empty())
 		print_errors(errors);
 
-	// 链接：clang 把 .bc 编为可执行文件
-	if (opts.link_output && !state.bc_path.empty())
+	// 链接：进程内 lld 把 COFF .obj 链为可执行文件或动态库（依 -o 扩展名分岔，不再 shell out 外部 clang.exe）
+	if (opts.link_output && !state.obj_path.empty())
 	{
-		std::string exe_path = opts.output;
-		if (exe_path.empty())
+		std::string out_path = opts.output;
+		if (out_path.empty())
 		{
 #ifdef _WIN32
-			exe_path = std::filesystem::path(opts.source_path).stem().string() + ".exe";
+			out_path = std::filesystem::path(opts.source_path).stem().string() + ".exe";
 #else
-			exe_path = std::filesystem::path(opts.source_path).stem().string();
+			out_path = std::filesystem::path(opts.source_path).stem().string();
 #endif
 		}
-		const std::string clang = find_clang(argv[0]);
-		// 汇总所有 .bc 输入
-		std::string inner = "\"" + clang + "\" -Wno-override-module \"" + state.bc_path + "\"";
-#ifdef _WIN32
-		inner += " -llegacy_stdio_definitions"; // 公共名 CRT stdio 兜底（修 plct 00186 sprintf LNK2019）
-		inner += " -Wl,/STACK:16777216";        // 大局部数组栈溢出兜底（CTS 0202/0041/0096/0008 等）
-#endif
-		for (const auto &bc : opts.link_inputs)
-			inner += " \"" + bc + "\"";
-		inner += " -o \"" + exe_path + "\"";
-#ifdef _WIN32
-		const std::string cmd = "\"" + inner + "\"";
-#else
-		const std::string cmd = inner;
-#endif
-		const int rc = std::system(cmd.c_str());
+		const std::vector<std::string> objs{state.obj_path};
+		const bool ok = colang::link_exe(objs, out_path, errors);
 		std::error_code ec;
-		std::filesystem::remove(state.bc_path, ec);
-		if (rc != 0)
+		std::filesystem::remove(state.obj_path, ec);
+		if (!ok)
 		{
-			std::fprintf(stderr, "colang: error: linking failed (exit %d)\n", rc);
+			print_errors(errors);
+			std::fprintf(stderr, "colang: error: linking failed\n");
 			return 1;
 		}
 	}

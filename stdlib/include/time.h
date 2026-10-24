@@ -40,10 +40,10 @@ struct tm {
 extern time_t  time(time_t *t);
 extern clock_t clock(void);
 extern double  difftime(time_t end, time_t start);
-extern struct tm *gmtime(const time_t *t);
-extern struct tm *localtime(const time_t *t);
+extern struct tm* gmtime(const time_t *t);
+extern struct tm* localtime(const time_t *t);
 extern time_t  mktime(struct tm *tm);
-extern char   *asctime(const struct tm *tm);
+extern char* asctime(const struct tm *tm);
 extern size_t  strftime(char *s, size_t max, const char *fmt, const struct tm *tm);
 
 #endif /* _COLANG_TIME_H */

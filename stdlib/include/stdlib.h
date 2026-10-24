@@ -13,9 +13,9 @@
 typedef struct { int quot; int rem; } div_t;
 typedef struct { long long quot; long long rem; } ldiv_t;
 
-extern void *malloc(size_t size);
-extern void *calloc(size_t nmemb, size_t size);
-extern void *realloc(void *ptr, size_t size);
+extern void* malloc(size_t size);
+extern void* calloc(size_t nmemb, size_t size);
+extern void* realloc(void *ptr, size_t size);
 extern void free(void *ptr);
 
 extern void abort(void);
@@ -35,7 +35,7 @@ extern div_t div(int numer, int denom);
 extern ldiv_t ldiv(long numer, long denom);
 
 /* 环境变量（getenv 此前缺失：隐式声明按 int 返回 → 64 位指针被截 → 解引用崩溃） */
-extern char *getenv(const char *name);
+extern char* getenv(const char *name);
 
 /* abs / 绝对值家族 */
 extern int abs(int x);
@@ -53,7 +53,7 @@ extern unsigned long long strtoull(const char *s, char **end, int base);
 typedef int (*_colang_compar)(const void *, const void *);
 typedef void (*_colang_atexit_cb)(void);
 extern void qsort(void *base, size_t nmemb, size_t size, _colang_compar compar);
-extern void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+extern void* bsearch(const void *key, const void *base, size_t nmemb, size_t size,
                     _colang_compar compar);
 extern int atexit(_colang_atexit_cb func);
 
@@ -72,7 +72,7 @@ extern void ignore_handler_s(const char *msg, void *ptr, errno_t error);        
 /* 比较器形参以 typedef 表达（colang 尚不能解析内联函数指针形参 `int (*compar)(...)`）*/
 typedef int (*_colang_compar_key)(const void *, const void *, void *);
 typedef int (*_colang_compar_ctx)(void *, const void *, const void *);
-extern void *bsearch_s(const void *key, const void *base, rsize_t nmemb, rsize_t size,
+extern void* bsearch_s(const void *key, const void *base, rsize_t nmemb, rsize_t size,
                        _colang_compar_key compar, void *context);
 extern void qsort_s(void *base, rsize_t nmemb, rsize_t size,
                     _colang_compar_ctx compar, void *context);

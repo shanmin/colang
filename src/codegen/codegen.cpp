@@ -35,6 +35,23 @@
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 
+// —— COFF .obj 发射（新 PM，供进程内 lld 链接）——
+#include <llvm/Analysis/CGSCCPassManager.h>
+#include <llvm/Analysis/RuntimeLibcallInfo.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/CodeGen/MachineFunctionAnalysis.h>
+#include <llvm/CodeGen/MachineModuleInfo.h>
+#include <llvm/CodeGen/MachinePassManager.h>
+#include <llvm/CodeGen/TargetPassConfig.h> // registerCodeGenCallback
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/StandardInstrumentations.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/CGPassBuilderOption.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Target/TargetOptions.h>
+#include <llvm/Transforms/Scalar/LoopPassManager.h>
+
 #include "colang/codegen.h"
 #include "colang/type_resolver.h"
 
@@ -503,6 +520,10 @@ struct CodeGenImpl
 			llvm::FunctionType *ft = to_func_type(fn);
 			module->getOrInsertFunction(fn.name, ft);
 		}
+		// P219：顶层非恒定初始化的运行期 store 承载（仅 .co 新面 has_bare 生效，纯 C 档逐字不变）
+		const bool co_has_bare = !tu.top_level_body.empty();
+		struct TlPendingInit { llvm::GlobalVariable *gvar; ExprPtr init; CTypePtr ctype; };
+		std::vector<TlPendingInit> tl_pending_inits;
 		// 第零遍：发射全局变量
 		for (const auto &gv : tu.globals)
 		{
@@ -524,21 +545,42 @@ struct CodeGenImpl
 				continue;
 			}
 			llvm::Type *ty = to_llvm_alloca_type(gv.type);
-			auto linkage = gv.is_static
+			// P212 Strip：被导入模块的非 public 全局 → InternalLinkage（不注入外部可见 LLVM 值，
+			//   同模块内引用仍可解析；链接器可自然 DCE）。主源自身、或 public、保持 P211 旧行为。
+			const bool p212_strip_global = !gv.source_module_key.empty() && !gv.is_public;
+			auto linkage = (gv.is_static || p212_strip_global)
 				? llvm::GlobalValue::InternalLinkage
 				: llvm::GlobalValue::ExternalLinkage;
 			bool is_const = false; // P3: const 全局可考虑 constant
 			llvm::Constant *init_val = llvm::Constant::getNullValue(ty);
+			bool tl_need_runtime = false; // P219：顶层非恒定初始化标记
 			if (gv.init)
-				init_val = fold_global_init(gv.init, ty);
+			{
+				bool folded = true;
+				llvm::Constant *c = fold_global_init(gv.init, ty, &folded);
+				// P219 A 方案：仅 .co 新面（有顶层裸指令）时，标量/指针初值不可折叠
+				//   不再静默折成 null，改占位 0 + 记待运行期 store（合成 main 头部按序写回）。
+				//   纯 C 档（无顶层裸句）沿用旧折叠行为，CTS/.c 零影响。
+				if (!folded && co_has_bare && ty->isSingleValueType())
+				{
+					init_val = llvm::Constant::getNullValue(ty);
+					tl_need_runtime = true;
+				}
+				else init_val = c;
+			}
 			auto *gvar = new llvm::GlobalVariable(*module, ty, is_const,
 				linkage, init_val, gv.name);
 			if (auto a = obj_align(gv.type, ty, gv.align)) gvar->setAlignment(*a);
 			// P211 B.3：public 仅叠加 DLL 导出 storage class，不改 linkage。
-			if (gv.is_public)
+			// COFF 约束：内部链接（static/P212 strip）符号不得带 DLL 存储类
+			//   （"symbol with local linkage cannot have a DLL storage class"）；故仅当
+			//   最终 linkage 为 External 时才打 Export。static public 在 exe 场景本就无导出语义。
+			if (gv.is_public && linkage == llvm::GlobalValue::ExternalLinkage)
 				gvar->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
 			globals_[gv.name] = gvar;
 			global_types_[gv.name] = gv.type;
+			if (tl_need_runtime)
+				tl_pending_inits.push_back({gvar, gv.init, gv.type});
 		}
 		// 第一遍：声明所有函数（保证调用可见）
 		for (const auto &fn : tu.funcs)
@@ -554,16 +596,58 @@ struct CodeGenImpl
 			llvm::FunctionCallee FC = module->getOrInsertFunction(fn.name, ft);
 			if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee()))
 			{
-				F->setLinkage(fn.is_static
+				// P212 Strip：被导入模块的非 public 函数定义 → InternalLinkage（不对外可见）。
+				//   同模块内引用（如 public wrapper 调 private helper）仍能解析，LLVM 自然 DCE。
+				// P213 winapi.co 探路修正：纯原型（body == nullptr）**不参与 strip**。
+				//   它们本就没有本地定义可限内，强制保持 ExternalLinkage 交给链接器解析（典型场景：
+				//   winapi.co 中的 Win32 API 声明，clang 默认链接的 kernel32.lib 会自然处理 __imp_ thunk）。
+				const bool p212_strip_func = !fn.source_module_key.empty() && !fn.is_public && fn.body;
+				const bool f_internal = fn.is_static || p212_strip_func;
+				F->setLinkage(f_internal
 					? llvm::GlobalValue::InternalLinkage
 					: llvm::GlobalValue::ExternalLinkage);
 				// P211 B.3：public 仅叠加 DLL 导出 storage class（COFF .drectve /EXPORT:），不改 linkage。
-				if (fn.is_public)
+				// P213 winapi.co 探路修正：**仅对有函数体的 public 打 DLLExport**。
+				//   纯原型 (body == nullptr) 本就不局部定义、不存在可导出的对象；强制打 Export 会误导
+				//   lld 去当前 binary 中寻不存在的定义 → 静默默返 0 或 LNK4217。交给链接器默认处理。
+				// COFF 约束：内部链接符号（static）不得带 DLL 存储类；static public 仅内部可调用、不导出。
+				if (fn.is_public && fn.body && !f_internal)
 					F->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
 				// Win64 ABI 要求每个函数带 .pdata/.xdata 展开表；clang 从源码编译时默认
 				// 加 "uwtable"，但 colang 手工建 IR 不会自动带。缺它则基于 RtlUnwind 的栈
 				// 回溯（UCRT longjmp、异常处理、backtrace）找不到帧 → 崩溃。统一补上。
 				F->addFnAttr("uwtable");
+			}
+		}
+		// ============================================================
+		// P214 [[lib("X")]] → COFF 目录段 .drectve 的 /DEFAULTLIB 指令
+		//   实测通道（_tmp/libprobe/dt.ll）：
+		//     private global [N x i8] c"/DEFAULTLIB:\22X.lib\22 ", section ".drectve"
+		//   经 .bc → clang.exe → lld-link 穿透成立，无需命令行再给 -lX。
+		//   按首现序去重（同库多次声明只发一条）；函数优先于全局变量（跟 AST 顺序）。
+		//   注意：/DEFAULTLIB 只解决「拉哪个库」，不解决多库同名符号的归属 —— 后者已由
+		//   Sema 的冲突检查（同名不同 lib → error）在编译期拦下。
+		// ============================================================
+		{
+			std::vector<std::string> libs;
+			auto add_lib = [&libs](const std::string &s)
+			{
+				if (s.empty()) return;
+				for (const auto &x : libs)
+					if (x == s) return;
+				libs.push_back(s);
+			};
+			for (const auto &fn : tu.funcs) add_lib(fn.lib_name);
+			for (const auto &gv : tu.globals) add_lib(gv.lib_name);
+			for (std::size_t i = 0; i < libs.size(); ++i)
+			{
+				// 末尾留一个空格作分隔（与 MSVC CRT 自带的 .drectve 条目一致），再加 '\0' 收尾
+				const std::string directive = "/DEFAULTLIB:\"" + libs[i] + ".lib\" ";
+				llvm::Constant *data = llvm::ConstantDataArray::getString(ctx, directive, true);
+				auto *dg = new llvm::GlobalVariable(*module, data->getType(), true,
+					llvm::GlobalValue::PrivateLinkage, data, "co.drectve" + std::to_string(i));
+				dg->setSection(".drectve");
+				dg->setAlignment(llvm::MaybeAlign(2));
 			}
 		}
 		// 第二遍：定义有 body 的函数
@@ -645,6 +729,16 @@ struct CodeGenImpl
 						}
 					}
 					in_synthesized_main_body_ = true;
+					// P219：顶层非恒定初始化 → 合成 main 头部按声明序 store 运行期值
+					//   （先于顶层裸句执行，贴近「顶层顺序执行」模型；此时 argc/argv/envp 已入作用域）
+					for (auto &pi : tl_pending_inits)
+					{
+						llvm::Type *vt = pi.gvar->getValueType();
+						llvm::Value *v = gen_expr(pi.init);
+						if (v && v->getType() != vt)
+							v = convert_value(v, vt, get_expr_ctype(pi.init));
+						if (v) builder.CreateStore(v, pi.gvar);
+					}
 					for (const auto &s : tu.top_level_body)
 						if (s) gen_stmt(s, m);
 					in_synthesized_main_body_ = false;
@@ -1174,8 +1268,9 @@ struct CodeGenImpl
 	}
 
 	// 将初始化表达式折叠为 LLVM 常量（全局变量初始化器用）
-	llvm::Constant *fold_global_init(const ExprPtr &e, llvm::Type *ty)
+	llvm::Constant *fold_global_init(const ExprPtr &e, llvm::Type *ty, bool *out_folded = nullptr)
 	{
+		if (out_folded) *out_folded = true; // P219：默认视为可折叠，仅于末尾 fallback 置 false
 		if (!e) return llvm::Constant::getNullValue(ty);
 		// union 目标（具名 struct 包 [N x i8]）：标量/花括号均归首成员
 		if (ty->isStructTy())
@@ -1416,7 +1511,7 @@ struct CodeGenImpl
 				if (ty->isIntegerTy() || ty->isFloatingPointTy())
 				{
 					if (!e->args.empty())
-						return fold_global_init(e->args[0], ty);
+						return fold_global_init(e->args[0], ty, out_folded);
 					return llvm::Constant::getNullValue(ty);
 				}
 			}
@@ -1428,9 +1523,30 @@ struct CodeGenImpl
 			// ConstantPointerNull，使全局指针成员初始化后为 null（CTS 0030 族 printf("%s") 得 (null)）。
 			if (e->kind == ExprKind::StringLiteral)
 			{
-				std::string decoded = co_decode_string(e->str_val);
-				llvm::Constant *data = llvm::ConstantDataArray::getString(ctx, llvm::StringRef(decoded), /*AddNull*/ true);
-				auto *saty = llvm::cast<llvm::ArrayType>(data->getType());
+				const int w = co_str_lit_width(e->str_val);
+				llvm::ArrayType *saty = nullptr;
+				llvm::Constant *data = nullptr;
+				if (w == 1)
+				{
+					std::string decoded = co_decode_string(e->str_val);
+					data = llvm::ConstantDataArray::getString(ctx, llvm::StringRef(decoded), /*AddNull*/ true);
+					saty = llvm::cast<llvm::ArrayType>(data->getType());
+				}
+				else
+				{
+					// 全局宽字符指针初值（wchar_t *p = L"…" / char32_t *q = U"…"）：按前缀三路降
+					// UTF-16/UTF-32（与 gen_expr 右值发射、fold 数组分支同口径）；旧路径恒发 i8 会与 wchar_t* 点位宽不符。
+					llvm::Type *ety = (w == 2) ? static_cast<llvm::Type *>(llvm::Type::getInt16Ty(ctx))
+					                           : static_cast<llvm::Type *>(llvm::Type::getInt32Ty(ctx));
+					std::vector<llvm::Constant *> elems;
+					if (w == 2)
+						for (uint16_t c : co_decode_utf16(e->str_val)) elems.push_back(llvm::ConstantInt::get(ety, c));
+					else
+						for (uint32_t c : co_decode_utf32(e->str_val)) elems.push_back(llvm::ConstantInt::get(ety, c));
+					elems.push_back(llvm::ConstantInt::get(ety, 0));
+					saty = llvm::ArrayType::get(ety, elems.size());
+					data = llvm::ConstantArray::get(saty, elems);
+				}
 				auto *sgv = new llvm::GlobalVariable(*module, saty, /*isConstant*/ true,
 					llvm::GlobalValue::PrivateLinkage, data, ".str");
 				sgv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
@@ -1466,8 +1582,10 @@ struct CodeGenImpl
 				llvm::Constant *ci = llvm::ConstantInt::get(llvm::IntegerType::get(ctx, 64), bits);
 				return llvm::ConstantExpr::getIntToPtr(ci, llvm::cast<llvm::PointerType>(ty));
 			}
+			if (out_folded) *out_folded = false; // P219：指针初值不可折叠（如函数调用）→ 交运行期 store
 			return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ty));
 		}
+		if (out_folded) *out_folded = false; // P219：标量初值不可折叠（如函数调用/读运行时变量）→ 交运行期 store
 		return llvm::Constant::getNullValue(ty);
 	}
 
@@ -2554,8 +2672,37 @@ struct CodeGenImpl
 				static_cast<uint8_t>(e->int_val));
 		case ExprKind::StringLiteral:
 		{
-			std::string decoded = decode_string(e->str_val);
-			return builder.CreateGlobalString(llvm::StringRef(decoded), ".str");
+			const int w = co_str_lit_width(e->str_val);
+			if (w == 1)
+			{
+				std::string decoded = decode_string(e->str_val);
+				return builder.CreateGlobalString(llvm::StringRef(decoded), ".str");
+			}
+			// 右值宽字符串字面量（L"…"/u"…"→i16、U"…"→i32）：按前缀三路降 UTF-16/UTF-32，
+			// 物化为 private constant 全局数组再退化为首元素指针（复用 fold_global_init 同款解码器、
+			// 同口径；C §6.4.5 前缀决定字面量元素类型）。旧路径恒发 i8、忽略前缀（§3.1 后置项）。
+			llvm::Type *ety = (w == 2) ? static_cast<llvm::Type *>(llvm::Type::getInt16Ty(ctx))
+			                           : static_cast<llvm::Type *>(llvm::Type::getInt32Ty(ctx));
+			std::vector<llvm::Constant *> elems;
+			if (w == 2)
+			{
+				const std::vector<uint16_t> u = co_decode_utf16(e->str_val);
+				for (uint16_t c : u) elems.push_back(llvm::ConstantInt::get(ety, c));
+			}
+			else
+			{
+				const std::vector<uint32_t> u = co_decode_utf32(e->str_val);
+				for (uint32_t c : u) elems.push_back(llvm::ConstantInt::get(ety, c));
+			}
+			elems.push_back(llvm::ConstantInt::get(ety, 0)); // 终止 null 码元
+			llvm::ArrayType *aty = llvm::ArrayType::get(ety, elems.size());
+			llvm::Constant *init = llvm::ConstantArray::get(aty, elems);
+			auto *gv = new llvm::GlobalVariable(*module, aty, /*isConstant*/ true,
+				llvm::GlobalValue::PrivateLinkage, init, ".str");
+			gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+			llvm::Constant *z32 = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+			llvm::Constant *idxs[] = { z32, z32 };
+			return llvm::ConstantExpr::getGetElementPtr(aty, gv, llvm::ArrayRef<llvm::Constant *>(idxs));
 		}
 		case ExprKind::VarRef:
 		{
@@ -4097,7 +4244,15 @@ struct CodeGenImpl
 			if (e->type && e->type->kind == TypeKind::Float) return e->type;
 			return make_type(TypeKind::Double);
 		case ExprKind::StringLiteral:
+			// 前缀决定字面量元素类型（C §6.4.5）：L/u→wchar_t*(i16)、U→char32_t*(i32)、其余→char*。
+			// 与 gen_expr 右值三路编码发射同口径（均据 co_str_lit_width）；使 wchar_t *p = L"…" 与
+			// MessageBoxW(L"…", …) 实参在 Sema 通过。旧行为恒报 char*（与右值发射不一致）。
+		{
+			const int w = co_str_lit_width(e->str_val);
+			if (w == 2) return make_pointer(make_type(TypeKind::WChar));
+			if (w == 4) return make_pointer(make_type(TypeKind::Char32));
 			return make_pointer(make_type(TypeKind::Char)); // char[N] 经 lvalue → char*
+		}
 		case ExprKind::VarRef:
 		{
 			auto vt = var_types_.find(e->name);
@@ -4639,6 +4794,103 @@ struct CodeGenImpl
 // ============================================================
 // 对外接口
 // ============================================================
+
+// 用 LLVM 23 新 PM 把模块下 Lower 成 COFF .obj（对标 llc NewPMDriver）。
+// 关键点（Phase 0 spike 实测）：
+//   - 模块 DataLayout 必须与目标机一致，否则 buildCodeGenPipeline fatal-error；
+//     故此处用 TM->createDataLayout() 覆写模块 DL（与 clang 喂 .bc 时行为一致）。
+//   - X86 TargetMachine 构造器由 LLVMInitializeX86Target() 注册（非 ...TargetMC）。
+static bool emit_object_file(llvm::Module *M, const std::string &obj_path,
+                             const std::string &src, std::vector<Error> &errors)
+{
+	auto fail = [&](const std::string &msg) -> bool {
+		errors.push_back(Error{src, Pos{1, 1}, msg, false});
+		return false;
+	};
+
+	static bool target_inited = false;
+	if (!target_inited)
+	{
+		// LLVMInitializeX86* 由 TargetSelect.h 声明于全局 extern "C"（非 llvm 命名空间）。
+		LLVMInitializeX86Target();
+		LLVMInitializeX86TargetInfo();
+		LLVMInitializeX86TargetMC();
+		LLVMInitializeX86AsmPrinter();
+		LLVMInitializeX86AsmParser();
+		target_inited = true;
+	}
+
+	const llvm::Triple TT(M->getTargetTriple());
+	std::string lookup_err;
+	const llvm::Target *TheTarget = llvm::TargetRegistry::lookupTarget(TT, lookup_err);
+	if (!TheTarget)
+		return fail("target lookup: " + lookup_err);
+
+	llvm::TargetOptions Options;
+	std::unique_ptr<llvm::TargetMachine> TM(TheTarget->createTargetMachine(
+		TT, "x86-64", "", Options, std::nullopt));
+	if (!TM)
+		return fail("createTargetMachine failed");
+
+	// 目标机权威 DataLayout 覆写模块，保证与新 PM 下降一致。
+	M->setDataLayout(TM->createDataLayout());
+
+	std::error_code ec;
+	llvm::raw_fd_ostream Dest(obj_path, ec, llvm::sys::fs::OF_None);
+	if (ec)
+		return fail("cannot write .obj: " + ec.message());
+	llvm::raw_pwrite_stream &OS = Dest; // 常规文件流可 seek，无需 buffer_ostream
+
+	llvm::TargetLibraryInfoImpl TLII(TT);
+	llvm::CGPassBuilderOption Opt;
+	Opt.DisableVerify = true;
+
+	llvm::MachineModuleInfo MMI(TM.get());
+	llvm::PassInstrumentationCallbacks PIC;
+	llvm::StandardInstrumentations SI(M->getContext(), /*DebugLogging=*/false,
+								  /*DebugPassManager=*/false);
+	llvm::registerCodeGenCallback(PIC, *TM);
+
+	llvm::MachineFunctionAnalysisManager MFAM;
+	llvm::LoopAnalysisManager LAM;
+	llvm::FunctionAnalysisManager FAM;
+	llvm::CGSCCAnalysisManager CGAM;
+	llvm::ModuleAnalysisManager MAM;
+
+	FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
+	MAM.registerPass([&] {
+		const llvm::TargetOptions &TO = TM->Options;
+		return llvm::RuntimeLibraryAnalysis(
+			M->getTargetTriple(), TM->Options.ExceptionModel,
+			TM->Options.FloatABIType, TM->Options.EABIVersion,
+			TO.MCOptions.ABIName, TM->Options.VecLib);
+	});
+	MAM.registerPass([&] { return llvm::MachineModuleAnalysis(MMI); });
+
+	llvm::PassBuilder PB(TM.get(), llvm::PipelineTuningOptions(), std::nullopt, &PIC);
+	PB.registerModuleAnalyses(MAM);
+	PB.registerCGSCCAnalyses(CGAM);
+	PB.registerFunctionAnalyses(FAM);
+	PB.registerLoopAnalyses(LAM);
+	PB.registerMachineFunctionAnalyses(MFAM);
+	PB.crossRegisterProxies(LAM, FAM, CGAM, MAM, &MFAM);
+	SI.registerCallbacks(PIC, &MAM);
+
+	llvm::ModulePassManager MPM;
+	if (auto Err = TM->buildCodeGenPipeline(
+			MPM, MAM, OS, /*DwoOut=*/nullptr, llvm::CodeGenFileType::ObjectFile,
+			Opt, MMI.getContext(), &PIC))
+	{
+		std::string msg;
+		llvm::raw_string_ostream ms(msg);
+		ms << "buildCodeGenPipeline: " << llvm::toString(std::move(Err));
+		return fail(msg);
+	}
+	MPM.run(*M, MAM);
+	Dest.flush();
+	return true;
+}
+
 bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error> &errors)
 {
 	if (!state.ast)
@@ -4680,23 +4932,16 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 		return false;
 	}
 
-	// -c 编译模式：写 .bc 到输出路径（默认 <stem>.bc）
+	// -c 编译模式：经 X86 TargetMachine 下 Lower 为 COFF .obj，写到输出路径
+	// （默认 <stem>.obj）；不链接、不删除（区别于链接模式的临时 .obj）。
 	if (opts.compile_only)
 	{
-		std::string bc_out = opts.output.empty() ? (module_name + ".bc") : opts.output;
-		std::error_code ec;
-		llvm::raw_fd_ostream os(bc_out, ec);
-		if (ec)
-		{
-			errors.push_back(Error{opts.source_path, Pos{1, 1}, "cannot write .bc: " + ec.message()});
-			return false;
-		}
-		llvm::WriteBitcodeToFile(*cg.module, os);
-		state.bc_path = bc_out; // 保留（不删除）
-		return true;
+		const std::string obj_out = opts.output.empty() ? (module_name + ".obj") : opts.output;
+		state.obj_path = obj_out; // 保留（不删除）
+		return emit_object_file(cg.module.get(), obj_out, opts.source_path, errors);
 	}
 
-	// 链接模式：写 .bc 到临时目录
+	// 链接模式：经 X86 TargetMachine 下 Lower 为 COFF .obj（写临时目录，进程内 lld 链接后删除）
 	if (opts.link_output)
 	{
 		std::error_code ec;
@@ -4705,15 +4950,8 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 		{
 			tmp = std::filesystem::current_path(ec);
 		}
-		state.bc_path = (tmp / (module_name + ".bc")).string();
-		llvm::raw_fd_ostream os(state.bc_path, ec);
-		if (ec)
-		{
-			errors.push_back(Error{opts.source_path, Pos{1, 1}, "cannot write .bc: " + ec.message()});
-			return false;
-		}
-		llvm::WriteBitcodeToFile(*cg.module, os);
-		return true;
+		state.obj_path = (tmp / (module_name + ".obj")).string();
+		return emit_object_file(cg.module.get(), state.obj_path, opts.source_path, errors);
 	}
 
 	return true;

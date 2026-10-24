@@ -6,21 +6,21 @@
 
 #include <stddef.h>
 
-extern void *memcpy(void *dst, const void *src, size_t n);
-extern void *memmove(void *dst, const void *src, size_t n);
-extern void *memset(void *dst, int c, size_t n);
+extern void* memcpy(void *dst, const void *src, size_t n);
+extern void* memmove(void *dst, const void *src, size_t n);
+extern void* memset(void *dst, int c, size_t n);
 extern int memcmp(const void *a, const void *b, size_t n);
-extern void *memchr(const void *s, int c, size_t n);
+extern void* memchr(const void *s, int c, size_t n);
 
 extern size_t strlen(const char *s);
-extern char *strcpy(char *dst, const char *src);
-extern char *strncpy(char *dst, const char *src, size_t n);
-extern char *strcat(char *dst, const char *src);
+extern char* strcpy(char *dst, const char *src);
+extern char* strncpy(char *dst, const char *src, size_t n);
+extern char* strcat(char *dst, const char *src);
 extern int strcmp(const char *a, const char *b);
 extern int strncmp(const char *a, const char *b, size_t n);
-extern char *strchr(const char *s, int c);
-extern char *strrchr(const char *s, int c);
-extern char *strstr(const char *haystack, const char *needle);
+extern char* strchr(const char *s, int c);
+extern char* strrchr(const char *s, int c);
+extern char* strstr(const char *haystack, const char *needle);
 
 /* Annex K（§K.3.7/K.3.8，P9.30 务实子集）：边界检查字符串/内存函数。
  * 仅在 #define __STDC_WANT_LIB_EXT1__ 1 后包含本头时可见。

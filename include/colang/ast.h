@@ -238,6 +238,25 @@ struct Stmt
 // ============================================================
 // 声明（顶层）
 // ============================================================
+// C23 属性（P214）
+// ============================================================
+// parser 在声明位识别并记录 [[...]]，产物累积在本结构中，最终落到 FuncDecl/GlobalVar。
+// 本批仅落地两个属性：
+//   [[deprecated]] / [[deprecated("消息")]] —— ISO C23 §6.7.11 标准属性
+//   [[lib("链接名")]]                     —— Co 层新定义属性（声明该符号由哪个导入库实现）
+// 其余标准属性（nodiscard/maybe_unused/…）与厂商限定名分别按「接受不生效」/「拒收报错」处理。
+// 「接受不生效」的位置（局部声明/语句位/typedef）不经本结构，直接整段消费。
+struct DeclAttributes
+{
+	bool deprecated = false;
+	std::string deprecated_msg;   // [[deprecated("msg")]] 的消息（可空）
+	bool has_lib = false;
+	std::string lib_name;         // [[lib("user32")]] 的链接名（不含 .lib 后缀/路径）
+};
+
+// ============================================================
+// 函数 / 全局变量
+// ============================================================
 struct Param
 {
 	std::string name;
@@ -252,8 +271,15 @@ struct FuncDecl
 	bool is_variadic = false;
 	bool is_static = false;  // static 函数 (InternalLinkage)
 	bool is_public = false;  // P211 Co 层：public 标记 → DLL 导出（不改 linkage）
+	// P214 C23 属性：[[deprecated]] / [[lib("X")]]
+	bool is_deprecated = false;
+	std::string deprecated_msg;
+	std::string lib_name;    // 空 = 未标注 [[lib]]
 	StmtPtr body; // CompoundStmt if definition; nullptr if declaration only
 	SourceLoc loc;
+	// P212 loader 归属标记：源模块规范化绝对路径 key；空串 = 主源 TU 本体。
+	//   仅 loader 在合并前写入；parser/sema/codegen 默认空即视为「主源」。
+	std::string source_module_key;
 };
 
 struct GlobalVar
@@ -264,8 +290,13 @@ struct GlobalVar
 	bool is_static = false;  // InternalLinkage
 	bool is_extern = false;  // 纯声明（无定义）
 	bool is_public = false;  // P211 Co 层：public 标记 → DLL 导出（不改 linkage）
+	// P214 C23 属性：[[deprecated]] / [[lib("X")]]
+	bool is_deprecated = false;
+	std::string deprecated_msg;
+	std::string lib_name;
 	unsigned align = 0;      // C23 _Alignas 强制对齐（字节；0 = 未指定）
 	SourceLoc loc;
+	std::string source_module_key;  // P212 同 FuncDecl
 };
 
 // ============================================================
@@ -286,6 +317,8 @@ struct StructDef
 	bool is_definition = false; // 带 { ... } 的完整定义（false = 仅前置引用，成员表为空不代表空类型）
 	std::vector<StructMember> members;
 	SourceLoc loc;
+	bool is_public = false;         // P212：struct 定义可标 public 参与 import
+	std::string source_module_key;  // P212 同 FuncDecl
 };
 
 struct EnumConstant
@@ -299,6 +332,44 @@ struct EnumDef
 	std::string tag;     // enum Name 的 Name
 	std::vector<EnumConstant> constants;
 	SourceLoc loc;
+	bool is_public = false;         // P212
+	std::string source_module_key;  // P212
+};
+
+// ============================================================
+// import 声明（P212 Co 层）
+// ============================================================
+// 语法（沿用 .old3 D38、附录 B.4；filename 双形式）：
+//   import * | name [as alias], … from ("file" | module_name) [as ModAlias];
+// filename 双形式：
+//   【字符串字面量】支持跨目录/特殊字符（如 "sub/lib.co"、"my-mod"）
+//     无后缀自动补 `.co`；以引用方目录为基准
+//   【简化标识符】from a 等价 from "a.co"（仅同目录，无引号/后缀/分隔符）
+// 例：
+//   import * from "stdio.co";                        // 全量导入（字符串）
+//   import printf from "stdio.co";                    // 指定符号（字符串）
+//   import puts as print_line from "io.co";           // 符号改名
+//   import a, b as x, c from "m.co" as MyMod;         // 多项 + 模块别名
+//   import * from stdio;                              // 简化：同 stdio.co
+//   import add from mod;                              // 简化：同 mod.co
+//   import x from "sub/deep";                         // 跨目录（字符串形式必要）
+struct ImportSpecifier
+{
+	std::string name;   // 非 star 时的符号名；is_star=true 时为空
+	std::string alias;  // `as X` 目标名（可空，为空时与 name 同）
+	bool is_star = false; // `import *` 全量导入
+	SourceLoc loc;
+};
+
+struct ImportDecl
+{
+	std::vector<ImportSpecifier> specs;
+	std::string filename;      // 字符串字面量内容（已 co_decode_string 剥前缀/解转义）
+	std::string module_alias;  // `as ModAlias` 可选（本文件内引用该模块的限定名）
+	SourceLoc loc;
+	// P212 loader 解析回填：规范化绝对路径 key，用于跨模块可见性匹配。
+	//   parser 产出时为空；loader 在 load_recursive 前填入主源本层 imports 对应项。
+	std::string resolved_module_key;
 };
 
 // ============================================================
@@ -314,6 +385,16 @@ struct TranslationUnit
 	// P211 Co 层入口模型：文件作用域的裸语句序列（printf/if/for/return/...）
 	//   按源码顺序保留，codegen 在合成 main 中依序发射。
 	std::vector<StmtPtr> top_level_body;
+	// P212 Co 层：顶层 import 声明。driver 在 parse 后递归加载被导入模块、
+	//   DFS 后序拓序合并 AST 到主源 TU（本字段保留原始 import 声明供 sema 可见集构造）。
+	std::vector<ImportDecl> imports;
+	// P212 loader 诊断展示路径（环检测报路径、module not found 拼串用）。
+	//   主源 = opts.source_path 文件名；子模块 = 已解析的绝对路径文件名。不依默认行为。仅 loader 写。
+	std::string diagnostics_display_path;
+	// P212 loader：合并后 top_level_body 头部属于「被导入模块」的语句条数（拓序前插总长）。
+	//   主源自身的顶层裸语句 = top_level_body[imported_top_level_body_count .. end)。
+	//   sema 走查可见性时对 index < 本字段的项目跳过（视为 imported 内部事务、不查跨模块可见性）。
+	std::size_t imported_top_level_body_count = 0;
 };
 
 using TUPtr = std::shared_ptr<TranslationUnit>;

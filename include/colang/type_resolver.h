@@ -341,7 +341,15 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		return nullptr;
 	}
 	if (e->kind == ExprKind::StringLiteral)
+	{
+		// 前缀决定字面量元素类型（C §6.4.5）：L/u→wchar_t*(i16)、U→char32_t*(i32)、其余→char*。
+		// 与 codegen::gen_expr 右值三路编码发射同口径（均据 co_str_lit_width），使 wchar_t *p = L"…"
+		// 与 MessageBoxW(L"…", …) 等宽字符实参在 Sema 通过。旧行为恒报 char*（忽略前缀、与右值发射不一致）。
+		const int w = co_str_lit_width(e->str_val);
+		if (w == 2) return make_pointer(make_type(TypeKind::WChar));
+		if (w == 4) return make_pointer(make_type(TypeKind::Char32));
 		return make_pointer(make_type(TypeKind::Char));
+	}
 	if (e->kind == ExprKind::FloatLiteral)
 	{
 		// P9.24 浮点后缀定型：f/F 后缀的 FloatLiteral 由 parser 携带 Float 类型，此处如实采纳

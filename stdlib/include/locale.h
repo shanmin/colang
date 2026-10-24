@@ -44,7 +44,7 @@ struct lconv {
     char  int_n_sign_posn;
 };
 
-extern char *setlocale(int category, const char *locale);
-extern struct lconv *localeconv(void);
+extern char* setlocale(int category, const char *locale);
+extern struct lconv* localeconv(void);
 
 #endif /* _COLANG_LOCALE_H */

@@ -28,7 +28,7 @@ extern int putchar(int c);
 extern int getchar(void);
 extern int fprintf(FILE *stream, const char *fmt, ...);
 extern int fscanf(FILE *stream, const char *fmt, ...);
-extern FILE *fopen(const char *path, const char *mode);
+extern FILE* fopen(const char *path, const char *mode);
 extern int fclose(FILE *stream);
 
 /* stdin/stdout/stderr — C §7.21.1，类型为 FILE* 的外部对象式宏。
@@ -37,7 +37,7 @@ extern int fclose(FILE *stream);
  * 已由 clang.exe+UCRT 实测可链接且可作 fprintf 目标。
  * 边界：面向 Windows/UCRT 宿主；glibc(Linux) 下 stderr 为 extern FILE* 数据符号，
  *       待 colang 引入平台预定义宏后再按平台分派。*/
-extern FILE *__acrt_iob_func(unsigned);
+extern FILE* __acrt_iob_func(unsigned);
 
 #define stdin  (__acrt_iob_func(0))
 #define stdout (__acrt_iob_func(1))

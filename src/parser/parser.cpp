@@ -50,6 +50,11 @@ struct Parser
 	bool last_typedef_ = false;
 	bool last_public_ = false; // P211 Co 层：public 存储类位（仅顶层函数/全局有意义）
 	unsigned last_alignas_ = 0; // parse_decl_specifiers 捕获的 _Alignas 强制对齐（字节；0=未指定）
+	DeclAttributes last_attrs_;   // P214：parse_decl_specifiers 期间（中置位）识别到的属性
+	// P214：属性列表本身语法错（未闭合/缺属性名）时置位。
+	//   parse_translation_unit 对顶层项做推测解析、失败会回滚 errs；若不标记，本类诊断会被一并吞掉。
+	//   置位后 parse_global_decl_or_func 直接“认领”本项（返回 true）→ 诊断得以保留。
+	bool attr_fatal_ = false;
 	// 函数名 -> 返回类型（auto 推断用）
 	std::unordered_map<std::string, CTypePtr> func_return_types_;
 	// 局部变量名 -> 类型（typeof/auto 推断用，作用域简化为全局累积）
@@ -186,6 +191,17 @@ struct Parser
 		errs.push_back(Error{loc.file, Pos{loc.line, loc.column}, msg});
 	}
 
+	// 告警：不置致命标志（Error::is_warning=true，driver 侧 has_fatal 不计入）
+	void warn(const SourceLoc &loc, const std::string &msg)
+	{
+		Error e;
+		e.file = loc.file;
+		e.pos = Pos{loc.line, loc.column};
+		e.message = msg;
+		e.is_warning = true;
+		errs.push_back(std::move(e));
+	}
+
 	// —— 语法规约 ——
 
 	TUPtr parse_translation_unit()
@@ -194,6 +210,22 @@ struct Parser
 		cur_tu_ = tu.get();
 		while (!at_end())
 		{
+			// P212 Co 层：`import` 前置识别。词法上属 Keyword，不匹 is_type_start
+			//   → parse_global_decl_or_func 失败回滚 → 落入裸语句兜底 → 会误报
+			//   “expected declaration or statement”而无法产 ImportDecl；此处短路。
+			//   识别语法后填入 TU.imports、供 driver 递归加载使用；Step 1 仅识别不加载，
+			//   Step 3 起 driver 才会消费本列表。
+			if (check_keyword("import"))
+			{
+				ImportDecl decl;
+				if (parse_import_decl(decl))
+				{
+					tu->imports.push_back(std::move(decl));
+					continue;
+				}
+				skip_to_semi();
+				continue;
+			}
 			// P211 Co 层入口模型：顶层先试声明/函数定义，失败则回滚后按裸语句入 top_level_body。
 			//   回滚需同时恢复 errs（防 expect_punct("(") 等推测性报错污染）。
 			const std::size_t save_pos = pos;
@@ -217,25 +249,288 @@ struct Parser
 		return tu;
 	}
 
-	// C23 [[attribute]] 跳过：识别连续的 [[...]] 并整段消费
-	void skip_attributes()
+	// P212 import 语法：
+	//   import * | name [as alias], … from "file" [as ModAlias] ;
+	// `from` / `as` 不作保留字（旧 C 代码可能用同名标识符）、靠上下文词法识别：
+	//   本函数中当“当前 token 为 Identifier 且拼写等于 from/as”视为语法位。
+	bool parse_import_decl(ImportDecl &out)
 	{
-		while (peek().text == "[" && peek(1).text == "[")
+		out.loc = peek().loc;
+		advance(); // 消耗 'import'
+
+		// 选择器列表（`*` 或 `name [as alias]`、逗号分隔）
+		bool first = true;
+		while (true)
 		{
-			advance(); // first [
-			advance(); // second [
-			// 跳过直到 ]]
-			while (!at_end())
+			if (!first)
 			{
-				if (peek().text == "]" && peek(1).text == "]")
+				if (!match_punct(",")) break;
+			}
+			first = false;
+
+			ImportSpecifier spec;
+			spec.loc = peek().loc;
+			if (check_punct("*"))
+			{
+				advance();
+				spec.is_star = true;
+			}
+			else if (peek().kind == TokKind::Identifier)
+			{
+				spec.name = advance().text;
+				// 可选 `as alias`（`as` 非保留字、Identifier 拼写判定）
+				if (peek().kind == TokKind::Identifier && peek().text == "as")
 				{
-					advance(); // first ]
-					advance(); // second ]
+					advance();
+					if (peek().kind != TokKind::Identifier)
+					{
+						error(peek().loc, "expected alias after 'as'");
+						return false;
+					}
+					spec.alias = advance().text;
+				}
+			}
+			else
+			{
+				error(peek().loc, "expected '*' or identifier in import list");
+				return false;
+			}
+			out.specs.push_back(std::move(spec));
+		}
+
+		// `from` 关键字位（Identifier 拼写判定）
+		if (peek().kind != TokKind::Identifier || peek().text != "from")
+		{
+			error(peek().loc, "expected 'from' in import declaration");
+			return false;
+		}
+		advance();
+
+		// filename 双形式（P212 简化语法）：
+		//   • TokKind::String —— 带引号、可跨目录/含后缀、经 co_decode_string 剥前缀/解转义
+		//   • TokKind::Identifier —— 简化形式、仅同目录且无引号/后缀/分隔符、loader 自动补 `.co`
+		if (peek().kind == TokKind::String)
+		{
+			out.filename = co_decode_string(advance().text);
+		}
+		else if (peek().kind == TokKind::Identifier)
+		{
+			out.filename = advance().text; // 简化：同目录、无后缀、loader 补 `.co`
+		}
+		else
+		{
+			error(peek().loc, "expected string literal or identifier as import filename");
+			return false;
+		}
+
+		// 可选 `as ModAlias`
+		if (peek().kind == TokKind::Identifier && peek().text == "as")
+		{
+			advance();
+			if (peek().kind != TokKind::Identifier)
+			{
+				error(peek().loc, "expected module alias after 'as'");
+				return false;
+			}
+			out.module_alias = advance().text;
+		}
+
+		if (!match_punct(";"))
+		{
+			error(peek().loc, "expected ';' after import declaration");
+			return false;
+		}
+		return true;
+	}
+
+	// 属性列表语法错专用：除报诊断外还置 attr_fatal_（防顶层推测解析回滚吞掉诊断）
+	void attr_error(const SourceLoc &loc, const std::string &msg)
+	{
+		attr_fatal_ = true;
+		error(loc, msg);
+	}
+
+	// ============================================================
+	// C23 [[attribute]]（P214：由「整段吞掉」改为「识别并记录」）
+	// ============================================================
+	// 旧实现发现 `[[` 就一路找 `]]`，未闭合时吞到 EOF 且零诊断。现按属性名分派：
+	//   已落地：deprecated / deprecated("msg")（ISO C23 §6.7.11）、lib("链接名")（Co 层新定义）
+	//   已识别、本批不生效：nodiscard / maybe_unused / noreturn / fallthrough / trap / pure /
+	//                     stable / assert / assume / incomplete / reproducible_constant /
+	//                     unsequenced / misleading_casefall（静默接受）
+	//   厂商/限定名 [[x::y]]：报错拒收（ADR-104 不做厂商扩展）
+	//   其余裸名：warning "unknown attribute 'x' ignored" + 跳过（不阻断编译）
+	// collect=false = 「接受不生效」位置（局部声明/语句位/typedef/成员）：仍消费 token、
+	//   仍报纯语法错（缺属性名/未闭合），但不记录、不报语义诊断（保持既有零诊断行为）。
+	void parse_attributes(DeclAttributes &out, bool collect)
+	{
+		while (check_punct("[") && peek(1).kind == TokKind::Punct && peek(1).text == "[")
+		{
+			const SourceLoc loc = peek().loc;
+			advance(); // [
+			advance(); // [
+			for (;;)
+			{
+				if (at_end())
+				{
+					attr_error(loc, "expected ']]' in attribute list");
+					return;
+				}
+				if (check_punct("]") && peek(1).text == "]")
+				{
+					advance(); // ]
+					advance(); // ]
 					break;
+				}
+				// [[::]] 空属性列表（C23 §6.7.11p3 合法、无效果）
+				if (check_punct(":") && peek(1).text == ":")
+				{
+					advance();
+					advance();
+					continue;
+				}
+				if (!parse_one_attribute(out, collect)) return;
+				if (check_punct(",")) { advance(); continue; }
+				// 已成对的 ']]' → 交由下一轮统一消费（含 EOF 守卫）。
+				//   必须同时校验 peek(1)，否则单个 ']'（如误写 `[[deprecated] int f();`）会反复
+				//   进入 parse_one_attribute 而不推进 → 死循环。
+				if (check_punct("]") && peek(1).text == "]") continue;
+				attr_error(peek().loc, "expected ',' or ']]' in attribute list");
+				// 错误恢复：跳到匹配的 ']]' 后停住（不继续误读后续声明）
+				while (!at_end())
+				{
+					if (check_punct("]") && peek(1).text == "]") { advance(); advance(); break; }
+					advance();
+				}
+				return;
+			}
+		}
+	}
+
+	// 消费单个属性元素（名 + 可选 '::' 限定链 + 可选实参括号）。
+	// 返回 false = 遇 EOF 不可恢复，调用方应立即跳出整条属性列表。
+	bool parse_one_attribute(DeclAttributes &out, bool collect)
+	{
+		const SourceLoc loc = peek().loc;
+		std::string name;
+		if (peek().kind == TokKind::Identifier || peek().kind == TokKind::Keyword)
+			name = advance().text;
+		else
+			attr_error(loc, "expected attribute name");
+		// 厂商/命名空间限定名 a::b：本方言一律拒收（词法无 '::' 单 token，故 ':' ':' 两连判）
+		bool qualified = false;
+		std::string full = name;
+		while (check_punct(":") && peek(1).text == ":")
+		{
+			advance();
+			advance();
+			qualified = true;
+			if (peek().kind == TokKind::Identifier || peek().kind == TokKind::Keyword)
+				full += "::" + advance().text;
+		}
+		// 可选实参：只取首个字符串字面量，其余 token 消费至匹配的 ')'（嵌套括号计数）
+		std::string arg;
+		bool has_arg = false;
+		if (check_punct("("))
+		{
+			advance();
+			int depth = 1;
+			while (depth > 0)
+			{
+				if (at_end())
+				{
+					attr_error(loc, "expected ')' in attribute argument list");
+					return false;
+				}
+				const Token &t = peek();
+				if (t.kind == TokKind::Punct && t.text == ")") --depth;
+				else if (t.kind == TokKind::Punct && t.text == "(") ++depth;
+				if (depth > 0 && t.kind == TokKind::String && !has_arg)
+				{
+					has_arg = true;
+					arg = co_decode_string(t.text);
 				}
 				advance();
 			}
 		}
+		if (!collect) return true;
+		if (qualified)
+		{
+			error(loc, "qualified attribute name '" + full + "' is not supported");
+			return true;
+		}
+		if (name == "deprecated")
+		{
+			if (out.deprecated)
+			{
+				error(loc, "'deprecated' attribute can only be applied once");
+				return true;
+			}
+			out.deprecated = true;
+			out.deprecated_msg = arg;
+			return true;
+		}
+		if (name == "lib")
+		{
+			if (!has_arg)
+			{
+				error(loc, "'lib' attribute requires a string literal library name");
+				return true;
+			}
+			if (out.has_lib)
+			{
+				error(loc, "'lib' attribute can only be applied once");
+				return true;
+			}
+			// 链接名形式：不含扩展名/路径/空白/引号/冒号（codegen 拼 /DEFAULTLIB:"X.lib"）
+			if (arg.empty())
+				error(loc, "'lib' attribute requires a non-empty library name");
+			else if (arg.size() >= 4 && arg.compare(arg.size() - 4, 4, ".lib") == 0)
+				error(loc, "'lib' attribute takes a library name without the '.lib' suffix");
+			else if (arg.find_first_of("\\/\"' \t:") != std::string::npos)
+				error(loc, "'lib' attribute takes a bare library name (no path or spaces)");
+			else
+			{
+				out.has_lib = true;
+				out.lib_name = arg;
+			}
+			return true;
+		}
+		// 已识别、本批不生效的标准属性
+		static const char *const k_no_effect[] = {
+			"nodiscard", "maybe_unused", "noreturn", "_Noreturn", "fallthrough", "trap",
+			"pure", "stable", "assert", "assume", "incomplete", "reproducible_constant",
+			"unsequenced", "misleading_casefall"};
+		for (const char *p : k_no_effect)
+			if (name == p) return true;
+		if (!name.empty())
+			warn(loc, "unknown attribute '" + name + "' ignored");
+		return true;
+	}
+
+	// 两个声明位（前置 L811 与 parse_decl_specifiers 中置位）的属性归并，重复项报错
+	void merge_attributes(DeclAttributes &dst, const DeclAttributes &src, const SourceLoc &loc)
+	{
+		if (src.deprecated)
+		{
+			if (dst.deprecated) { error(loc, "'deprecated' attribute can only be applied once"); return; }
+			dst.deprecated = true;
+			dst.deprecated_msg = src.deprecated_msg;
+		}
+		if (src.has_lib)
+		{
+			if (dst.has_lib) { error(loc, "'lib' attribute can only be applied once"); return; }
+			dst.has_lib = true;
+			dst.lib_name = src.lib_name;
+		}
+	}
+
+	// 「接受不生效」位的兼容入口：消费并做语法校验，不记录、不报语义诊断
+	void skip_attributes()
+	{
+		DeclAttributes tmp;
+		parse_attributes(tmp, false);
+		attr_fatal_ = false; // 本位不认领声明，标志不得泄到后续顶层项
 	}
 
 	// _BitInt(N) 解析（C23 任意宽度整数）
@@ -686,8 +981,11 @@ struct Parser
 	bool parse_global_decl_or_func(TranslationUnit &tu)
 	{
 		SourceLoc loc = peek().loc;
-		// C23 [[attribute]] 跳过
-		skip_attributes();
+		attr_fatal_ = false; // P214：每项顶层声明入口清空（标志只反映本项）
+		// C23 [[attribute]]：前置位识别并记录（P214）
+		DeclAttributes attrs;
+		parse_attributes(attrs, true);
+		if (attr_fatal_) { attr_fatal_ = false; return true; } // 认领本项，保留属性语法诊断
 		// _Static_assert(const_expr, "msg");
 		if (check_keyword("_Static_assert") || check_keyword("static_assert"))
 		{
@@ -714,12 +1012,16 @@ struct Parser
 		if (match_keyword("public")) is_public = true;
 		// typedef 检测
 		bool is_typedef = match_keyword("typedef");
-		CTypePtr base_type = parse_decl_specifiers();
+		CTypePtr base_type = parse_decl_specifiers(is_public); // P217：顶层 public 下传，回填本层定义的 struct/enum is_public
 		is_static = is_static || last_static_;
 		is_extern = is_extern || last_extern_;
 		is_typedef = is_typedef || last_typedef_;
 		is_public = is_public || last_public_;
 		unsigned ga = last_alignas_; // 本声明的 _Alignas（需在任何后续递归解析前捕获）
+		// P214：中置位（类型说明符之前/之间）识别到的属性与前置位归并；重复项报错
+		merge_attributes(attrs, last_attrs_, loc);
+		last_attrs_ = DeclAttributes();
+		if (attr_fatal_) { attr_fatal_ = false; return true; } // 中置位属性语法错：同样认领本项
 		if (!base_type) return false;
 		// 纯类型定义（struct/enum 无变量名）: 后面跟 ';'
 		if (check_punct(";")) { advance(); return true; }
@@ -746,6 +1048,9 @@ struct Parser
 			fn.return_type = std::move(dtype);
 			fn.is_static = is_static;
 			fn.is_public = is_public;
+			fn.is_deprecated = attrs.deprecated;
+			fn.deprecated_msg = attrs.deprecated_msg;
+			fn.lib_name = attrs.lib_name;
 			expect_punct("(");
 			parse_param_list(fn.params, fn.is_variadic);
 			expect_punct(")");
@@ -761,20 +1066,20 @@ struct Parser
 			tu.funcs.push_back(std::move(fn));
 			// 多声明符续接（如 int f(int a), g(int a), a;）：其余声明符经 Decorator
 			while (match_punct(","))
-				parse_global_declarator_item(tu, base_type, is_static, is_extern, ga, loc, is_public);
+				parse_global_declarator_item(tu, base_type, is_static, is_extern, ga, loc, is_public, attrs);
 			match_punct(";");
 			return true;
 		}
 		// —— 对象/分组/函数指针对象声明符（可多个，逗号分隔）——
 		do
 		{
-			parse_global_declarator_item(tu, base_type, is_static, is_extern, ga, loc, is_public);
+			parse_global_declarator_item(tu, base_type, is_static, is_extern, ga, loc, is_public, attrs);
 		} while (match_punct(","));
 		match_punct(";");
 		return true;
 	}
 
-	CTypePtr parse_decl_specifiers()
+	CTypePtr parse_decl_specifiers(bool top_public = false)
 	{
 		// 声明说明符可任意顺序出现（C §6.7.1p1：如 `volatile static int` / `struct S static x`）。
 		// 存储类在此统一消费并记入 last_*_，由调用方与前置已消费的存储类合并。
@@ -782,6 +1087,7 @@ struct Parser
 		last_extern_ = false;
 		last_typedef_ = false;
 		last_public_ = false;
+		last_attrs_ = DeclAttributes(); // P214：中置属性位同样需在入口清空（防递归/上一声明残留）
 		bool cnst_front = false;
 		// register：C23 仍保留该关键字（存储类），但不保证真实寄存器绑定；按 clang 默认作 no-op 消费
 		for (;;)
@@ -826,7 +1132,7 @@ struct Parser
 			else if (static_cast<unsigned>(a) > acc)
 				acc = static_cast<unsigned>(a);
 		}
-		CTypePtr r = parse_decl_specifiers_core();
+		CTypePtr r = parse_decl_specifiers_core(top_public);
 		if (cnst_front && r)
 			r->is_const = true;
 		// C23 §6.7：限定符/存储类可出现在类型说明符之后（int const x / struct S static s2）。
@@ -915,7 +1221,7 @@ struct Parser
 		return t;
 	}
 
-	CTypePtr parse_decl_specifiers_core()
+	CTypePtr parse_decl_specifiers_core(bool top_public = false)
 	{
 		last_auto_ = false;
 		// 跳过不影响类型的存储类/属性关键字（含 register no-op，见 P141）
@@ -924,8 +1230,8 @@ struct Parser
 			match_keyword("_Noreturn") || match_keyword("_Thread_local") ||
 			match_keyword("thread_local") || match_keyword("_Atomic"))
 			;
-		// C23 [[attribute]] 跳过（不影响类型解析）
-		skip_attributes();
+		// C23 [[attribute]]：中置位识别并记录（不影响类型解析）
+		parse_attributes(last_attrs_, true);
 		bool cnst = false;
 		// volatile 仅为限定符：colang CType 未建模该属性，消费后不改变类型/布局。
 		for (;;)
@@ -1168,6 +1474,8 @@ struct Parser
 				}
 				// 块作用域内重定义同名 tag 已在解析成员前改名为唯一 tag（见 begin_definition_tag）
 				sd.tag = tag;
+				// P217：顶层 public 回填——仅最外层被定义的 struct 继承 public（成员循环等内部调用保持默认 false）
+				sd.is_public = sd.is_public || top_public;
 				// 前置声明已由 begin_definition_tag 登记：原地补全，避免同一 tag 出现两条定义，
 				// 使按 tag 取首个匹配的成员查找（offsetof/sizeof/成员访问）读到空壳。
 				bool completed_in_place = false;
@@ -1241,6 +1549,8 @@ struct Parser
 					if (!match_punct(",")) break;
 				}
 				expect_punct("}");
+				// P217：顶层 public 回填——仅最外层被定义的 enum 继承 public
+				ed.is_public = ed.is_public || top_public;
 				cur_tu_->enums.push_back(std::move(ed));
 			}
 			auto et = std::make_shared<CType>();
@@ -2017,7 +2327,7 @@ struct Parser
 	// 不消费分隔 ',' 或结尾 ';'（由调用方循环处理）。
 	void parse_global_declarator_item(TranslationUnit &tu, CTypePtr base_type,
 		bool is_static, bool is_extern, unsigned ga, const SourceLoc &loc,
-		bool is_public = false)
+		bool is_public = false, const DeclAttributes &attrs = DeclAttributes())
 	{
 		std::string nm;
 		std::vector<Param> own; // 紧邻标识符的具名参数（分组/返回函数指针的函数定义用）
@@ -2042,6 +2352,9 @@ struct Parser
 			fn.is_variadic = type->is_variadic;
 			fn.is_static = is_static;
 			fn.is_public = is_public;
+			fn.is_deprecated = attrs.deprecated;
+			fn.deprecated_msg = attrs.deprecated_msg;
+			fn.lib_name = attrs.lib_name;
 			func_return_types_[fn.name] = fn.return_type;
 			if (check_punct("{")) // 函数定义：消费函数体（原型/声明以 ; 结尾，不进此分支）
 			{
@@ -2062,6 +2375,10 @@ struct Parser
 		gv.is_static = is_static;
 		gv.is_extern = is_extern;
 		gv.is_public = is_public;
+		// P214 C23 属性
+		gv.is_deprecated = attrs.deprecated;
+		gv.deprecated_msg = attrs.deprecated_msg;
+		gv.lib_name = attrs.lib_name;
 		if (match_punct("="))
 			gv.init = check_punct("{") ? parse_init_list() : parse_assign();
 		deduce_array_size(gv.type, gv.init);
@@ -2936,7 +3253,12 @@ bool parse(const CompileOptions & /*opts*/, CompileState &state, std::vector<Err
 {
 	Parser p(state.tokens, errors);
 	state.ast = p.parse_translation_unit();
-	return errors.empty();
+	// P214：只有致命错才能中断管线。旧口径 `errors.empty()` 会把任何 warning（包含
+	//   预处理 #warning、以及本批新增的 unknown attribute 告警）当成失败、后续层根本不跑。
+	//   与 driver/main 的 has_fatal 口径对齐。
+	for (const auto &e : errors)
+		if (!e.is_warning) return false;
+	return true;
 }
 
 }  // namespace colang

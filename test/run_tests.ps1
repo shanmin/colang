@@ -7,9 +7,9 @@ usage (from the repo root):
 
 verdict: each *.co under test\ is compiled and run; main returning 0 is a PASS,
          any non-zero exit code is a FAIL.
-prereq : build the compiler first (run build.bat at repo root); the link step
-         needs clang on PATH -- the colang frontend emits .bc and an external
-         clang.exe links it into an executable.
+prereq : build the compiler first (run build.bat at repo root); linking is done
+         by colang's built-in in-process lld linker -- no external clang.exe is
+         required (the frontend emits COFF .obj and links in a single step).
 exit   : 0 = all passed, 1 = some failed, 2 = environment missing.
 
 NOTE: kept ASCII-only on purpose, safe under any Windows code page / PowerShell.

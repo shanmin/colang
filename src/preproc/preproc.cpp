@@ -1436,8 +1436,9 @@ bool Preprocessor::eval_expr(const std::vector<Token> &line, std::size_t from,
 		return false;
 	};
 	auto has_c_attribute = [](const std::string &name) -> bool {
-		// C23 §6.7.11 标准属性（本编译器接受并跳过 [[...]]）；作用域名(::)与未知名一律 false
-		return name == "deprecated" || name == "maybe_unused" || name == "nodiscard";
+		// C23 §6.7.11 标准属性 + Co 层新定义属性 lib（P214）；作用域名(::)与未知名一律 false
+		return name == "deprecated" || name == "maybe_unused" || name == "nodiscard" ||
+		       name == "lib";
 	};
 	CondExpr ce(expanded, 0, expanded.size(), is_defined, has_include, has_c_attribute);
 	const std::intmax_t v = ce.eval();

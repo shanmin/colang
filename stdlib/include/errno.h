@@ -11,7 +11,7 @@
 #ifndef _COLANG_ERRNO_H
 #define _COLANG_ERRNO_H
 
-extern int *_errno(void);
+extern int* _errno(void);
 #define errno (*_errno())
 
 /* C 标准必备错误码（§7.5） */

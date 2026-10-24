@@ -8,6 +8,7 @@
 #include "colang/driver.h"
 
 #include "colang/codegen.h"
+#include "colang/loader.h"
 #include "colang/parser.h"
 #include "colang/preproc.h"
 #include "colang/sema.h"
@@ -35,6 +36,12 @@ bool compile(const CompileOptions &opts, CompileState &state, std::vector<Error>
 		return true;
 	}
 	if (!parse(opts, state, errors))
+	{
+		return false;
+	}
+	// P212 Co 层：递归加载并合并 imports（拓序前插子模块 AST 到主 TU）。
+	//   主 TU.imports 为空时快速返回、不做任何修改；-E 模式不会进到此处（前面已短路）。
+	if (!load_and_merge_imports(opts, *state.ast, errors))
 	{
 		return false;
 	}

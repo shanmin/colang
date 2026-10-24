@@ -1,6 +1,6 @@
 # Program Entry and Execution
 
-> This chapter describes Co's program entry and execution model. **Entry dispatch, optional `main`, top-level `return` and the exit-code model are implemented since 0.2.0**; the command-line `argv` and cross-module top-level execution timing are still not provided (see "Currently implemented boundary" at the end).
+> This chapter describes Co's program entry and execution model. **Entry dispatch, optional `main`, top-level `return` and the exit-code model are implemented since 0.2.0; cross-module (`import`) top-level execution in a centralized topological order is implemented since 0.3.0**; command-line `argv` is still not provided (see "Currently implemented boundary" at the end).
 
 ## Top-level statements run in order
 
@@ -40,7 +40,13 @@ If a program has **neither top-level statements nor `main`** (there is genuinely
 
 ## Cross-module execution timing
 
-When a program consists of several modules (`.co` files) that `import` one another, the **execution timing and the "run exactly once" rule** for each module's top-level statements are still being finalized together with the module system; see the "Module" chapter.
+Since **0.3.0**, when a program consists of several modules (`.co` files) that `import` one another, each module's top-level statements follow:
+
+- **Exactly once at first load**: no matter how many times a module is imported, its top-level code runs only once.
+- **Centralized topological order**: all imported modules' top-level statements are emitted **before the main entry**, arranged in DFS-postorder of the dependency closure (dependencies run before dependents). The physical position of `import` lines in the main source has no effect on this order.
+- **`main` of a non-main module is not a load hook**: if a module defines `main`, it is treated as an ordinary function symbol and does not execute automatically.
+
+See the "import (Module Import)" and "Module" chapters for details.
 
 ## Currently implemented boundary
 
@@ -53,5 +59,4 @@ Since **0.2.0**, entry dispatch and exit-code behavior are implemented as specif
 
 Not yet provided:
 
-- Command-line `argv` is not exposed in this version (no built-in global `argv` array, and no array-carries-own-length infrastructure yet);
-- Cross-module top-level execution timing belongs to the module layer and is not open yet (see the "Module" and "import" chapters).
+- Command-line `argv` is not exposed in this version (no built-in global `argv` array, and no array-carries-own-length infrastructure yet).

@@ -15,7 +15,7 @@ One invocation handles **one** source file. When no action option is given, the 
 | `-h`, `--help` | Show usage and the option list |
 | `-v`, `--version` | Show the compiler version, the LLVM version used, and the target platform |
 | `-E` | Preprocess only; send the expanded token listing to standard output |
-| `-c` | Compile only; produce a `.bc` object file without linking |
+| `-c` | Compile only; produce a `.obj` (COFF) object file without linking |
 | `-o <file>` | Write the output to `<file>` |
 | `-I <dir>` | Add a header search directory; may also be written `-I<dir>` and repeated |
 
@@ -24,10 +24,10 @@ One invocation handles **one** source file. When no action option is given, the 
 | Action | Output | Default name when `-o` is omitted |
 | --- | --- | --- |
 | Default (compile + link) | Executable | Windows: `<source basename>.exe`; other platforms: `<source basename>` |
-| `-c` | `.bc` object file | `<source basename>.bc`, left in the current directory |
+| `-c` | `.obj` object file | `<source basename>.obj`, left in the current directory |
 | `-E` | Standard output | Always goes to standard output; `-o` has no effect |
 
-When linking, the intermediate `.bc` is written to the system temporary directory and removed automatically after the link.
+When linking, the intermediate `.obj` is written to the system temporary directory and removed automatically after the link.
 
 ## What `-E` actually prints
 
@@ -49,28 +49,20 @@ In order of decreasing priority:
 
 The release package keeps that relative layout, so it works out of the box after extraction. If you move the compiler elsewhere, keep `bin/` and `stdlib/include/` in their relative positions, or point `COLANG_STDLIB` at the header directory. When the standard headers cannot be located, `#include <stdio.h>` fails with `#include file not found`.
 
-## Linking prerequisite: an external clang
+## Linker: built in
 
-The compiler produces LLVM bitcode; turning it into an executable is done by an external `clang`. It is looked up in this order:
+colang ships its own linker, so turning sources into an executable needs **no external `clang` and no linker command**.
 
-1. Walking upward from the directory containing the `colang` executable, looking for `clang` under `llvm*/build/Release/bin/` (then `Debug`);
-2. Falling back to the `clang` found on `PATH`.
+- Linking requires the Windows SDK and the VC runtime libraries to be installed on the machine (they provide `libcmt` and other platform libraries). colang locates them automatically, so an ordinary command prompt is enough — a Developer command prompt is **not** required.
+- By default the output **statically links the C runtime**, so an exe you build on your machine runs on Windows machines that do not have the VC redistributable installed.
 
-On a machine without `clang`, only the non-linking actions such as `-E` and `-c` work; the default compile + link fails with `linking failed`.
-
-> **Compatibility note**: this dependency is part of the runtime environment of the release package. What you distribute to a machine without LLVM tooling is your **compiled program**, not colang itself.
+> **Compatibility note**: what you distribute is your **compiled program (exe)**, not colang itself. No LLVM/clang tooling needs to accompany the program.
 
 ## Multi-file programs
 
-A single invocation accepts only one source file; any additional positional argument whose name ends in `.bc` is treated as a link input:
+A single invocation compiles one source file. colang composes several `.co` source files through the `import` mechanism (see the "import (Module Import)" chapter).
 
-```
-colang -c a.co                 # produces a.bc
-colang -c b.co                 # produces b.bc
-colang a.bc b.bc -o app.exe    # link both object files into an executable
-```
-
-Without `-o`, a pure link action defaults to `a.exe` (Windows) / `a.out` (other platforms). The module mechanism (`import`) is not open yet; see the "Module" and "import (Module Import)" chapters for the design direction.
+The single `.obj` produced by `-c` is useful for inspecting the compile result. Linking several object files directly into an executable is still under development; for now, organize multi-file programs with `import`.
 
 ## Diagnostics and exit codes
 

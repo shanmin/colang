@@ -64,7 +64,7 @@ extern int cnd_wait(cnd_t *cond, mtx_t *mtx);
 extern int tss_create(tss_t *key, tss_dtor_t dtor);
 extern void tss_delete(tss_t key);
 extern int tss_set(tss_t key, void *val);
-extern void *tss_get(tss_t key);
+extern void* tss_get(tss_t key);
 
 /* —— 一次性调用（§7.26.11）—— */
 extern void call_once(once_flag *flag, thrd_cb_t func);

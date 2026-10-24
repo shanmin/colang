@@ -111,9 +111,9 @@ printf("%d\n", total(3, 10, 20, 30)); // 60
 
 ### Current boundaries (compiler implementation status)
 
-Since **0.2.0**:
+Since **0.3.0**:
 
-- **`public` on top-level functions / global variables is implemented**: lexer / parser / sema are wired, and when the artifact is a dynamic library the symbol is written into the export table (`DLLExportStorageClass`); `static public` in either order is legal. At this stage `public` **does not change linkage** and **does not participate in cross-module visibility** (that belongs to the `import` layer); visibility among multiple files inside the same artifact still follows C's linkage rules (`static` confines a name to its own translation unit, everything else is externally visible). In Co's target model, "module-internal" is still expressed by **omitting `public`** (see the "Module" chapter).
+- **`public` on top-level functions / global variables is implemented**: lexer / parser / sema are wired, and when the artifact is a dynamic library the symbol is written into the export table (`DLLExportStorageClass`); `static public` in either order is legal. **Since 0.3.0, `public` also serves as the sole cross-module visibility gate**: symbols not marked `public` cannot be reached by `import` (both named and `*` forms report `cannot import non-public symbol`); non-`public` imported symbols are forced to `InternalLinkage` during codegen. In this batch, `public` still **does not change linkage within the same TU** (non-`public` remains `ExternalLinkage` by default, matching P211); "module-internal" is still expressed by **omitting `public`** (see the "Module" and "import" chapters).
 - **Sequential execution of top-level commands is implemented** (entry dispatch, optional `main`, top-level `return` and exit code) — see the "Program Entry and Execution" chapter for the full model.
 
 ### Reserved names
