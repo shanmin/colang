@@ -75,16 +75,18 @@ printf("mod initialized\n");
 
 编译运行：先打印 `mod initialized`（顶层裸指令集中拓序 emit），然后按 `main.co` 的顶层顺序执行、退出码由顶层 `return` 决定。
 
-## 当前实装边界（0.3.0）
+## 当前实装边界（0.3.1）
 
 已实装：
 - `.co` 源文件的完整消费链路（词法/语法/加载/合并/可见性/strip/入口集成）；
 - 具名与 `*` 两种形态；`import` 语法位支持 `as ModAlias`（本批暂未启用限定访问）；
 - 集中拓序 + 首次加载执行一次；环检测与去重；
-- imported 非 `public` 符号在 codegen 强制 `InternalLinkage`。
+- imported 非 `public` 符号在 codegen 强制 `InternalLinkage`；
+- 跨模块 `public struct` / `union` / `enum` 类型引用（可作值类型变量、成员访问、取地址传参）；
+- 跨模块**裸标签**：被导入模块里标 `public` 的 `struct`/`union`/`enum`，消费方引用时可省略关键字（`Point p;`，详见「struct / union / enum」章节）；
+- 跨模块**编译期常量**：被导入模块的 `public const int`（如 `winapi.co` 的 `WM_*` 系列）在消费方可作普通只读值、数组维度、`switch` 的 `case` 标签使用；非常量标签会被拒绝并报 `case label does not reduce to an integer constant`。
 
 本批未覆盖、归后续里程碑：
 - 模块别名限定访问 `m.f()` / `m.x`（语法位已解析但未接入 Sema/Codegen）；
 - `.obj` / `.dll` / `.so` 作为可导入模块（须携带编译期声明元数据）；
-- 跨模块 `struct` / `enum` 类型引用（本批 `import` 主要面向函数、全局变量与顶层裸指令）；
 - DLL 场景下 `DllMain` 与顶层段触发时机。

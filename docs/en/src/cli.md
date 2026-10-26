@@ -45,9 +45,9 @@ It is meant for inspecting macro expansion, conditional pruning and file inclusi
 In order of decreasing priority:
 
 1. Directories given with `-I` on the command line;
-2. The Co-provided standard header directory (`stdio.h`, `stdint.h`, ...), located automatically: the environment variable `COLANG_STDLIB` is checked first (point it straight at the header directory); if unset, the compiler walks upward from the directory containing the `colang` executable and locates `stdlib/include` by the presence of `stdlib/include/stddef.h`.
+2. The Co-provided standard header directory (`stdio.h`, `stdint.h`, `winapi.co`, ...), located automatically: the environment variable `COLANG_STDLIB` is checked first (point it straight at the header directory); if unset, the compiler walks upward (at most 8 levels) from the directory containing the `colang` executable and locates that `include/` directory by the presence of `include/stddef.h`.
 
-The release package keeps that relative layout, so it works out of the box after extraction. If you move the compiler elsewhere, keep `bin/` and `stdlib/include/` in their relative positions, or point `COLANG_STDLIB` at the header directory. When the standard headers cannot be located, `#include <stdio.h>` fails with `#include file not found`.
+The release package is a flat single-level layout — `colang.exe` sits next to the standard header directory `include/`, so it works out of the box after extraction: neither `#include <stdio.h>` nor `import "winapi.co"` needs `-I`. If you move the compiler elsewhere, keep `colang.exe` and `include/` side by side, or point `COLANG_STDLIB` at the header directory. When the standard headers cannot be located, `#include <stdio.h>` fails with `#include file not found`.
 
 ## Linker: built in
 

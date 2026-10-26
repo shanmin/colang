@@ -130,6 +130,11 @@ struct CodeGenImpl
 	//   Return 分支据此将无值的 `return;` 从 CreateRetVoid()（对 i32 返回不合法）
 	//   改为 `ret i32 0`；有值则自然走现有 convert_value 到 i32。gen_function 中始终为 false。
 	bool in_synthesized_main_body_ = false;
+	// P229 Windows GUI 子系统 / WinMain 入口：由 gen_tu 扫描 AST 得出，经 generate() 回传 CompileState。
+	//   use_winmain_=true → 入口取 WinMain、跳过合成 main、隐含 windows 子系统；
+	//   windows_subsystem_=true → 任一函数标 [[subsystem("windows")]]（或 use_winmain_）。
+	bool windows_subsystem_ = false;
+	bool use_winmain_ = false;
 	// Annex K set_constraint_handler_s 的模块级 handler 存储（缓存以免重复建同名全局）
 	llvm::GlobalVariable *annexk_handler_gv_ = nullptr;
 	// 文件作用域复合字面量物化的匿名静态全局对象命名计数（00149/00150）
@@ -524,6 +529,16 @@ struct CodeGenImpl
 		const bool co_has_bare = !tu.top_level_body.empty();
 		struct TlPendingInit { llvm::GlobalVariable *gvar; ExprPtr init; CTypePtr ctype; };
 		std::vector<TlPendingInit> tl_pending_inits;
+		// P241：预登记全部全局变量的类型（名 → CType），使「文件作用域初始化器」折叠过程中
+		//   经 CodegenTypeEnv::var_type 解析「声明在当前全局之后」的全局时能命中类型，
+		//   sizeof/alignof 不再回退 int32(4)（P234 旁支② / P227 同族「按名查全局」）。
+		//   仅登记类型、不建 LLVM 值：取址折叠（fold_addr_of_global）对未发射全局仍按
+		//   「前向引用不误折」返回 null（P227 既定口径），故不影响地址常量语义。
+		for (const auto &gv : tu.globals)
+		{
+			if (!gv.type || gv.type->kind == TypeKind::Void) continue;
+			if (!global_types_.count(gv.name)) global_types_[gv.name] = gv.type;
+		}
 		// 第零遍：发射全局变量
 		for (const auto &gv : tu.globals)
 		{
@@ -552,24 +567,13 @@ struct CodeGenImpl
 				? llvm::GlobalValue::InternalLinkage
 				: llvm::GlobalValue::ExternalLinkage;
 			bool is_const = false; // P3: const 全局可考虑 constant
-			llvm::Constant *init_val = llvm::Constant::getNullValue(ty);
-			bool tl_need_runtime = false; // P219：顶层非恒定初始化标记
-			if (gv.init)
-			{
-				bool folded = true;
-				llvm::Constant *c = fold_global_init(gv.init, ty, &folded);
-				// P219 A 方案：仅 .co 新面（有顶层裸指令）时，标量/指针初值不可折叠
-				//   不再静默折成 null，改占位 0 + 记待运行期 store（合成 main 头部按序写回）。
-				//   纯 C 档（无顶层裸句）沿用旧折叠行为，CTS/.c 零影响。
-				if (!folded && co_has_bare && ty->isSingleValueType())
-				{
-					init_val = llvm::Constant::getNullValue(ty);
-					tl_need_runtime = true;
-				}
-				else init_val = c;
-			}
+			// 先以零初值建全局并登记，再折叠初始化器：使「自引用 &本全局」
+			//   （如 struct N a = { &a, ... } 循环哨兵、.st_3=&tg3_1）能在 fold_addr_of_global
+			//   命中 globals_[gv.name]。旧路径 fold 早于登记 → 自引用 &a 落 forward-ref 分支折成
+			//   null，运行期解引用越界（CTS 0010/0011/0048 崩族）。折叠永不返回 nullptr，故
+			//   先建零初值再 setInitializer 与原「以 init_val 建」终态逐字一致（零回归）。
 			auto *gvar = new llvm::GlobalVariable(*module, ty, is_const,
-				linkage, init_val, gv.name);
+				linkage, llvm::Constant::getNullValue(ty), gv.name);
 			if (auto a = obj_align(gv.type, ty, gv.align)) gvar->setAlignment(*a);
 			// P211 B.3：public 仅叠加 DLL 导出 storage class，不改 linkage。
 			// COFF 约束：内部链接（static/P212 strip）符号不得带 DLL 存储类
@@ -579,6 +583,19 @@ struct CodeGenImpl
 				gvar->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
 			globals_[gv.name] = gvar;
 			global_types_[gv.name] = gv.type;
+			bool tl_need_runtime = false; // P219：顶层非恒定初始化标记
+			if (gv.init)
+			{
+				bool folded = true;
+				llvm::Constant *c = fold_global_init(gv.init, ty, &folded);
+				// P219 A 方案：仅 .co 新面（有顶层裸指令）时，标量/指针初值不可折叠
+				//   不再静默折成 null，改占位 0 + 记待运行期 store（合成 main 头部按序写回）。
+				//   纯 C 档（无顶层裸句）沿用旧折叠行为，CTS/.c 零影响。
+				if (!folded && co_has_bare && ty->isSingleValueType())
+					tl_need_runtime = true; // 保持零初值，运行期按序 store
+				else
+					gvar->setInitializer(c);
+			}
 			if (tl_need_runtime)
 				tl_pending_inits.push_back({gvar, gv.init, gv.type});
 		}
@@ -659,7 +676,20 @@ struct CodeGenImpl
 			}
 		}
 		// ============================================================
-		// P211 A.4 入口合成（仅当非“纯 C 档”）
+		// P229：入口子系统标志——扫定义函数定 WinMain 入口 / [[subsystem("windows")]]。
+		//   WinMain 隐含 windows；标在任意函数的 subsystem("windows") 亦置 windows（可为 main 入口无控制台）。
+		//   P231：入口属性仅主模块生效——导入模块（source_module_key 非空）里的
+		//   WinMain/[[subsystem]] 不参与置位（sema 侧另有忽略警告）。
+		// ============================================================
+		for (const auto &f : tu.funcs)
+		{
+			if (!f.source_module_key.empty()) continue;
+			if (f.body && f.name == "WinMain") use_winmain_ = true;
+			if (f.subsystem_windows) windows_subsystem_ = true;
+		}
+		if (use_winmain_) windows_subsystem_ = true;
+		// ============================================================
+		// P211 A.4 入口合成（仅当非"纯 C 档"）
 		//   has_bare = 顶层裸指令存在（.co 新面）
 		//   user_main = 带 body 的 main 定义
 		//   纯 C 档 = !has_bare && user_main → 逐字同 P210，不合成、不改名
@@ -673,9 +703,9 @@ struct CodeGenImpl
 			const bool has_bare = !tu.top_level_body.empty();
 			const FuncDecl *user_main = nullptr;
 			for (const auto &f : tu.funcs)
-				if (f.body && f.name == "main") { user_main = &f; break; }
+				if (f.body && f.name == "main" && f.source_module_key.empty()) { user_main = &f; break; } // P231：仅主模块
 			const bool pure_c = !has_bare && user_main != nullptr;
-			if (!pure_c)
+			if (!pure_c && !use_winmain_) // P229：WinMain 入口下不合成 main（GUI 逻辑在 WinMain）
 			{
 				llvm::Function *old_main = nullptr;
 				if (user_main)
@@ -824,6 +854,56 @@ struct CodeGenImpl
 		return llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), arg_tys, false);
 	}
 
+	// 沿 Member/Subscript 链回溯到根「全局/静态」符号，累加编译期字节偏移。
+	// 与 fold_null_offset 同构，唯根为具名对象（globals_/vars_）而非 (T*)0。
+	// 链上出现非常量下标/未知类型/位域 → 回 nullptr，交回调用方按旧路径处理（零回归）。
+	// 修 CTS 0010/0011/0048 崩族：全局聚合初始化器内 `&arr[ci]`、`&g.field` 折成 null。
+	llvm::GlobalVariable *resolve_lvalue_root_offset(const ExprPtr &e, intmax_t &out_off)
+	{
+		if (!e) return nullptr;
+		ExprPtr p = e;
+		while (p && p->kind == ExprKind::Cast) p = p->lhs;   // 重解读 cast 不改地址偏移
+		if (!p) return nullptr;
+		const llvm::DataLayout &DL = module->getDataLayout();
+		if (p->kind == ExprKind::VarRef)
+		{
+			out_off = 0;
+			auto git = globals_.find(p->name);
+			if (git != globals_.end()) return git->second;
+			auto vit = vars_.find(p->name);   // 函数内 static：已物化为 GlobalVariable
+			if (vit != vars_.end())
+				if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(vit->second)) return gv;
+			return nullptr;
+		}
+		if (p->kind == ExprKind::Member)
+		{
+			intmax_t base = 0;
+			llvm::GlobalVariable *root = resolve_lvalue_root_offset(p->lhs, base);
+			if (!root) return nullptr;
+			MemberInfo mi = resolve_member_info(p);
+			// 逐级静态偏移（含匿名聚合提升；union 级恒 0）；位域/未知 tag 拒折
+			intmax_t moff = 0;
+			if (!member_static_offset(mi, p->name, moff)) return nullptr;
+			out_off = base + moff;
+			return root;
+		}
+		if (p->kind == ExprKind::Binary && p->op == "[]")
+		{
+			intmax_t base = 0;
+			llvm::GlobalVariable *root = resolve_lvalue_root_offset(p->lhs, base);
+			if (!root) return nullptr;
+			CTypePtr at = get_expr_ctype(p->lhs);
+			if (!at || !at->base) return nullptr;
+			llvm::Type *ety = to_llvm_alloca_type(at->base);
+			if (!ety) return nullptr;
+			intmax_t idx;
+			if (!fold_int_const(p->rhs, idx)) return nullptr;
+			out_off = base + idx * static_cast<intmax_t>(DL.getTypeAllocSize(ety).getFixedValue());
+			return root;
+		}
+		return nullptr;
+	}
+
 	// 将 “&已声明全局对象”（含 struct 成员 .p=&x、数组名退化为指针）折叠为该全局的
 	// 地址常量。无法静态解析（前向引用、成员/下标取址、复合字面量等）返回 nullptr，
 	// 交由调用方继续处理（不误折成 null）。修复 c-testsuite 00045/00049：旧路径缺此项，
@@ -840,6 +920,20 @@ struct CodeGenImpl
 			has_amp = true;
 			p = p->lhs;
 			while (p && p->kind == ExprKind::Cast) p = p->lhs;
+		}
+		// 子对象地址（&arr[ci] / &g.field，可嵌套）：偏移编译期常量 → i8 字节 GEP 常量。
+		// 仅 has_amp（取址形态）走此路；裸数组名退化仍由下方 VarRef 分支处理。
+		if (has_amp && p && (p->kind == ExprKind::Member ||
+			(p->kind == ExprKind::Binary && p->op == "[]")))
+		{
+			intmax_t off = 0;
+			if (llvm::GlobalVariable *root = resolve_lvalue_root_offset(p, off))
+			{
+				llvm::Constant *idx = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx),
+					static_cast<uint64_t>(off), false);
+				return llvm::ConstantExpr::getGetElementPtr(llvm::Type::getInt8Ty(ctx), root, {idx});
+			}
+			return nullptr;   // 链上出现非常量/未知 → 交回调用方（旧行为）
 		}
 		if (!p || p->kind != ExprKind::VarRef) return nullptr;
 		const std::string nm = p->name;
@@ -920,22 +1014,9 @@ struct CodeGenImpl
 			intmax_t base;
 			if (!fold_null_offset(p->lhs, base)) return false;
 			MemberInfo mi = resolve_member_info(p);
-			const std::string &tag = mi.base_tag;
-			auto sd = struct_defs_.find(tag);
-			if (sd == struct_defs_.end()) return false;
-			if (sd->second->is_union) { out = base; return true; }   // union 成员恒偏移 0
-			llvm::StructType *st = get_struct_type(tag);
-			if (!st) return false;
-			unsigned field_idx = mi.slot;
-			std::string key = tag + "." + p->name;
-			bool is_bf = false;
-			auto bf = bitfield_access_.find(key);
-			if (bf != bitfield_access_.end()) { field_idx = bf->second.storage_idx; is_bf = true; }
-			else { auto fi = field_index_map_.find(key); if (fi != field_index_map_.end()) field_idx = fi->second; }
-			if (field_idx >= st->getNumElements()) return false;
-			const llvm::StructLayout *sl = DL.getStructLayout(st);
-			intmax_t moff = static_cast<intmax_t>(sl->getElementOffset(field_idx).getFixedValue());
-			if (is_bf) return false;   // 位域成员 offsetof 本身 UB，不折
+			// 逐级静态偏移（含匿名聚合提升；union 级恒 0）；位域成员 offsetof 本身 UB → 不折
+			intmax_t moff = 0;
+			if (!member_static_offset(mi, p->name, moff)) return false;
 			out = base + moff; return true;
 		}
 		if (p->kind == ExprKind::Binary && p->op == "[]")
@@ -1001,6 +1082,37 @@ struct CodeGenImpl
 			// 空基址 offsetof 取址：& 的操作数常为成员/下标（非整型常量），
 			// 须先于 fold_int_const(e->lhs) 尝试 offsetof 折叠，否则操作数折不动即整式回退 0。
 			if (e->op == "&" && fold_offsetof_int(e, out)) return true;
+			// sizeof / _Alignof 全局初始化器静态折叠（承 P227 同类「fold_global_init 折叠不完整」）：
+			// 旧 fold_int_const 不认 sizeof/alignof，致文件作用域 `int sz = sizeof(T);` 折 0（
+			// docs struct.md 探针暂露，10-24 K 矩阵）；函数体内正常（gen_expr Unary 分支已行）。
+			// 与 L3843/L3873 处运行期 sizeof/alignof 保持同语义：类型式 e->type、表达式式 e->lhs 探型；
+			// VLA 无法静态折、回 false 交上层走运行期路径（与 fold_global_init 非折叠路径同处理）。
+			if (e->op == "sizeof" || e->op == "alignof")
+			{
+				const auto &DL = module->getDataLayout();
+				if (e->op == "sizeof")
+				{
+					if (e->type)
+					{
+						out = static_cast<intmax_t>(DL.getTypeStoreSize(to_llvm_alloca_type(e->type)));
+						return true;
+					}
+					if (e->lhs)
+					{
+						CTypePtr et = sizeof_operand_ctype(e->lhs);
+						if (et && et->kind == TypeKind::Array && type_has_vla_dim(et)) return false;
+						llvm::Type *ty = et ? to_llvm_alloca_type(et) : llvm::Type::getInt32Ty(ctx);
+						out = static_cast<intmax_t>(DL.getTypeStoreSize(ty));
+						return true;
+					}
+					out = 4; return true;
+				}
+				// alignof / _Alignof
+				CTypePtr at = e->type ? e->type : (e->lhs ? get_expr_ctype(e->lhs) : nullptr);
+				out = at ? static_cast<intmax_t>(type_effective_align(at))
+				           : static_cast<intmax_t>(DL.getABITypeAlign(llvm::Type::getInt32Ty(ctx)).value());
+				return true;
+			}
 			intmax_t v; if (!fold_int_const(e->lhs, v)) return false;
 			if (e->op == "-") { out = -v; return true; }
 			if (e->op == "+") { out = v; return true; }
@@ -1153,6 +1265,26 @@ struct CodeGenImpl
 		auto sd = struct_defs_.find(tag);
 		if (sd == struct_defs_.end() || sd->second->members.empty())
 			return llvm::ConstantStruct::get(sty, llvm::Constant::getNullValue(arr));
+		// 指定初始化器（P238）：union 宿主的成员指定符必须落到**被指定**的成员（§6.7.9p12：
+		// 「用设计符指定成员时初始化该成员」）。旧实现无条件取 args[0] 折进 members[0] ——
+		// `union { int i; long long q; } g = { .q = 0x1122334455667788 }` 被截成 32 位写进 i，
+		// 全局静默误编译（探针 `_tmp/p238_b.co`）。链式（`.p.y` / `.a[1]`）复用 P237 物理路径。
+		if (e->kind == ExprKind::InitList && !e->args.empty() && e->args[0]
+			&& !e->args[0]->desig_chain.empty())
+		{
+			const ExprPtr &d0 = e->args[0];
+			std::vector<PhysStep> path;
+			std::size_t dcur = 0;
+			if (flatten_desig(sty, d0->desig_chain, dcur, path, 0)
+				&& dcur == d0->desig_chain.size() && !path.empty() && !path[0].is_index)
+			{
+				llvm::Type *lt = path_leaf_type(sty, path, 0);
+				llvm::Constant *c0 = lt ? fold_global_init(d0, lt) : nullptr;
+				llvm::Constant *cv = c0 ? wrap_path_const(sty, path, 0, c0) : nullptr;
+				if (cv) return cv;
+			}
+			// 解析失败（非本 union 成员 / 越界）：回落下方首成员路径，不误写偏移
+		}
 		CTypePtr fm = sd->second->members[0].type; // 首成员类型
 		llvm::Type *fmt = to_llvm_alloca_type(fm);
 		// 初始化式：首项是带括号子初始化器（或首成员标量）→ 整体折叠；
@@ -1267,6 +1399,323 @@ struct CodeGenImpl
 		return llvm::ConstantStruct::get(sty, els);
 	}
 
+	// 指定符链展开后的物理路径步（P237）：成员步按 C 成员索引（手工布局另经
+	// struct_member_ll_index 换算 LLVM 槽），下标步按数组元素序号。
+	struct PhysStep
+	{
+		bool is_index = false;
+		unsigned idx = 0;
+	};
+
+	// 链式指定符落地 helper（P237）。均定义在 fold_global_init / emit_init_list_store 之前，
+	// 以「叶子类型/叶子常量/叶子地址」反转递归，避开类内先声明后定义同一成员的 C2535 限制。
+	// 指定初始化器成员名 → C 成员索引链（穿过匿名聚合做成员名提升，与 sema/codegen 同口径）。
+	// 尾部即目标字段所在聚合；索引链逐层记全（union 层由使用方按「偏移恒 0」跳过）。
+	bool find_member_cpath(const std::string &tag, const std::string &fname,
+		std::vector<unsigned> &cpath, int depth = 0)
+	{
+		if (depth > 16 || tag.empty()) return false;
+		auto dit = struct_defs_.find(tag);
+		if (dit == struct_defs_.end()) return false;
+		const StructDef *sd = dit->second;
+		for (std::size_t i = 0; i < sd->members.size(); ++i)
+			if (!sd->members[i].name.empty() && sd->members[i].name == fname)
+			{
+				cpath.push_back(static_cast<unsigned>(i));
+				return true;
+			}
+		for (std::size_t i = 0; i < sd->members.size(); ++i)
+		{
+			const auto &m = sd->members[i];
+			if (!m.name.empty() || !m.type || m.type->tag.empty()) continue;
+			if (m.type->kind != TypeKind::Struct && m.type->kind != TypeKind::Union) continue;
+			cpath.push_back(static_cast<unsigned>(i));
+			if (find_member_cpath(m.type->tag, fname, cpath, depth + 1)) return true;
+			cpath.pop_back();
+		}
+		return false;
+	}
+
+	// 指定符链 → 物理路径（P237）：成员步经 find_member_cpath 穿匿名聚合展开成多级成员步，
+	// 下标步要求当前为数组。成功要求链全部消费（i 走到末尾）、out 即完整路径；
+	// 失败返回 false，调用方整块丢弃后回退旧路径。
+	bool flatten_desig(llvm::Type *ty, const std::vector<DesigStep> &ds, std::size_t &i,
+		std::vector<PhysStep> &out, int depth = 0)
+	{
+		if (i >= ds.size()) return true;
+		if (depth > 16 || !ty) return false;
+		const DesigStep &s = ds[i];
+		if (s.is_index)
+		{
+			auto *aty = llvm::dyn_cast<llvm::ArrayType>(ty);
+			if (!aty || s.index < 0) return false;
+			out.push_back({true, static_cast<unsigned>(s.index)});
+			++i;
+			return flatten_desig(aty->getElementType(), ds, i, out, depth + 1);
+		}
+		auto *sty = llvm::dyn_cast<llvm::StructType>(ty);
+		if (!sty) return false;
+		std::string tag = tag_for_struct(sty);
+		std::vector<unsigned> cpath;
+		if (tag.empty() || !find_member_cpath(tag, s.name, cpath)) return false;
+		for (unsigned ci : cpath)
+		{
+			auto dit = struct_defs_.find(tag);
+			if (dit == struct_defs_.end() || ci >= dit->second->members.size()) return false;
+			const StructMember &m = dit->second->members[ci];
+			out.push_back({false, ci});
+			ty = to_llvm_alloca_type(m.type);
+			tag = m.type ? m.type->tag : std::string();
+		}
+		++i;
+		return flatten_desig(ty, ds, i, out, depth + 1);
+	}
+
+	// 沿物理路径求叶子对象的 LLVM 类型（P237）：struct 层取成员类型、数组层取元素类型。
+	llvm::Type *path_leaf_type(llvm::Type *ty, const std::vector<PhysStep> &path, std::size_t lvl = 0)
+	{
+		if (!ty) return nullptr;
+		if (lvl >= path.size()) return ty;
+		const PhysStep &st = path[lvl];
+		if (st.is_index)
+		{
+			auto *aty = llvm::dyn_cast<llvm::ArrayType>(ty);
+			if (!aty || st.idx >= aty->getNumElements()) return nullptr;
+			return path_leaf_type(aty->getElementType(), path, lvl + 1);
+		}
+		auto *sty = llvm::dyn_cast<llvm::StructType>(ty);
+		if (!sty) return nullptr;
+		std::string tag = tag_for_struct(sty);
+		auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
+		if (dit == struct_defs_.end() || st.idx >= dit->second->members.size()) return nullptr;
+		return path_leaf_type(to_llvm_alloca_type(dit->second->members[st.idx].type), path, lvl + 1);
+	}
+
+	// 把已折叠好的叶子常量沿物理路径自内向外包成整对象常量（P237）：struct 层填
+	// ConstantStruct 对应槽，union 层交 union_body_const 摊成 [N x i8] 载荷（LLVM 禁止
+	// 聚合→字节数组的 bitcast），数组层填 ConstantArray 对应元素；其余位置清零。
+	llvm::Constant *wrap_path_const(llvm::Type *ty, const std::vector<PhysStep> &path,
+		std::size_t lvl, llvm::Constant *leaf)
+	{
+		if (!ty || !leaf) return nullptr;
+		if (lvl >= path.size()) return leaf;
+		const PhysStep &st = path[lvl];
+		if (st.is_index)
+		{
+			auto *aty = llvm::dyn_cast<llvm::ArrayType>(ty);
+			if (!aty || st.idx >= aty->getNumElements()) return nullptr;
+			llvm::Constant *inner = wrap_path_const(aty->getElementType(), path, lvl + 1, leaf);
+			if (!inner) return nullptr;
+			std::vector<llvm::Constant *> elems(aty->getNumElements(),
+				llvm::Constant::getNullValue(aty->getElementType()));
+			elems[st.idx] = inner;
+			return llvm::ConstantArray::get(aty, elems);
+		}
+		auto *sty = llvm::dyn_cast<llvm::StructType>(ty);
+		if (!sty) return nullptr;
+		std::string tag = tag_for_struct(sty);
+		auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
+		if (dit == struct_defs_.end() || st.idx >= dit->second->members.size()) return nullptr;
+		llvm::Constant *inner = wrap_path_const(
+			to_llvm_alloca_type(dit->second->members[st.idx].type), path, lvl + 1, leaf);
+		if (!inner) return nullptr;
+		// union 层：先按成员类型把内层包好，再摊成 [N x i8] 载荷（成员偏移恒 0）
+		if (dit->second->is_union) return union_body_const(sty, inner);
+		unsigned slot = static_cast<unsigned>(struct_member_ll_index(sty, st.idx));
+		if (slot >= sty->getNumElements()) return nullptr;
+		std::vector<llvm::Constant *> elems(sty->getNumElements(), nullptr);
+		for (std::size_t k = 0; k < sty->getNumElements(); ++k)
+			elems[k] = llvm::Constant::getNullValue(sty->getElementType(k));
+		elems[slot] = inner;
+		return llvm::ConstantStruct::get(sty, elems);
+	}
+
+	// 沿物理路径下钻到叶子地址（P237，局部初始化）：struct 层按 LLVM 槽 GEP，
+	// union 层成员偏移恒 0（地址不变），数组层按元素下标 GEP。
+	bool path_leaf_addr(llvm::Value *&addr, llvm::Type *&ty, CTypePtr &ct,
+		const std::vector<PhysStep> &path, std::size_t lvl = 0)
+	{
+		if (!addr || !ty) return false;
+		if (lvl >= path.size()) return true;
+		const PhysStep &st = path[lvl];
+		if (st.is_index)
+		{
+			auto *aty = llvm::dyn_cast<llvm::ArrayType>(ty);
+			if (!aty || st.idx >= aty->getNumElements()) return false;
+			addr = builder.CreateGEP(aty, addr,
+				{llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0),
+				 llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), st.idx)});
+			ct = (ct && ct->kind == TypeKind::Array && ct->base) ? ct->base : union_ctype_of(aty->getElementType());
+			ty = aty->getElementType();
+			return path_leaf_addr(addr, ty, ct, path, lvl + 1);
+		}
+		auto *sty = llvm::dyn_cast<llvm::StructType>(ty);
+		if (!sty) return false;
+		std::string tag = tag_for_struct(sty);
+		auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
+		if (dit == struct_defs_.end() || st.idx >= dit->second->members.size()) return false;
+		const StructMember &m = dit->second->members[st.idx];
+		if (!dit->second->is_union)
+		{
+			unsigned slot = static_cast<unsigned>(struct_member_ll_index(sty, st.idx));
+			if (slot >= sty->getNumElements()) return false;
+			addr = builder.CreateStructGEP(sty, addr, slot);
+		}
+		ct = m.type;
+		ty = to_llvm_alloca_type(m.type);
+		return path_leaf_addr(addr, ty, ct, path, lvl + 1);
+	}
+
+	// ── P239：指定符之后位置项的 DFS 续位（C11 §6.7.9p17） ────────────────
+	// 设计符之后的位置项须从「被指定子对象的下一个子对象」起按 DFS 序续位（本级无兄弟则
+	// 逐层上溯）。旧实现一律把「顶层序号 +1」当续位点：`{ [1].x = 5, 6 }` 把 6 落 arr[2].x
+	// （clang 为 arr[1].y）、`.ps[0].x = 1, 2, 3, 4` 只留 ps[0].x、其余静默丢。故把续位
+	// 游标由序号升级为**物理路径**（与 P237 同一表征，成员步记 C 成员索引）。
+	llvm::Type *phys_child_type(llvm::Type *ty, const PhysStep &st)
+	{
+		if (!ty) return nullptr;
+		if (st.is_index)
+		{
+			auto *aty = llvm::dyn_cast<llvm::ArrayType>(ty);
+			if (!aty || st.idx >= aty->getNumElements()) return nullptr;
+			return aty->getElementType();
+		}
+		auto *sty = llvm::dyn_cast<llvm::StructType>(ty);
+		if (!sty) return nullptr;
+		std::string tag = tag_for_struct(sty);
+		auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
+		if (dit == struct_defs_.end() || st.idx >= dit->second->members.size()) return nullptr;
+		return to_llvm_alloca_type(dit->second->members[st.idx].type);
+	}
+
+	// 同一父对象内 st 的下一兄弟：数组→下一元素、struct→下一 C 成员、union→无
+	// （union 同一时刻只有一个活跃成员，续位回到宿主层找兄弟）。
+	bool phys_sibling_after(llvm::Type *parentTy, const PhysStep &st, PhysStep &out)
+	{
+		if (!parentTy) return false;
+		if (st.is_index)
+		{
+			auto *aty = llvm::dyn_cast<llvm::ArrayType>(parentTy);
+			if (!aty || st.idx + 1 >= aty->getNumElements()) return false;
+			out.is_index = true;
+			out.idx = st.idx + 1;
+			return true;
+		}
+		auto *sty = llvm::dyn_cast<llvm::StructType>(parentTy);
+		if (!sty) return false;
+		std::string tag = tag_for_struct(sty);
+		auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
+		if (dit == struct_defs_.end() || dit->second->is_union) return false;
+		if (st.idx + 1 >= dit->second->members.size()) return false;
+		out.is_index = false;
+		out.idx = st.idx + 1;
+		return true;
+	}
+
+	// 物理路径之后的下一个子对象（DFS 序）；无则 false —— 调用方据此把后续位置项判为 excess 丢弃。
+	bool phys_next_path(llvm::Type *ty, const std::vector<PhysStep> &path, std::vector<PhysStep> &out)
+	{
+		std::vector<llvm::Type *> parents;
+		llvm::Type *cur = ty;
+		for (const auto &st : path)
+		{
+			parents.push_back(cur);
+			llvm::Type *child = phys_child_type(cur, st);
+			if (!child) return false;
+			cur = child;
+		}
+		out.clear();
+		for (std::size_t l = path.size(); l-- > 0;)
+		{
+			PhysStep sib;
+			if (phys_sibling_after(parents[l], path[l], sib))
+			{
+				out.assign(path.begin(), path.begin() + static_cast<std::ptrdiff_t>(l));
+				out.push_back(sib);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// 把路径末端的聚合展开到「第一个叶子」：位置项落在聚合子对象上时，brace elision
+	// 使其实际初始化的是该聚合的首个叶子（clang `{ .ps[0] = {1,2}, 3 }` 的 3 → ps[1].x）。
+	void phys_descend_first(llvm::Type *ty, std::vector<PhysStep> &path)
+	{
+		for (int guard = 0; guard < 32; ++guard)
+		{
+			llvm::Type *leaf = path_leaf_type(ty, path, 0);
+			if (!leaf) return;
+			PhysStep s;
+			if (auto *aty = llvm::dyn_cast<llvm::ArrayType>(leaf))
+			{
+				if (aty->getNumElements() == 0) return;
+				s.is_index = true;
+			}
+			else
+			{
+				auto *sty = llvm::dyn_cast<llvm::StructType>(leaf);
+				if (!sty) return;
+				std::string tag = tag_for_struct(sty);
+				auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
+				if (dit == struct_defs_.end() || dit->second->members.empty()) return;
+				s.is_index = false;
+			}
+			s.idx = 0;
+			path.push_back(s);
+		}
+	}
+
+	// 把叶子常量按物理路径**合并**进既有整对象常量（P239）：同层可能已有其它指定项，
+	// 不能像 wrap_path_const 那样整块重建。union 层按本次写入重建载荷（同一 union 逐成员
+	// 交错覆盖属未定义区，取后写者，与旧行为一致）。
+	llvm::Constant *merge_path_const(llvm::Type *ty, const std::vector<PhysStep> &path,
+		std::size_t lvl, llvm::Constant *base, llvm::Constant *leaf)
+	{
+		if (!ty || !leaf) return base;
+		if (lvl >= path.size()) return leaf;
+		const PhysStep &st = path[lvl];
+		if (st.is_index)
+		{
+			auto *aty = llvm::dyn_cast<llvm::ArrayType>(ty);
+			if (!aty || st.idx >= aty->getNumElements()) return base;
+			std::vector<llvm::Constant *> elems;
+			for (unsigned k = 0; k < aty->getNumElements(); ++k)
+			{
+				llvm::Constant *ce = base ? base->getAggregateElement(k) : nullptr;
+				elems.push_back(ce ? ce : llvm::Constant::getNullValue(aty->getElementType()));
+			}
+			llvm::Constant *nested = merge_path_const(aty->getElementType(), path, lvl + 1, elems[st.idx], leaf);
+			if (!nested) return base;
+			elems[st.idx] = nested;
+			return llvm::ConstantArray::get(aty, elems);
+		}
+		auto *sty = llvm::dyn_cast<llvm::StructType>(ty);
+		if (!sty) return base;
+		std::string tag = tag_for_struct(sty);
+		auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
+		if (dit == struct_defs_.end() || st.idx >= dit->second->members.size()) return base;
+		llvm::Type *mt = to_llvm_alloca_type(dit->second->members[st.idx].type);
+		if (!mt) return base;
+		if (dit->second->is_union)
+		{
+			llvm::Constant *inner = merge_path_const(mt, path, lvl + 1, nullptr, leaf);
+			return inner ? union_body_const(sty, inner) : base;
+		}
+		unsigned slot = static_cast<unsigned>(struct_member_ll_index(sty, st.idx));
+		if (slot >= sty->getNumElements()) return base;
+		std::vector<llvm::Constant *> elems;
+		for (unsigned k = 0; k < sty->getNumElements(); ++k)
+		{
+			llvm::Constant *ce = base ? base->getAggregateElement(k) : nullptr;
+			elems.push_back(ce ? ce : llvm::Constant::getNullValue(sty->getElementType(k)));
+		}
+		llvm::Constant *nested = merge_path_const(mt, path, lvl + 1, elems[slot], leaf);
+		if (!nested) return base;
+		elems[slot] = nested;
+		return llvm::ConstantStruct::get(sty, elems);
+	}
+
 	// 将初始化表达式折叠为 LLVM 常量（全局变量初始化器用）
 	llvm::Constant *fold_global_init(const ExprPtr &e, llvm::Type *ty, bool *out_folded = nullptr)
 	{
@@ -1292,6 +1741,12 @@ struct CodeGenImpl
 			{
 				if (ty->isIntegerTy())
 					return llvm::ConstantInt::get(ty, static_cast<uint64_t>(v));
+				// C §6.3.1.4：无符号常量表达式须按值转浮点。fold_int_const 以 intmax_t 回绕，
+				// `18446744073709551615ULL` 得 -1，不重解释就会折成 -1.0（局部路径经 uitofp 正确）。
+				CTypePtr vt = get_expr_ctype(e);
+				if (!vt) vt = e->type;
+				if (vt && is_unsigned_int_type(vt))
+					return llvm::ConstantFP::get(ty, static_cast<double>(static_cast<uint64_t>(v)));
 				return llvm::ConstantFP::get(ty, static_cast<double>(v));
 			}
 		}
@@ -1374,10 +1829,67 @@ struct CodeGenImpl
 					return llvm::ConstantArray::get(aty, elems);
 				}
 				std::size_t pos = 0;
+				// P239：链式/单层指定符之后，续位游标改记物理路径（cur_on=false 时逐字走旧序号语义）
+				std::vector<PhysStep> ppath;
+				bool cur_on = false;
 				for (const auto &ae : e->args)
 				{
-					std::size_t idx = (ae->desig_index >= 0)
-						? static_cast<std::size_t>(ae->desig_index) : pos;
+					// 链式指定符（P237）：`[1][2] = 4` 走物理路径常量（首级必为下标）。
+					// 旧路径只看首级 desig_index 并把值整块折进 elems[首级]（`[1][2]` 当 `[1]`）。
+					if (ae && ae->desig_chain.size() >= 2)
+					{
+						std::vector<PhysStep> path;
+						std::size_t dcur = 0;
+						if (flatten_desig(aty, ae->desig_chain, dcur, path, 0)
+							&& dcur == ae->desig_chain.size() && !path.empty()
+							&& path[0].is_index && path[0].idx < aty->getNumElements())
+						{
+							llvm::Type *lt = path_leaf_type(elem_ty, path, 1);
+							llvm::Constant *c0 = lt ? fold_global_init(ae, lt) : nullptr;
+							if (llvm::Constant *cv = c0 ? wrap_path_const(elem_ty, path, 1, c0) : nullptr)
+							{
+								elems[path[0].idx] = cv;
+								pos = path[0].idx + 1;
+								std::vector<PhysStep> nx;
+								cur_on = phys_next_path(aty, path, nx); // P239：游标接在该路径之后
+								ppath.swap(nx);
+								continue;
+							}
+						}
+					}
+					// 单层指定符：写入后把游标设在「该元素之后」（P239，使后续位置项精确续位）
+					if (ae->desig_index >= 0)
+					{
+						std::size_t idx = static_cast<std::size_t>(ae->desig_index);
+						pos = idx + 1;
+						if (idx < aty->getNumElements())
+						{
+							elems[idx] = fold_global_init(ae, elem_ty);
+							std::vector<PhysStep> one(1);
+							one[0].is_index = true;
+							one[0].idx = static_cast<unsigned>(idx);
+							std::vector<PhysStep> nx;
+							cur_on = phys_next_path(aty, one, nx);
+							ppath.swap(nx);
+						}
+						continue;
+					}
+					// 位置项（P239）：有物理游标则按 DFS 续位；无障碍时回落旧序号语义（行为逐字不变）
+					if (cur_on)
+					{
+						std::vector<PhysStep> tgt = ppath;
+						if (ae->kind != ExprKind::InitList) phys_descend_first(aty, tgt);
+						llvm::Type *lt = path_leaf_type(aty, tgt, 0);
+						llvm::Constant *c0 = lt ? fold_global_init(ae, lt) : nullptr;
+						if (c0 && !tgt.empty() && tgt[0].is_index && tgt[0].idx < aty->getNumElements())
+							elems[tgt[0].idx] = merge_path_const(elem_ty, tgt, 1, elems[tgt[0].idx], c0);
+						if (!tgt.empty() && tgt[0].is_index) pos = tgt[0].idx + 1;
+						std::vector<PhysStep> nx;
+						cur_on = phys_next_path(aty, tgt, nx);
+						ppath.swap(nx);
+						continue;
+					}
+					std::size_t idx = pos;
 					pos = idx + 1;
 					if (idx < aty->getNumElements())
 						elems[idx] = fold_global_init(ae, elem_ty);
@@ -1403,8 +1915,32 @@ struct CodeGenImpl
 				{
 					const auto &gm = gsd->second->members;
 					std::size_t cpos = 0; // C 成员序游标（位置初始化）
+					// 链式指定符（P237）：位域 struct 也走通用物理路径（首级为本层成员）。
+					// 旧分支只按首级名查 bitfield_access_/field_index_map_，会把 `.a[1]` 当 `.a`。
+					auto apply_desig_chain = [&](const ExprPtr &se, std::size_t &root) -> bool
+					{
+						if (!se || se->desig_chain.size() < 2) return false;
+						std::vector<PhysStep> path;
+						std::size_t dcur = 0;
+						if (!flatten_desig(sty, se->desig_chain, dcur, path, 0)
+							|| dcur != se->desig_chain.size() || path.empty() || path[0].is_index)
+							return false;
+						if (gsd == struct_defs_.end() || path[0].idx >= gm.size()) return false;
+						std::size_t slot = gsd->second->is_union ? 0 : struct_member_ll_index(sty, path[0].idx);
+						if (slot >= elems.size()) return false;
+						llvm::Type *mt = to_llvm_alloca_type(gm[path[0].idx].type);
+						llvm::Type *lt = path_leaf_type(mt, path, 1);
+						llvm::Constant *c0 = lt ? fold_global_init(se, lt) : nullptr;
+						llvm::Constant *cv = c0 ? wrap_path_const(mt, path, 1, c0) : nullptr;
+						if (!cv) return false;
+						elems[slot] = cv;
+						root = path[0].idx;
+						return true;
+					};
 					for (const auto &se : e->args)
 					{
+						std::size_t root = 0;
+						if (apply_desig_chain(se, root)) { cpos = root + 1; continue; }
 						std::string mname;
 						if (!se->desig_field.empty())
 						{
@@ -1468,14 +2004,110 @@ struct CodeGenImpl
 					return llvm::ConstantStruct::get(sty, elems);
 				}
 				std::size_t pos = 0;
+				// P239：指定符之后位置项的物理续位游标
+				std::vector<PhysStep> ppath;
+				bool cur_on = false;
 				for (std::size_t ai = 0; ai < e->args.size(); ++ai)
 				{
 					ExprPtr se = e->args[ai];
 					std::size_t idx;
+					// 位置项（P239）：指定符之后按物理路径 DFS 续位；聚合作子对象时展开到首叶
+					if (cur_on && se->desig_chain.empty() && se->desig_field.empty()
+						&& se->desig_index < 0 && gsd != struct_defs_.end())
+					{
+						std::vector<PhysStep> tgt = ppath;
+						if (se->kind != ExprKind::InitList) phys_descend_first(sty, tgt);
+						llvm::Type *lt = path_leaf_type(sty, tgt, 0);
+						llvm::Constant *c0 = lt ? fold_global_init(se, lt) : nullptr;
+						if (c0 && !tgt.empty() && !tgt[0].is_index
+							&& tgt[0].idx < gsd->second->members.size())
+						{
+							std::size_t slot = gsd->second->is_union ? 0 : struct_member_ll_index(sty, tgt[0].idx);
+							llvm::Type *mt = to_llvm_alloca_type(gsd->second->members[tgt[0].idx].type);
+							if (mt && slot < elems.size())
+								elems[slot] = merge_path_const(mt, tgt, 1, elems[slot], c0);
+							pos = tgt[0].idx + 1;
+						}
+						std::vector<PhysStep> nx;
+						cur_on = phys_next_path(sty, tgt, nx);
+						ppath.swap(nx);
+						continue;
+					}
+					// 链式指定符（P237）：`.ps[1].y` / `.a.b` 走通用物理路径（成员名先穿匿名聚合展开，
+					// 首级为本层成员）。旧路径只看首级 desig_field，把 `.ps[1].y` 当 `.ps`。
+					{
+						std::vector<PhysStep> path;
+						std::size_t dcur = 0;
+						if (se->desig_chain.size() >= 2 && gsd != struct_defs_.end()
+							&& flatten_desig(sty, se->desig_chain, dcur, path, 0)
+							&& dcur == se->desig_chain.size() && !path.empty() && !path[0].is_index
+							&& path[0].idx < gsd->second->members.size())
+						{
+							std::size_t slot = gsd->second->is_union ? 0 : struct_member_ll_index(sty, path[0].idx);
+							llvm::Type *mt = to_llvm_alloca_type(gsd->second->members[path[0].idx].type);
+							llvm::Type *lt = (slot < elems.size()) ? path_leaf_type(mt, path, 1) : nullptr;
+							llvm::Constant *c0 = lt ? fold_global_init(se, lt) : nullptr;
+							llvm::Constant *cv = c0 ? wrap_path_const(mt, path, 1, c0) : nullptr;
+							if (cv)
+							{
+								elems[slot] = cv;
+								pos = path[0].idx + 1;
+								std::vector<PhysStep> nx;
+								cur_on = phys_next_path(sty, path, nx); // P239：游标接在该路径之后
+								ppath.swap(nx);
+								continue;
+							}
+						}
+					}
+					// 指定初始化器名提升（P236）：`.提升名` 折叠到匿名聚合内的真实字段。
+					// 旧路径只认直接成员、失配回退 pos（此处恒 0）→ 值静默写进内层偏移 0（§6.7.9p17）。
+					std::vector<unsigned> cpath;
+					if (!se->desig_field.empty() && gsd != struct_defs_.end()
+						&& find_member_cpath(gtag, se->desig_field, cpath) && cpath.size() > 1)
+					{
+						const StructDef *psd = gsd->second;
+						CTypePtr mt = (cpath[0] < psd->members.size()) ? psd->members[cpath[0]].type : nullptr;
+						std::size_t slot = psd->is_union ? 0 : struct_member_ll_index(sty, cpath[0]);
+						llvm::Constant *cv = mt ? build_desig_const(mt->tag, cpath, 1, se) : nullptr;
+						if (cv && slot < elems.size()) elems[slot] = cv;
+						pos = cpath[0] + 1;
+						// P239：游标接在「匿名聚合全链之后」；`.hi` 之后无可续成员时逐层上溯
+						{
+							std::vector<PhysStep> full;
+							for (unsigned ci : cpath)
+							{
+								PhysStep s;
+								s.is_index = false;
+								s.idx = ci;
+								full.push_back(s);
+							}
+							std::vector<PhysStep> nx;
+							cur_on = phys_next_path(sty, full, nx);
+							ppath.swap(nx);
+						}
+						continue;
+					}
 					if (!se->desig_field.empty())
 					{
 						idx = find_struct_field_idx(sty, se->desig_field, pos);
 						pos = idx + 1;
+						// P239：游标接在该成员之后（记 C 成员索引，穿匿名聚合的多级情形已由上方 continue）
+						std::vector<unsigned> dcp;
+						if (gsd != struct_defs_.end() && find_member_cpath(gtag, se->desig_field, dcp)
+							&& !dcp.empty())
+						{
+							std::vector<PhysStep> full;
+							for (unsigned ci : dcp)
+							{
+								PhysStep s;
+								s.is_index = false;
+								s.idx = ci;
+								full.push_back(s);
+							}
+							std::vector<PhysStep> nx;
+							cur_on = phys_next_path(sty, full, nx);
+							ppath.swap(nx);
+						}
 					}
 					else
 					{
@@ -1671,6 +2303,32 @@ struct CodeGenImpl
 		}
 	}
 
+	// 位域成员的掩码写入（局部，P242）：读存储槽 → 清 (mask<<off) 位 → 并入 (v&mask)<<off → 写回。
+	//   与 P191 全局位域分支同口径（存储槽 = ba.storage_idx、掩码宽 = ba.bit_width、位移 = ba.bit_offset）。
+	//   整槽 store 会覆盖同存储单元的其它位域（如 {int a:4;int b:4;} 写 a 清掉 b），故必须按位合并。
+	void store_bitfield_at(llvm::StructType *sty, llvm::Value *addr, const ExprPtr &val, const BitfieldAccess &ba)
+	{
+		if (!sty || ba.storage_idx >= sty->getNumElements()) return;
+		llvm::Type *stor_ty = get_int_ty_for_bits(ba.unit_bits);
+		unsigned ub = stor_ty->getIntegerBitWidth();
+		uint64_t mask = (ba.bit_width >= ub) ? ~0ULL : ((1ULL << ba.bit_width) - 1);
+		ExprPtr it = val;
+		if (it && it->kind == ExprKind::InitList && it->args.size() == 1) it = it->args[0];
+		if (!it) return;
+		llvm::Value *v = gen_expr(it);
+		if (!v) return;
+		if (v->getType() != stor_ty) v = convert_value(v, stor_ty, get_expr_ctype(it));
+		v = builder.CreateAnd(v, llvm::ConstantInt::get(stor_ty, mask));
+		if (ba.bit_offset > 0)
+			v = builder.CreateShl(v, llvm::ConstantInt::get(stor_ty, ba.bit_offset));
+		uint64_t clr = ~(mask << ba.bit_offset);
+		llvm::Value *stor_addr = builder.CreateStructGEP(sty, addr, ba.storage_idx);
+		llvm::Value *cur = builder.CreateLoad(stor_ty, stor_addr);
+		cur = builder.CreateAnd(cur, llvm::ConstantInt::get(stor_ty, clr));
+		cur = builder.CreateOr(cur, v);
+		builder.CreateStore(cur, stor_addr);
+	}
+
 	// brace elision 感知的运行时局部初始化（与 elide_fold 同构）：从 flat args 游标 pos 按 ty 消费若干项 store 到 addr。
 	void elide_store(llvm::Type *ty, llvm::Value *addr, const std::vector<ExprPtr> &args, std::size_t &pos)
 	{
@@ -1760,24 +2418,7 @@ struct CodeGenImpl
 				auto bf = bitfield_access_.find(key);
 				if (bf != bitfield_access_.end())
 				{
-					const auto &ba = bf->second;
-					llvm::Type *stor_ty = get_int_ty_for_bits(ba.unit_bits);
-					unsigned ub = stor_ty->getIntegerBitWidth();
-					uint64_t mask = (ba.bit_width >= ub) ? ~0ULL : ((1ULL << ba.bit_width) - 1);
-					ExprPtr it = args[pos++];
-					if (it && it->kind == ExprKind::InitList && it->args.size() == 1) it = it->args[0];
-					llvm::Value *v = gen_expr(it);
-					if (!v) continue;
-					if (v->getType() != stor_ty) v = convert_value(v, stor_ty, get_expr_ctype(it));
-					v = builder.CreateAnd(v, llvm::ConstantInt::get(stor_ty, mask));
-					if (ba.bit_offset > 0)
-						v = builder.CreateShl(v, llvm::ConstantInt::get(stor_ty, ba.bit_offset));
-					uint64_t clr = ~(mask << ba.bit_offset);
-					llvm::Value *stor_addr = builder.CreateStructGEP(sty, addr, ba.storage_idx);
-					llvm::Value *cur = builder.CreateLoad(stor_ty, stor_addr);
-					cur = builder.CreateAnd(cur, llvm::ConstantInt::get(stor_ty, clr));
-					cur = builder.CreateOr(cur, v);
-					builder.CreateStore(cur, stor_addr);
+					store_bitfield_at(sty, addr, args[pos++], bf->second);
 					continue;
 				}
 				auto fi = field_index_map_.find(key);
@@ -1808,6 +2449,36 @@ struct CodeGenImpl
 		if (ct && ct->kind == TypeKind::Union)
 		{
 			if (e->args.empty()) return;
+			// 指定初始化器（P238）：union 宿主的 `.成员 = v` 须落到**被指定**的成员（§6.7.9p12）。
+			// 旧实现无条件按首成员类型写入 —— `union { int i; long long q; } l = { .q = 0x1122334455667788 }`
+			// 被截成 32 位写进 i，局部同样静默误编译（探针 `_tmp/p238_b.co`）。
+			// 链式（`.p.y` / `.a[1]`）复用 P237 物理路径：union 层偏移恒 0、`path_leaf_addr` 已跳过 GEP。
+			if (e->args[0] && !e->args[0]->desig_chain.empty())
+			{
+				const ExprPtr &d0 = e->args[0];
+				std::vector<PhysStep> path;
+				std::size_t dcur = 0;
+				if (flatten_desig(ty, d0->desig_chain, dcur, path, 0)
+					&& dcur == d0->desig_chain.size() && !path.empty() && !path[0].is_index)
+				{
+					llvm::Value *lp = addr;
+					llvm::Type *lt = ty;
+					CTypePtr lct = ct;
+					if (path_leaf_addr(lp, lt, lct, path))
+					{
+						if (lt->isAggregateType() && d0->kind == ExprKind::InitList)
+							emit_init_list_store(d0, lp, lt, lct);
+						else
+						{
+							llvm::Value *v = gen_expr(d0);
+							if (v->getType() != lt) v = convert_value(v, lt, get_expr_ctype(d0));
+							builder.CreateStore(v, lp);
+						}
+						return;
+					}
+				}
+				// 解析失败（非本 union 成员 / 越界）：回落下方首成员路径，不误写
+			}
 			const ExprPtr &first = e->args[0];
 			CTypePtr mt;
 			auto sd = struct_defs_.find(ct->tag);
@@ -1829,8 +2500,14 @@ struct CodeGenImpl
 				}
 				return;
 			}
-			llvm::Value *v = gen_expr(first);
-			if (v->getType() != fty) v = convert_value(v, fty, get_expr_ctype(first));
+			// 标量成员的括号包裹初值 `{ { 5 } }`（§6.7.9p11：标量初始化式可选加括号）：
+			// 全局 fold_global_init 对 InitList + 标量会递归取首项，局部旧实现把内层 InitList
+			// 直接交 gen_expr → 值恒 0（静默）。此处同口径取首项（P238 顺手修）。
+			ExprPtr item = first;
+			while (item && item->kind == ExprKind::InitList && !item->args.empty()) item = item->args[0];
+			if (!item) return;
+			llvm::Value *v = gen_expr(item);
+			if (v->getType() != fty) v = convert_value(v, fty, get_expr_ctype(item));
 			builder.CreateStore(v, ptr);
 			return;
 		}
@@ -1858,11 +2535,94 @@ struct CodeGenImpl
 				}
 			}
 			std::size_t pos = 0; // 当前位置（用于非指定元素）
+			// P239：指定符之后位置项的物理续位游标
+			std::vector<PhysStep> ppath;
+			bool cur_on = false;
 			for (const auto &elem : e->args)
 			{
+				// 链式指定符（P237）：`[1][2] = 4` / `[1].x = 5` 逐级 GEP 后写入（首级必为下标）
+				if (elem->desig_chain.size() >= 2)
+				{
+					std::vector<PhysStep> path;
+					std::size_t dcur = 0;
+					if (flatten_desig(aty, elem->desig_chain, dcur, path, 0)
+						&& dcur == elem->desig_chain.size() && !path.empty()
+						&& path[0].is_index && path[0].idx < aty->getNumElements())
+					{
+						llvm::Value *lp = addr;
+						llvm::Type *lt = aty;
+						CTypePtr lct = ct;
+						if (path_leaf_addr(lp, lt, lct, path))
+						{
+							if (lt->isAggregateType() && elem->kind == ExprKind::InitList)
+								emit_init_list_store(elem, lp, lt, lct);
+							else
+							{
+								llvm::Value *v = gen_expr(elem);
+								if (v->getType() != lt) v = convert_value(v, lt, get_expr_ctype(elem));
+								builder.CreateStore(v, lp);
+							}
+							pos = path[0].idx + 1;
+							std::vector<PhysStep> nx;
+							cur_on = phys_next_path(aty, path, nx); // P239：游标接在该路径之后
+							ppath.swap(nx);
+							continue;
+						}
+					}
+				}
+				// 位置项（P239）：有物理游标则按 DFS 续位；无障碍时回落旧序号语义（行为逐字不变）
+				if (cur_on)
+				{
+					std::vector<PhysStep> tgt = ppath;
+					if (elem->kind != ExprKind::InitList) phys_descend_first(aty, tgt);
+					llvm::Value *lp = addr;
+					llvm::Type *lt = aty;
+					CTypePtr lct = ct;
+					if (!tgt.empty() && tgt[0].is_index && path_leaf_addr(lp, lt, lct, tgt))
+					{
+						if (lt->isAggregateType() && elem->kind == ExprKind::InitList)
+							emit_init_list_store(elem, lp, lt, lct);
+						else
+						{
+							llvm::Value *v = gen_expr(elem);
+							if (v->getType() != lt) v = convert_value(v, lt, get_expr_ctype(elem));
+							builder.CreateStore(v, lp);
+						}
+						pos = tgt[0].idx + 1;
+					}
+					std::vector<PhysStep> nx;
+					cur_on = phys_next_path(aty, tgt, nx);
+					ppath.swap(nx);
+					continue;
+				}
 				// 指定索引或顺序
-				std::size_t idx = (elem->desig_index >= 0)
-					? static_cast<std::size_t>(elem->desig_index) : pos;
+				if (elem->desig_index >= 0)
+				{
+					std::size_t idx = static_cast<std::size_t>(elem->desig_index);
+					pos = idx + 1;
+					if (idx < aty->getNumElements())
+					{
+						llvm::Value *ii = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), idx);
+						llvm::Value *ptr = builder.CreateGEP(aty, addr, {llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0), ii});
+						CTypePtr ect = (ct && ct->kind == TypeKind::Array && ct->base) ? ct->base : union_ctype_of(elem_ty);
+						if (elem_ty->isAggregateType() && elem->kind == ExprKind::InitList)
+							emit_init_list_store(elem, ptr, elem_ty, ect);
+						else
+						{
+							llvm::Value *v = gen_expr(elem);
+							if (v->getType() != elem_ty) v = convert_value(v, elem_ty, get_expr_ctype(elem));
+							builder.CreateStore(v, ptr);
+						}
+						std::vector<PhysStep> one(1);
+						one[0].is_index = true;
+						one[0].idx = static_cast<unsigned>(idx);
+						std::vector<PhysStep> nx;
+						cur_on = phys_next_path(aty, one, nx);
+						ppath.swap(nx);
+					}
+					continue;
+				}
+				std::size_t idx = pos;
 				pos = idx + 1;
 				if (idx >= aty->getNumElements()) break;
 				llvm::Value *ii = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), idx);
@@ -1901,25 +2661,207 @@ struct CodeGenImpl
 				}
 			}
 			std::size_t pos = 0;
+			// P239：指定符之后位置项的物理续位游标。含位域的 struct 不启用 —— 位域与同居成员共享
+			// 存储单元，按物理路径整槽 store 会覆盖同槽其它位域（与全局位域分支同口径的保守回退）。
+			bool lbf = false;
+			{
+				std::string btag = tag_for_struct(sty);
+				auto bd = btag.empty() ? struct_defs_.end() : struct_defs_.find(btag);
+				if (bd != struct_defs_.end())
+					for (const auto &mm : bd->second->members)
+						if (mm.bit_width >= 0) { lbf = true; break; }
+			}
+			std::vector<PhysStep> ppath;
+			bool cur_on = false;
 			for (std::size_t ai = 0; ai < e->args.size(); ++ai)
 			{
 				ExprPtr elem = e->args[ai];
-				std::size_t idx;
-				// 通过 .name 查找字段索引
-				if (!elem->desig_field.empty())
+				llvm::Value *ptr = nullptr;
+				llvm::Type *ft = nullptr;
+				// 位置项（P239）：指定符之后按物理路径 DFS 续位；聚合作子对象时展开到首叶
+				if (cur_on && elem->desig_chain.empty() && elem->desig_field.empty()
+					&& elem->desig_index < 0)
 				{
-					// 从 struct_defs_ 查成员名列表
-					idx = find_struct_field_idx(sty, elem->desig_field, pos);
-					pos = idx + 1;
+					std::vector<PhysStep> tgt = ppath;
+					if (elem->kind != ExprKind::InitList) phys_descend_first(sty, tgt);
+					llvm::Value *lp = addr;
+					llvm::Type *lt = sty;
+					CTypePtr lct = ct;
+					if (!tgt.empty() && !tgt[0].is_index && path_leaf_addr(lp, lt, lct, tgt))
+					{
+						if (lt->isAggregateType() && elem->kind == ExprKind::InitList)
+							emit_init_list_store(elem, lp, lt, lct);
+						else
+						{
+							llvm::Value *v = gen_expr(elem);
+							if (v->getType() != lt) v = convert_value(v, lt, get_expr_ctype(elem));
+							builder.CreateStore(v, lp);
+						}
+						pos = tgt[0].idx + 1;
+					}
+					std::vector<PhysStep> nx;
+					cur_on = !lbf && phys_next_path(sty, tgt, nx);
+					ppath.swap(nx);
+					continue;
+				}
+				// 链式指定符（P237）：`.ps[1].y` / `.a.b` 逐级 GEP 后写入（成员名先穿匿名聚合展开）
+				if (elem->desig_chain.size() >= 2)
+				{
+					std::vector<PhysStep> path;
+					std::size_t dcur = 0;
+					std::string tg = tag_for_struct(sty);
+					auto d = tg.empty() ? struct_defs_.end() : struct_defs_.find(tg);
+					if (d != struct_defs_.end()
+						&& flatten_desig(sty, elem->desig_chain, dcur, path, 0)
+						&& dcur == elem->desig_chain.size() && !path.empty() && !path[0].is_index
+						&& path[0].idx < d->second->members.size())
+					{
+						llvm::Value *lp = addr;
+						llvm::Type *lt = sty;
+						CTypePtr lct = ct;
+						if (path_leaf_addr(lp, lt, lct, path))
+						{
+							if (lt->isAggregateType() && elem->kind == ExprKind::InitList)
+								emit_init_list_store(elem, lp, lt, lct);
+							else
+							{
+								llvm::Value *v = gen_expr(elem);
+								if (v->getType() != lt) v = convert_value(v, lt, get_expr_ctype(elem));
+								builder.CreateStore(v, lp);
+							}
+							pos = path[0].idx + 1;
+							std::vector<PhysStep> nx;
+							cur_on = !lbf && phys_next_path(sty, path, nx); // P239：游标接在该路径之后
+							ppath.swap(nx);
+							continue;
+						}
+					}
+				}
+				std::vector<unsigned> cpath;
+				// 指定初始化器名提升（P236）：`.提升名` 须下钻到匿名聚合内的真实字段；
+				// 旧路径 find_struct_field_idx 只认直接成员、失配回退 pos=0 → 静默写进内层偏移 0。
+				if (!elem->desig_field.empty()
+					&& find_member_cpath(tag_for_struct(sty), elem->desig_field, cpath)
+					&& cpath.size() > 1)
+				{
+					// 逐层下钻：struct 层按 LLVM 槽 GEP；union 层成员偏移恒 0、地址不变
+					// （与 gen_member_addr 的链式寻址同口径）。
+					llvm::Value *p = addr;
+					llvm::StructType *cs = sty;
+					std::string ctag = tag_for_struct(sty);
+					for (std::size_t k = 0; k < cpath.size(); ++k)
+					{
+						if (!cs || ctag.empty()) break;
+						auto dit = struct_defs_.find(ctag);
+						if (dit == struct_defs_.end()) break;
+						const StructDef *sd = dit->second;
+						unsigned ci = cpath[k];
+						if (ci >= sd->members.size()) break;
+						if (!sd->is_union)
+						{
+							unsigned slot = static_cast<unsigned>(struct_member_ll_index(cs, ci));
+							if (slot >= cs->getNumElements()) break;
+							p = builder.CreateStructGEP(cs, p, slot);
+						}
+						if (k + 1 == cpath.size())
+						{
+							ptr = p;
+							ft = to_llvm_alloca_type(sd->members[ci].type);
+							break;
+						}
+						ctag = sd->members[ci].type ? sd->members[ci].type->tag : std::string();
+						cs = ctag.empty() ? nullptr : get_struct_type(ctag);
+					}
+					pos = cpath[0] + 1;
+					// P239：游标接在「匿名聚合全链之后」
+					{
+						std::vector<PhysStep> full;
+						for (unsigned ci : cpath)
+						{
+							PhysStep s;
+							s.is_index = false;
+							s.idx = ci;
+							full.push_back(s);
+						}
+						std::vector<PhysStep> nx;
+						cur_on = !lbf && phys_next_path(sty, full, nx);
+						ppath.swap(nx);
+					}
 				}
 				else
 				{
-					idx = struct_member_ll_index(sty, pos); // 手工布局: C 成员序→LLVM 索引
-					++pos;
+					std::size_t idx;
+					// P242：含位域 struct —— 位置项按 C 成员序定位（auto-layout 槽序≠C 序号）、位域成员掩码写入。
+					//   lbf 时 cur_on 恒 false（上方已禁游标），无需维护 P239 物理游标。
+					if (lbf)
+					{
+						std::string btag = tag_for_struct(sty);
+						auto bsd = btag.empty() ? struct_defs_.end() : struct_defs_.find(btag);
+						const auto *bms = (bsd != struct_defs_.end()) ? &bsd->second->members : nullptr;
+						std::size_t cmi = static_cast<std::size_t>(-1);
+						if (!elem->desig_field.empty())
+						{
+							if (bms)
+								for (std::size_t mi = 0; mi < bms->size(); ++mi)
+									if ((*bms)[mi].name == elem->desig_field) { cmi = mi; break; }
+						}
+						else if (bms)
+						{
+							while (pos < bms->size() && (*bms)[pos].name.empty()) ++pos; // 匿名位域不占初始化位
+							cmi = (pos < bms->size()) ? pos : static_cast<std::size_t>(-1);
+						}
+						if (bms && cmi < bms->size())
+						{
+							auto bf = bitfield_access_.find(btag + "." + (*bms)[cmi].name);
+							if (bf != bitfield_access_.end())
+							{
+								store_bitfield_at(sty, addr, elem, bf->second);
+								pos = cmi + 1;
+								continue;
+							}
+							auto fi = field_index_map_.find(btag + "." + (*bms)[cmi].name);
+							idx = (fi != field_index_map_.end()) ? fi->second : cmi;
+							pos = cmi + 1;
+						}
+						else
+						{
+							idx = struct_member_ll_index(sty, pos);
+							++pos;
+						}
+					}
+					// 通过 .name 查找字段索引
+					else if (!elem->desig_field.empty())
+					{
+						// 从 struct_defs_ 查成员名列表
+						idx = find_struct_field_idx(sty, elem->desig_field, pos);
+						pos = idx + 1;
+						// P239：游标接在该成员之后（记 C 成员索引）
+						std::vector<unsigned> dcp;
+						if (find_member_cpath(tag_for_struct(sty), elem->desig_field, dcp) && !dcp.empty())
+						{
+							std::vector<PhysStep> full;
+							for (unsigned ci : dcp)
+							{
+								PhysStep s;
+								s.is_index = false;
+								s.idx = ci;
+								full.push_back(s);
+							}
+							std::vector<PhysStep> nx;
+							cur_on = !lbf && phys_next_path(sty, full, nx);
+							ppath.swap(nx);
+						}
+					}
+					else
+					{
+						idx = struct_member_ll_index(sty, pos); // 手工布局: C 成员序→LLVM 索引
+						++pos;
+					}
+					if (idx >= sty->getNumElements()) break;
+					ptr = builder.CreateStructGEP(sty, addr, static_cast<unsigned>(idx));
+					ft = sty->getElementType(static_cast<unsigned>(idx));
 				}
-				if (idx >= sty->getNumElements()) break;
-				llvm::Value *ptr = builder.CreateStructGEP(sty, addr, static_cast<unsigned>(idx));
-				llvm::Type *ft = sty->getElementType(static_cast<unsigned>(idx));
+				if (!ptr || !ft) break; // 成员名解析失败：放弃该分支（不误写偏移 0）
 				// union 槽 + 括号列表：交 emit_init_list_store 的 ct==Union 分支（首成员可以是聚合，
 				// 旧特判只取首项 gen_expr → 把 InitList 当值生成，指针成员全丢）。
 				if (elem->kind == ExprKind::InitList)
@@ -1978,6 +2920,35 @@ struct CodeGenImpl
 				}
 			}
 		}
+	}
+
+	// 指定初始化器提升名 → 「仅目标字段非零」的嵌套常量（自内向外逐层包）。
+	// struct 层填 ConstantStruct 对应槽；union 层交 union_body_const 摊成 [N x i8] 载荷
+	// （LLVM 禁止聚合→字节数组的 bitcast，故不能直接叠进 union 类型）。
+	// 返回类型 = tag 该层的 LLVM struct 类型；未知 tag / 越界 / 无法折算一律 nullptr。
+	llvm::Constant *build_desig_const(const std::string &tag, const std::vector<unsigned> &cpath,
+		std::size_t lvl, const ExprPtr &e)
+	{
+		if (tag.empty() || lvl >= cpath.size()) return nullptr;
+		auto dit = struct_defs_.find(tag);
+		if (dit == struct_defs_.end()) return nullptr;
+		const StructDef *sd = dit->second;
+		unsigned ci = cpath[lvl];
+		if (ci >= sd->members.size()) return nullptr;
+		const StructMember &m = sd->members[ci];
+		llvm::Constant *val = (lvl + 1 == cpath.size())
+			? fold_global_init(e, to_llvm_alloca_type(m.type))
+			: build_desig_const(m.type ? m.type->tag : std::string(), cpath, lvl + 1, e);
+		if (!val) return nullptr;
+		llvm::StructType *sty = get_struct_type(tag);
+		if (sd->is_union) return union_body_const(sty, val);
+		std::vector<llvm::Constant *> elems(sty->getNumElements(), nullptr);
+		for (std::size_t i = 0; i < sty->getNumElements(); ++i)
+			elems[i] = llvm::Constant::getNullValue(sty->getElementType(i));
+		unsigned slot = static_cast<unsigned>(struct_member_ll_index(sty, ci));
+		if (slot >= sty->getNumElements()) return nullptr;
+		elems[slot] = val;
+		return llvm::ConstantStruct::get(sty, elems);
 	}
 
 	// 查找 struct 字段在 LLVM StructType 中的索引
@@ -2578,6 +3549,10 @@ struct CodeGenImpl
 			// i1（比较/布尔结果）转 FP 须按无符号 0/1：sitofp i1 true(有符号 1-bit = -1) 会得 -1.0，
 			// 而 C 关系运算 `b==a` 产 int 0/1 再转 FP 应为 0.0/1.0（CTS 0114 long double 族）。
 			if (from->getIntegerBitWidth() == 1) return builder.CreateUIToFP(v, target);
+			// C §6.3.1.4：无符号整型转浮点须按值（uitofp）。源位宽相同但 signed/unsigned
+			// 共用同一 LLVM 整型（i32 既可能 int 也可能 unsigned int），符号性只能取自 CType；
+			// 缺判会把 `unsigned u=0x80000000; (double)u` 转成 -2147483648.0。
+			if (src_t && is_unsigned_int_type(src_t)) return builder.CreateUIToFP(v, target);
 			return builder.CreateSIToFP(v, target);
 		}
 		if (from->isIntegerTy() && target->isIntegerTy())
@@ -2667,9 +3642,20 @@ struct CodeGenImpl
 				return llvm::ConstantFP::get(llvm::Type::getFloatTy(ctx), e->float_val);
 			return llvm::ConstantFP::get(llvm::Type::getDoubleTy(ctx), e->float_val);
 		case ExprKind::CharLiteral:
-			// int_val 已由 parser 经 co_decode_char 解码为真实码值（跨层单一真值源）
-			return llvm::ConstantInt::get(llvm::Type::getInt8Ty(ctx),
-				static_cast<uint8_t>(e->int_val));
+		{
+			// int_val 已由 parser 解码为真实码值（跨层单一真值源）。带前缀者按 §6.4.4.4 在
+			//   字面量自身宽度发射（L/u→i16、U→i32、u8/无前缀→i8）；旧实现恒发 i8，
+			//   非 ASCII 宽字符值被截到首字节、宽度信息丢失。
+			llvm::Type *cty = llvm::Type::getInt8Ty(ctx);
+			if (e->type)
+			{
+				if (e->type->kind == TypeKind::WChar || e->type->kind == TypeKind::Char16)
+					cty = llvm::Type::getInt16Ty(ctx);
+				else if (e->type->kind == TypeKind::Char32)
+					cty = llvm::Type::getInt32Ty(ctx);
+			}
+			return llvm::ConstantInt::get(cty, static_cast<uint64_t>(e->int_val));
+		}
 		case ExprKind::StringLiteral:
 		{
 			const int w = co_str_lit_width(e->str_val);
@@ -2993,18 +3979,24 @@ struct CodeGenImpl
 					auto as_bool = [&](llvm::Value *b) -> llvm::Value * {
 						return b->getType() == I32 ? b : builder.CreateZExt(b, I32);
 					};
-					auto to_fp = [&](llvm::Value *v, llvm::Type *want) -> llvm::Value * {
+					auto to_fp = [&](llvm::Value *v, llvm::Type *want, const CTypePtr &src = nullptr) -> llvm::Value * {
 						if (v->getType() == want) return v;
 						if (v->getType()->isFloatingPointTy())
 							return want->isFloatTy() ? builder.CreateFPTrunc(v, want) : builder.CreateFPExt(v, want);
 						if (v->getType()->isIntegerTy())
+						{
+							// C §6.3.1.4：无符号/i1 源按值转（uitofp），否则大值变负数
+							if (v->getType()->getIntegerBitWidth() == 1 ||
+								(src && is_unsigned_int_type(src)))
+								return builder.CreateUIToFP(v, want);
 							return builder.CreateSIToFP(v, want);
+						}
 						return v;
 					};
 					if (is_fabs)
 					{
 						llvm::Type *want = (nm == "fabsf") ? F32 : F64;
-						llvm::Value *a = to_fp(gen_expr(e->args[0]), want);
+						llvm::Value *a = to_fp(gen_expr(e->args[0]), want, get_expr_ctype(e->args[0]));
 						if (!a->getType()->isFloatingPointTy()) return a;
 						return builder.CreateIntrinsic(want, llvm::Intrinsic::fabs, {a});
 					}
@@ -3012,14 +4004,14 @@ struct CodeGenImpl
 					{
 						bool f32 = (nm == "exp10f");
 						llvm::Type *want = f32 ? F32 : F64;
-						llvm::Value *a = to_fp(gen_expr(e->args[0]), want);
+						llvm::Value *a = to_fp(gen_expr(e->args[0]), want, get_expr_ctype(e->args[0]));
 						llvm::FunctionCallee pc = module->getOrInsertFunction(f32 ? "powf" : "pow",
 							llvm::FunctionType::get(want, {want, want}, false));
 						llvm::Value *ten = llvm::ConstantFP::get(want, 10.0);
 						return builder.CreateCall(pc, {ten, a});
 					}
 					// 分类/关系：按 double 求值（float 实参安全提升，语义等价）
-					llvm::Value *a = to_fp(gen_expr(e->args[0]), F64);
+					llvm::Value *a = to_fp(gen_expr(e->args[0]), F64, get_expr_ctype(e->args[0]));
 					if (!a->getType()->isFloatingPointTy()) return as_bool(llvm::ConstantInt::getFalse(ctx));
 					auto is_inf = [&]() -> llvm::Value * {
 						return builder.CreateFCmpOEQ(
@@ -3038,7 +4030,7 @@ struct CodeGenImpl
 						return builder.CreateTrunc(builder.CreateLShr(bits, 63), I32);
 					}
 					if (e->args.size() < 2) return as_bool(llvm::ConstantInt::getFalse(ctx));
-					llvm::Value *b = to_fp(gen_expr(e->args[1]), F64);
+					llvm::Value *b = to_fp(gen_expr(e->args[1]), F64, get_expr_ctype(e->args[1]));
 					if (!b->getType()->isFloatingPointTy()) return as_bool(llvm::ConstantInt::getFalse(ctx));
 					if (nm == "isgreater") return as_bool(builder.CreateFCmpOGT(a, b));
 					if (nm == "isgreaterequal") return as_bool(builder.CreateFCmpOGE(a, b));
@@ -3596,8 +4588,8 @@ struct CodeGenImpl
 		{
 			// 统一提升到 double
 			llvm::Type *dty = llvm::Type::getDoubleTy(ctx);
-			llvm::Value *l = to_fp(l_raw, dty);
-			llvm::Value *r = to_fp(r_raw, dty);
+			llvm::Value *l = to_fp(l_raw, dty, get_expr_ctype(e->lhs));
+			llvm::Value *r = to_fp(r_raw, dty, get_expr_ctype(e->rhs));
 			if (op == "+") return builder.CreateFAdd(l, r);
 			if (op == "-") return builder.CreateFSub(l, r);
 			if (op == "*") return builder.CreateFMul(l, r);
@@ -3758,7 +4750,7 @@ struct CodeGenImpl
 			}
 			else if (e->lhs) // sizeof(expr)
 			{
-				CTypePtr et = get_expr_ctype(e->lhs);
+				CTypePtr et = sizeof_operand_ctype(e->lhs);
 				// VLA 的 sizeof 是运行期表达式（§6.5.3.4p2：结果为元素个数乘元素大小）。
 				// 旧路径 to_llvm_alloca_type 得 [0 x elem] → 返 0。
 				if (et && et->kind == TypeKind::Array && type_has_vla_dim(et))
@@ -4014,8 +5006,8 @@ struct CodeGenImpl
 					// 左值为整型而右值为浮点（C §6.3.2.8 常用算术转换）同样走此路：整型先转 double，
 					// 存回由函数尾部 convert_value(rhs, stor_ty) 截回左值真实存储类型（修 IR 校验「add i32, double」）。
 					llvm::Type *dty = llvm::Type::getDoubleTy(ctx);
-					llvm::Value *a = to_fp(lhs_val, dty);
-					llvm::Value *b = to_fp(rhs, dty);
+					llvm::Value *a = to_fp(lhs_val, dty, lhs_ct);
+					llvm::Value *b = to_fp(rhs, dty, get_expr_ctype(e->rhs));
 					if (base_op == "+") rhs = builder.CreateFAdd(a, b);
 					else if (base_op == "-") rhs = builder.CreateFSub(a, b);
 					else if (base_op == "*") rhs = builder.CreateFMul(a, b);
@@ -4236,8 +5228,12 @@ struct CodeGenImpl
 		{
 		case ExprKind::IntLiteral:
 		case ExprKind::CharLiteral:
+			// 带前缀字符常量按其前缀类型参与 _Generic 匹配（§6.4.4.4，控制表达式不做整型提升）：
+			//   _Generic(L'A', wchar_t: …, int: …) 应命中 wchar_t。
 			if (e->type && (e->type->kind == TypeKind::LongLong || e->type->kind == TypeKind::Long ||
-				e->type->kind == TypeKind::Int || e->type->kind == TypeKind::BitInt))
+				e->type->kind == TypeKind::Int || e->type->kind == TypeKind::BitInt ||
+				e->type->kind == TypeKind::WChar || e->type->kind == TypeKind::Char8 ||
+				e->type->kind == TypeKind::Char16 || e->type->kind == TypeKind::Char32))
 				return e->type;
 			return make_type(TypeKind::Int);
 		case ExprKind::FloatLiteral:
@@ -4368,6 +5364,15 @@ struct CodeGenImpl
 		return resolve_expr_type(e, env);
 	}
 
+	// sizeof 操作数的类型：字符串字面量须按**数组对象**计（§6.3.2.1：sizeof 是不发生数组→指针
+	//   退化的语境），而 get_expr_ctype 按左值转换后的元素指针建模 → 直接用它会把 sizeof("abc") 错得 8。
+	//   其余表达式一律沿用 get_expr_ctype（变量/成员/下标的数组类型本就不退化）。
+	CTypePtr sizeof_operand_ctype(const ExprPtr &e)
+	{
+		if (e && e->kind == ExprKind::StringLiteral) return ctype_of_string_literal(e->str_val);
+		return get_expr_ctype(e);
+	}
+
 	// 成员访问解析结果：
 	//   base_tag = 基表达式紧邻的容器 struct/union tag（GEP 从此出发）
 	//   slot     = base_tag 中一级成员索引（命名成员本身，或含提升名的匿名 union 成员）
@@ -4377,11 +5382,17 @@ struct CodeGenImpl
 		unsigned slot = 0;
 		std::string decl_tag;
 		unsigned decl_idx = 0;
+		// 自 base_tag 到字段声明处的逐级「(所在 tag, 成员序号)」链，首项即一级成员：
+		// 直命名成员链长 1；穿过匿名聚合时逐级追加（末项即 decl_tag 一级）。
+		// 用于逐级下钻定位——union 级偏移恒 0、struct 级按其布局取槽偏移。
+		std::vector<std::pair<std::string, unsigned>> chain;
 	};
-	// 递归定位字段：一级命中的命名成员 → slot=其索引；匿名 union 成员包裹→ slot=该匿名成员索引
-	// （union 成员偏移恒 0，一次 GEP 到槽即达字段，无需逐层 GEP）。
+	// 递归定位字段：一级命中的命名成员 → slot=其索引；匿名聚合包裹→ slot=该匿名成员索引，
+	// 并在 chain 中记录逐级路径（union 级无偏移、struct 级偏移非 0：匿名 struct 嵌入 union 时
+	// 其第二字段偏移不能丢弃，旧「一次 GEP 到槽」的假设只对匿名 union 嵌套成立）。
 	bool locate_member(const std::string &tag, const std::string &field, int depth,
-	                   unsigned &slot, std::string &decl_tag, unsigned &decl_idx)
+	                   unsigned &slot, std::string &decl_tag, unsigned &decl_idx,
+	                   std::vector<std::pair<std::string, unsigned>> &chain)
 	{
 		if (depth > 16) return false;
 		auto sd = struct_defs_.find(tag);
@@ -4391,7 +5402,9 @@ struct CodeGenImpl
 		for (unsigned i = 0; i < mem.size(); ++i)
 			if (!mem[i].name.empty() && mem[i].name == field) {
 				if (depth == 0) slot = i;
-				decl_tag = tag; decl_idx = i; return true;
+				decl_tag = tag; decl_idx = i;
+				chain.push_back({tag, i});
+				return true;
 			}
 		// 二级：穿过匿名 struct/union（union 保留嵌套，struct 已由 parser 平铺）
 		for (unsigned i = 0; i < mem.size(); ++i)
@@ -4401,9 +5414,11 @@ struct CodeGenImpl
 				&& !mem[i].type->tag.empty())
 			{
 				unsigned sub_slot = 0; std::string dt; unsigned di = 0;
-				if (locate_member(mem[i].type->tag, field, depth + 1, sub_slot, dt, di)) {
+				if (locate_member(mem[i].type->tag, field, depth + 1, sub_slot, dt, di, chain)) {
 					if (depth == 0) slot = i;
-					decl_tag = dt; decl_idx = di; return true;
+					decl_tag = dt; decl_idx = di;
+					chain.insert(chain.begin(), {tag, i});
+					return true;
 				}
 			}
 		}
@@ -4481,7 +5496,7 @@ struct CodeGenImpl
 		mi.base_tag = tag;
 		mi.decl_tag = tag;
 		unsigned slot = 0;
-		if (locate_member(tag, e->name, 0, slot, mi.decl_tag, mi.decl_idx))
+		if (locate_member(tag, e->name, 0, slot, mi.decl_tag, mi.decl_idx, mi.chain))
 			mi.slot = slot;
 		else
 		{
@@ -4493,44 +5508,82 @@ struct CodeGenImpl
 		return mi;
 	}
 
-	// 生成成员地址 GEP
+	// 成员相对基址的静态字节偏移：按 chain 逐级累加（union 级 0、struct 级取槽偏移）。
+	// 位域成员（offsetof 本身 UB）或未知 tag 返回 false，交调用方拒折。
+	bool member_static_offset(const MemberInfo &mi, const std::string &name, intmax_t &off)
+	{
+		const llvm::DataLayout &DL = module->getDataLayout();
+		off = 0;
+		if (mi.chain.empty()) return true;   // 未命中：维持旧默认（一级偏移 0）
+		for (std::size_t k = 0; k < mi.chain.size(); ++k)
+		{
+			const std::string &ctag = mi.chain[k].first;
+			auto sd_it = struct_defs_.find(ctag);
+			if (sd_it == struct_defs_.end()) return false;
+			if (sd_it->second->is_union) continue;   // union 成员偏移恒 0
+			llvm::StructType *st = get_struct_type(ctag);
+			if (!st) return false;
+			unsigned field_idx = mi.chain[k].second;
+			if (k + 1 == mi.chain.size())
+			{
+				// 末级：位域用存储单元索引、普通成员查 field_index_map_
+				std::string key = ctag + "." + name;
+				if (bitfield_access_.find(key) != bitfield_access_.end()) return false;   // 位域拒折
+				auto fi = field_index_map_.find(key);
+				if (fi != field_index_map_.end()) field_idx = fi->second;
+			}
+			else
+				field_idx = static_cast<unsigned>(struct_member_ll_index(st, field_idx));
+			if (field_idx >= st->getNumElements()) return false;
+			off += static_cast<intmax_t>(DL.getStructLayout(st)->getElementOffset(field_idx).getFixedValue());
+		}
+		return true;
+	}
+
+	// 生成成员地址 GEP：按 chain 逐级下钻（struct 级 GEP 到槽、union 级不产生指令）。
+	// 旧实现对 union 基址一律返回基址，仅「匿名 union 嵌套」时正确；匿名 struct 嵌入 union
+	// 时其非首字段偏移被丢弃（LARGE_INTEGER.HighPart 读到 LowPart），故按链逐级走。
 	llvm::Value *gen_member_addr(const ExprPtr &e)
 	{
 		MemberInfo mi = resolve_member_info(e);
-		const std::string &tag = mi.base_tag;
-		// union: 所有成员偏移为0，直接返回基址
-		auto sd_it = struct_defs_.find(tag);
-		bool is_union = (sd_it != struct_defs_.end() && sd_it->second->is_union);
-		if (is_union)
+		llvm::Value *addr = (e->op == ".") ? gen_lvalue_addr(e->lhs) : gen_expr(e->lhs);
+		if (mi.chain.empty())
 		{
-			if (e->op == ".")
-				return gen_lvalue_addr(e->lhs);
+			// 未命中：维持旧默认（struct 按 0 号槽 GEP、union 直接基址）
+			auto sd_it = struct_defs_.find(mi.base_tag);
+			if (sd_it != struct_defs_.end() && sd_it->second->is_union)
+				return addr;
+			llvm::StructType *st = get_struct_type(mi.base_tag);
+			if (!st) return addr;
+			return builder.CreateStructGEP(st, addr, 0, e->name.c_str());
+		}
+		for (std::size_t k = 0; k < mi.chain.size(); ++k)
+		{
+			const std::string &ctag = mi.chain[k].first;
+			auto sd_it = struct_defs_.find(ctag);
+			if (sd_it != struct_defs_.end() && sd_it->second->is_union) continue;   // union 成员偏移恒 0
+			llvm::StructType *st = get_struct_type(ctag);   // 确保布局已建立
+			unsigned field_idx = mi.chain[k].second;        // fallback = source order
+			bool last = (k + 1 == mi.chain.size());
+			if (last)
+			{
+				// 末级：位域用存储单元索引、普通成员查 field_index_map_
+				std::string key = ctag + "." + e->name;
+				auto bf_it = bitfield_access_.find(key);
+				if (bf_it != bitfield_access_.end())
+					field_idx = bf_it->second.storage_idx;
+				else
+				{
+					auto fi_it = field_index_map_.find(key);
+					if (fi_it != field_index_map_.end())
+						field_idx = fi_it->second;
+				}
+			}
 			else
-				return gen_expr(e->lhs);
+				field_idx = static_cast<unsigned>(struct_member_ll_index(st, field_idx));   // 中间匿名聚合成员
+			addr = builder.CreateStructGEP(st, addr, field_idx, last ? e->name.c_str() : "");
 		}
-		// 确定实际 LLVM field index（位域成员用存储单元索引）
-		llvm::StructType *st = get_struct_type(tag); // 确保布局已建立
-		unsigned field_idx = mi.slot; // fallback = source order
-		std::string key = tag + "." + e->name;
-		auto bf_it = bitfield_access_.find(key);
-		if (bf_it != bitfield_access_.end())
-			field_idx = bf_it->second.storage_idx;
-		else
-		{
-			auto fi_it = field_index_map_.find(key);
-			if (fi_it != field_index_map_.end())
-				field_idx = fi_it->second;
-		}
-		if (e->op == ".")
-		{
-			llvm::Value *obj_addr = gen_lvalue_addr(e->lhs);
-			return builder.CreateStructGEP(st, obj_addr, field_idx, e->name.c_str());
-		}
-		else // "->" 
-		{
-			llvm::Value *ptr = gen_expr(e->lhs);
-			return builder.CreateStructGEP(st, ptr, field_idx, e->name.c_str());
-		}
+		return addr;
 	}
 
 	// —— 短路求值 && / || ——
@@ -4680,8 +5733,10 @@ struct CodeGenImpl
 		// Int → FP
 		if (val->getType()->isIntegerTy() && target->isFloatingPointTy())
 		{
-			// 同 convert_value：i1 按无符号 0/1 转 FP，避免 sitofp i1 true = -1.0。
+			// 同 convert_value：i1 按无符号 0/1 转 FP，避免 sitofp i1 true = -1.0；
+			// 无符号源按值转（uitofp），否则 `(double)0x80000000u` 得负数（C §6.3.1.4）。
 			if (val->getType()->getIntegerBitWidth() == 1) return builder.CreateUIToFP(val, target);
+			if (is_unsigned_int_type(get_expr_ctype(e->lhs))) return builder.CreateUIToFP(val, target);
 			return builder.CreateSIToFP(val, target);
 		}
 		// 整数↔整数
@@ -4703,17 +5758,21 @@ struct CodeGenImpl
 	}
 
 	// 提升为 i32（char->sext, i1->zext, ptr->ptrtoint）
-	// 提升为浮点类型（double）
-	llvm::Value *to_fp(llvm::Value *v, llvm::Type *fp_ty)
+	// 提升为浮点类型（double）。src_t 为源表达式 CType（可空），仅用于判定无符号性
+	// （同 convert_value：i32 既可能 int 也可能 unsigned int，只能取自 CType）。
+	llvm::Value *to_fp(llvm::Value *v, llvm::Type *fp_ty, const CTypePtr &src_t = nullptr)
 	{
 		llvm::Type *t = v->getType();
 		if (t == fp_ty) return v;
 		if (t == llvm::Type::getFloatTy(ctx)) return builder.CreateFPExt(v, fp_ty);
 		if (t->isDoubleTy()) return builder.CreateFPTrunc(v, fp_ty); // float→double 不会到这里
-		if (t == llvm::Type::getInt32Ty(ctx)) return builder.CreateSIToFP(v, fp_ty);
-		if (t == llvm::Type::getInt8Ty(ctx)) return builder.CreateSIToFP(v, fp_ty);
-		if (t == llvm::Type::getInt1Ty(ctx)) return builder.CreateZExt(v, llvm::Type::getInt32Ty(ctx)), builder.CreateSIToFP(builder.CreateZExt(v, llvm::Type::getInt32Ty(ctx)), fp_ty);
-		if (t->isIntegerTy()) return builder.CreateSIToFP(v, fp_ty);
+		if (t == llvm::Type::getInt1Ty(ctx)) return builder.CreateZExt(v, llvm::Type::getInt32Ty(ctx)), builder.CreateUIToFP(builder.CreateZExt(v, llvm::Type::getInt32Ty(ctx)), fp_ty);
+		if (t->isIntegerTy())
+		{
+			// C §6.3.1.4：无符号源按值转（uitofp），否则大值变负数
+			if (src_t && is_unsigned_int_type(src_t)) return builder.CreateUIToFP(v, fp_ty);
+			return builder.CreateSIToFP(v, fp_ty);
+		}
 		return v;
 	}
 
@@ -4907,6 +5966,10 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 
 	CodeGenImpl cg(module_name, errors);
 	cg.gen_tu(*state.ast);
+
+	// P229：回传入口子系统标志（供链接层依 -subsystem/-entry 分岔）。
+	state.windows_subsystem = cg.windows_subsystem_;
+	state.use_winmain = cg.use_winmain_;
 
 	// DEBUG: 先写 .ll 再验证
 	if (opts.emit_llvm)

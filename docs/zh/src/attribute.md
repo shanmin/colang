@@ -8,12 +8,15 @@ Co 采用 C23 的属性拼写：一对方括号 `[[` `]]` 包住若干属性，�
 [[ ATTRIBUTE1, ATTRIBUTE2(...) ]]  声明
 ```
 
-Co 当前赋予实际意义的属性有两个：
+Co 当前赋予实际意义的属性有五个：
 
 | 属性 | 作用于 | 效果 |
 | --- | --- | --- |
 | `[[lib("X")]]` | 顶层函数声明、全局变量声明 | 声明该符号由外部库 `X` 供给，链接期自动拉入 `X` |
 | `[[deprecated]]`、`[[deprecated("消息")]]` | 顶层函数、全局变量 | 引用该符号时发一条告警 |
+| `[[nodiscard]]`、`[[nodiscard("理由")]]` | 有返回值的函数（含原型） | 调用返回值在语句位被丢弃时告警；显式 `(void)f()` 不告警 |
+| `[[noreturn]]` | `void` 函数 | 校验函数体不返回：体内 `return` 与落穿都告警；调用点按「不返回」处理 |
+| `[[subsystem("windows")]]` | 入口函数（`main` / `WinMain`） | 把链接产物切为 Windows GUI 子系统（无控制台） |
 
 属性只用 `[[` 这一种拼写；C 里等价的 `<:` `::>` 替代拼写 Co 不支持。
 
@@ -55,8 +58,75 @@ int use(int x)
 ```
 
 - 属性挂在前置声明、定义写在另一处时，按**同一实体**合并——调用点照样告警。
+- **同一位置重复标注幂等接受**（如 `[[deprecated, deprecated]]`、相邻两个属性列表），理由串**取最先写的一个**（first-wins），后续重复整体忽略——与 clang 同口径。
 - 告警**不改变程序退出码**，也不阻断编译。
 - 局部作用域里的声明上的 `deprecated` 当前不生效。
+
+## `[[nodiscard]]`——返回值不得丢弃
+
+给有返回值的函数标 `[[nodiscard]]`，此后调用它却把返回值在语句位丢弃，就会收到一条告警；带理由可写明应当如何处理：
+
+```
+[[nodiscard]] int check(int x);
+[[nodiscard("记得处理返回值")]] int compute(int x);
+
+int run(int x)
+{
+    check(x);                 // warning: ignoring return value of function declared with 'nodiscard' attribute
+    compute(x);               // 同上，告警尾部附带理由： : 记得处理返回值
+    (void)check(x);           // 显式丢弃，视为有意为之，不告警
+    return check(x) + 1;      // 使用返回值，不告警
+}
+```
+
+- 告警文本与 clang（`-std=c23`）同形；带理由时尾部 `: 理由` 逐字保留。
+- **只有原型（无函数体的声明）标了也生效**：原型与定义分开书写时按同一实体登记。
+- 标在**无返回值**（`void`）的函数上报错：`attribute 'nodiscard' cannot be applied to functions without return value`。
+- 同一位置重复标注（`[[nodiscard, nodiscard]]`）幂等接受，与 clang 同口径。
+
+## `[[noreturn]]`——声明函数不返回
+
+给 `void` 函数标 `[[noreturn]]`，编译器校验它确实不返回：函数体内出现 `return` 逐条告警，函数体落穿（执行到末尾自然结束）另报一次；同时调用点按「不返回」处理，被调函数之后的死代码不再引发「缺 `return`」类误报：
+
+```
+[[noreturn]] void bail(void);
+
+int work(int c)
+{
+    if (c)
+        bail();               // 调用点按不返回处理
+    return 0;                 // 不再误报「某路径无返回值」
+}
+```
+
+- 告警文本与 clang 同形：`function 'h' declared 'noreturn' should not return`。
+- `[[_Noreturn]]` 为 C23 已弃用的旧拼写，Co 接受且与 `[[noreturn]]` 同义（不对旧拼写另发弃用警告）。
+- 同样**只看标注、不看书写顺序**：原型标注即登记；重复标注幂等接受。
+
+## `[[subsystem("windows")]]`——切换链接子系统
+
+默认情况下，Co 生成的是**控制台**子系统程序（运行时会带一个控制台窗口）。把 `[[subsystem("windows")]]` 标在入口函数上，链接产物即切为 **Windows GUI 子系统**（无控制台窗口）：
+
+```
+[[subsystem("windows")]]
+int WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow)
+{
+    // 创建窗口、跑消息循环……
+    return 0;
+}
+```
+
+取值只有两个：
+
+- `"windows"`：Windows GUI 子系统，无控制台。
+- `"console"`：控制台子系统（显式写法，等价于不标）。
+
+约束与要点：
+
+- **只在入口函数（`main` 或 `WinMain`）上生效**；标在其它函数上会发一条告警（不阻断编译）。
+- **一个声明上写两个 `[[subsystem]]` 报错**；取值既非 `"windows"` 也非 `"console"` 报错。
+- **定义 `WinMain` 即隐含 windows 子系统**，无须再写 `[[subsystem("windows")]]`（写了也不冲突）。
+- 程序入口与 `WinMain` 的更多约定见「程序入口与执行」章节。
 
 ## 探测与未识别属性
 
@@ -68,7 +138,7 @@ int use(int x)
 #endif
 ```
 
-- 已知但当前批次尚无实际效果的属性（如 `nodiscard`、`maybe_unused`、`noreturn`、`fallthrough` 等）**静默接受**——不报错也不刷警，为的是不打扰从 C/C++ 迁来的代码。
+- 已知但当前尚无实际效果的属性（`maybe_unused`、`fallthrough` 等）**静默接受**——不报错也不刷警，为的是不打扰从 C/C++ 迁来的代码。
 - 未识别的裸名属性发一条 `unknown attribute 'x' ignored` 告警并跳过，不阻断编译。
 - 带命名空间的属性名（如 `[[colang::lib]]`）**一律报错拒收**：Co 不假装支持自己兑现不了的厂商属性。
 
@@ -78,17 +148,22 @@ int use(int x)
 | --- | --- | --- |
 | 属性拼写 `[[...]]` | 沿用 C23 | 与 C23 相同 |
 | `[[deprecated]]` | 支持（诊断层，不进产物） | 与 C23 语义一致 |
-| `[[nodiscard]]` / `[[maybe_unused]]` / `[[noreturn]]` 等 | 接受但不产生效果 | 与 C23 不同（C23 有实际语义） |
+| `[[nodiscard]]` / `[[noreturn]]` | 首批语义已生效（告警与校验，与 clang 同形） | 与 C23 基本一致（类型级标注等边角见下） |
+| `[[maybe_unused]]` / `[[fallthrough]]` | 接受但不产生效果 | 与 C23 不同（C23 有实际语义） |
 | `[[lib("X")]]` | Co 新定义，C 标准无此属性 | Co 独有 |
+| `[[subsystem("windows")]]` | Co 新定义，C 标准无此属性 | Co 独有 |
 | `<:` `::>` 替代拼写 | 不支持 | 与 C23 不同 |
 
 > **兼容性告知**：
 > 1. `[[lib("X")]]` 是 Co 自定义属性。把 `.co`/`.c` 交给真正的 clang/clangd 看时，它会按未知属性 `-Wunknown-attributes` 警告并忽略——**这是必然如此、不是缺陷**；外部工具不会校验库归属，只有 Co 编译器消费它。
 > 2. 从 C/C++ 迁移时，`#pragma comment(lib, "X")` 与 `__declspec(dllimport)` 本编译器**既不实现、也不模拟**，库归属一律须显式改写为 `[[lib("X")]]`。
 > 3. `[[deprecated]]` 是纯前端诊断，Co 与 clang 一样**不把它编进产物 IR**，因此不会传导到依赖该产物的下游模块。
+> 4. `[[subsystem("windows")]]` 同样是 Co 自定义属性：真 clang/clangd 会按未知属性警告并忽略（**必然如此、非缺陷**）；子系统切换只有 Co 编译器消费。
 
 ## 当前边界（编译器实装状态）
 
 - `[[lib("X")]]` 落地为 COFF `.drectve` 段的 `/DEFAULTLIB` 链接指令，按声明首现序去重；这依赖链接步能消费该指令，**尚不能**做到「同名符号按具体 dll 精确绑定」——多 dll 同名符号的 per-symbol 绑定属后续链接器能力。
-- `[[deprecated]]` 生效范围限于顶层函数与全局变量的引用点告警。
-- `[[nodiscard]]`、`[[maybe_unused]]`、`[[noreturn]]`、`[[align]]` 等的实际效果尚未实装（当前仅静默接受）。
+- `[[deprecated]]` 生效范围限于顶层函数与全局变量的引用点告警；局部声明位不生效，C23 允许的第二个标注位点（声明符之后）未建模。
+- `[[nodiscard]]` / `[[noreturn]]` 首批语义已落地（丢弃告警 / 不返回校验）。边界：标在非函数声明上（如 `[[nodiscard]] int x = 7;`）静默接受；挂在 `struct`/`union` 类型或函数指针类型上（C23 允许）未建模；`[[_Noreturn]]` 旧拼写不报弃用警告。
+- `[[maybe_unused]]`、`[[fallthrough]]`、`[[align]]` 等仍仅静默接受——Co 当前没有「未使用变量」「隐式贯穿」类告警可供抑制，待相应告警落地时再启用。
+- `[[subsystem("windows")]]` 经链接器命令行 `-subsystem:windows` 落地，其优先级高于静态 CRT 内嵌的 `.drectve`；入口随之在 `WinMain` 时取 `WinMainCRTStartup`、否则钉 `mainCRTStartup`。仅 Windows/COFF 目标有效；W 版 `wWinMain` 暂未支持。

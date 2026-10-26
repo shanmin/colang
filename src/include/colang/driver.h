@@ -38,6 +38,9 @@ struct CompileState
 	std::vector<Token> tokens; // preprocess 产出（已展开、已裁剪非活跃分支）
 	TUPtr ast;                 // parse 产出（翻译单元）
 	std::string obj_path;      // codegen 产出（COFF .obj；链接模式为临时、链接后删除）
+	// P229 codegen 产出：入口子系统标志（供 main.cpp 链接调用传 link_exe）。
+	bool windows_subsystem = false; // [[subsystem("windows")]] 或 WinMain → -subsystem:windows
+	bool use_winmain = false;       // 定义 WinMain → -entry:WinMainCRTStartup
 };
 
 // 运行整条管线；诊断追加到 errors，成功返回 true。

@@ -6,8 +6,9 @@
 //   - 静态 CRT：-defaultlib:libcmt -defaultlib:oldnames
 //   - 公共名 stdio 兜底：-defaultlib:legacy_stdio_definitions（修 sprintf LNK2019）
 //   - 大栈：-stack:16777216（承接原 -Wl,/STACK，修多维大局部数组栈溢出）
-//   - 子系统/入口（Console + mainCRTStartup）由 libcmt 内嵌 .drectve 自动提供，
-//     故此处不显式传 -subsystem/-entry，产物退出码/基线与 clang 一致。
+//   - 子系统/入口：默认（Console + mainCRTStartup）由 libcmt 内嵌 .drectve 自动提供；
+//     P229 依 windows_subsystem/use_winmain 显式传 -subsystem:windows / -entry:WinMainCRTStartup
+//     （实测：命令行优先级高于 .drectve，可覆盖之）。
 //  [dll] `-o *.dll`：传 -dll -entry:_DllMainCRTStartup，导出表由 codegen 对 public
 //   符号发射的 `.drectve` `/EXPORT:` 指令填充；CRT 初始化随 attach 正常执行。
 //   导入库由 lld 默认随 -out 基名生成（如 foo.lib）。
@@ -49,6 +50,7 @@ bool ends_with_ci(const std::string& s, const std::string& suffix)
 }  // namespace
 
 bool link_exe(const std::vector<std::string> &objs, const std::string &out_path,
+              bool windows_subsystem, bool use_winmain,
               std::vector<Error> &errors)
 {
 	// 组装 lld 参数向量（首元素为程序名占位，lld COFF 驱动忽略之）。
@@ -67,6 +69,18 @@ bool link_exe(const std::vector<std::string> &objs, const std::string &out_path,
 		argv.emplace_back("-dll");
 		// 显式指定 DLL 入口，避免 libcmt 的 .drectve `/ENTRY:mainCRTStartup`（exe 专用）误导。
 		argv.emplace_back("-entry:_DllMainCRTStartup");
+	}
+	else
+	{
+		// P229 exe：Windows GUI 子系统 / WinMain 入口（均命令行覆盖 .drectve）。
+		if (windows_subsystem)
+			argv.emplace_back("-subsystem:windows");
+		if (use_winmain)
+			argv.emplace_back("-entry:WinMainCRTStartup");
+		else if (windows_subsystem)
+			// windows 子系统但不走 WinMain（main/顶层入口）：必须显式钉 mainCRTStartup。
+			//   否则 lld 会按 windows 子系统推断入口为 WinMainCRTStartup → 报 undefined WinMain。
+			argv.emplace_back("-entry:mainCRTStartup");
 	}
 	argv.emplace_back("-defaultlib:libcmt");
 	argv.emplace_back("-defaultlib:oldnames");

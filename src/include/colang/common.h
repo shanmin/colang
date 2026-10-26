@@ -110,13 +110,236 @@ inline unsigned char co_decode_char(const std::string &raw)
 	}
 }
 
+// 字符字面量编码前缀（跨层单一真值源）：raw 形如 L'A' / u'A' / U'A' / u8'A' / 'A'（前缀与引号均在其内）。
+// 返回 "u8" / "u" / "U" / "L" / ""（无前缀）。前缀决定字面量类型（ISO C §6.4.4.4）：
+//   L→wchar_t、u→char16_t、U→char32_t、u8→char8_t、无前缀→int。
+inline std::string co_char_lit_prefix(const std::string &raw)
+{
+	if (raw.empty() || raw.front() == '\'') return std::string();
+	const std::size_t q = raw.find('\'');
+	if (q == std::string::npos) return std::string();
+	const std::string pre = raw.substr(0, q);
+	if (pre == "u8" || pre == "u" || pre == "U" || pre == "L") return pre;
+	return std::string();
+}
+
+// ---- 通用字符名 UCN（ISO C §6.4.3：\uXXXX / \UXXXXXXXX）----
+// 跨层单一真值源：parser 用 co_ucn_validate 报诊断；各解码器入口先用 co_expand_ucn 把 UCN
+//   就地展开为 UTF-8 字节，随后沿用既有「按元素宽度/编码分派」（窄字节、UTF-16、UTF-32），
+//   不必在每种编码里各写一份 UCN 逻辑。当前范围＝**字面量内**（字符/字符串常量）；
+//   标识符里的 UCN（`int \u00e9;`）尚未支持。
+// 语法约束（§6.4.3p1）：\u 固定 4 位十六进制、\U 固定 8 位。
+
+// 从 raw[i] 起解析一个 UCN：是 UCN 则返回消耗字节数并写 cp，否则返回 0（含位数/字符不足）。
+inline std::size_t co_ucn_parse(const std::string &raw, std::size_t i, uint32_t &cp)
+{
+	if (i + 1 >= raw.size() || raw[i] != '\\') return 0;
+	const char k = raw[i + 1];
+	const std::size_t digits = (k == 'u') ? 4 : (k == 'U') ? 8 : 0;
+	if (digits == 0 || i + 2 + digits > raw.size()) return 0;
+	uint32_t v = 0;
+	for (std::size_t j = 0; j < digits; ++j)
+	{
+		const char c = raw[i + 2 + j];
+		unsigned d;
+		if (c >= '0' && c <= '9') d = static_cast<unsigned>(c - '0');
+		else if (c >= 'a' && c <= 'f') d = static_cast<unsigned>(c - 'a' + 10);
+		else if (c >= 'A' && c <= 'F') d = static_cast<unsigned>(c - 'A' + 10);
+		else return 0;
+		v = v * 16 + d;
+	}
+	cp = v;
+	return 2 + digits;
+}
+
+// UCN 码点合法性：合法返回空串，否则返回英文诊断文本（与 clang 同文）。
+//   口径取 **C23**（本项目「单一 C 超集方言、倾向 C23」、不按 -std 门控）：
+//   代理区 D800–DFFF 与 > 0x10FFFF 仍为错；C11/C17 额外的「除 $ @ ` 外不得用 UCN 表示
+//   < 0xA0 字符」已被 C23 放宽，本实现随 C23 接受（clang：-std=c11 报 character 'A'
+//   cannot be specified …，-std=c23 则接受）。
+inline std::string co_ucn_check(uint32_t cp)
+{
+	if (cp > 0x10FFFF) return "invalid universal character name: code point out of range";
+	if (cp >= 0xD800 && cp <= 0xDFFF) return "invalid universal character name: surrogate code point";
+	return std::string();
+}
+
+// 扫描字面量原文中的 UCN：返回首个诊断文本（无问题→空串）。普通转义对（\n、\\ 等）整体跳过，
+//   故 `"\\u4e2d"`（反斜杠 + u4e2d 字面文本）不会被误当作 UCN。
+inline std::string co_ucn_validate(const std::string &raw)
+{
+	for (std::size_t i = 0; i + 1 < raw.size(); ++i)
+	{
+		if (raw[i] != '\\') continue;
+		uint32_t cp = 0;
+		const std::size_t len = co_ucn_parse(raw, i, cp);
+		if (len == 0)
+		{
+			const char k = raw[i + 1];
+			if (k == 'u' || k == 'U') return "incomplete universal character name";
+			++i; // 普通转义：跳过被转义字符
+			continue;
+		}
+		const std::string why = co_ucn_check(cp);
+		if (!why.empty()) return why;
+		i += len - 1;
+	}
+	return std::string();
+}
+
+// 取字面量原文中首个 UCN 的码点（供窄字符常量判定「是否超出 char 可表示范围」）。
+inline bool co_ucn_first(const std::string &raw, uint32_t &cp)
+{
+	for (std::size_t i = 0; i + 1 < raw.size(); ++i)
+	{
+		if (raw[i] != '\\') continue;
+		uint32_t v = 0;
+		const std::size_t len = co_ucn_parse(raw, i, v);
+		if (len == 0) { ++i; continue; }
+		cp = v;
+		return true;
+	}
+	return false;
+}
+
+// UTF-8 追加一个码点（co_expand_ucn 专用，与 co_decode_string 的读向互逆）。
+inline void co_utf8_append(std::string &out, uint32_t cp)
+{
+	if (cp < 0x80) { out += static_cast<char>(cp); return; }
+	if (cp < 0x800)
+	{
+		out += static_cast<char>(0xC0 | (cp >> 6));
+		out += static_cast<char>(0x80 | (cp & 0x3F));
+		return;
+	}
+	if (cp < 0x10000)
+	{
+		out += static_cast<char>(0xE0 | (cp >> 12));
+		out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+		out += static_cast<char>(0x80 | (cp & 0x3F));
+		return;
+	}
+	out += static_cast<char>(0xF0 | (cp >> 18));
+	out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+	out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+	out += static_cast<char>(0x80 | (cp & 0x3F));
+}
+
+// 把字面量原文中的合法 UCN 就地展开为 UTF-8 字节（其余字节原样保留）。
+//   非法 UCN 亦原样保留——非法情形由 co_ucn_validate 在编译期报错，此处只求不崩。
+//   非 UCN 的转义对整体搬运（`\X` 两字节），避免 `\\u4e2d` 的后半段被误展开。
+inline std::string co_expand_ucn(const std::string &raw)
+{
+	std::string out;
+	out.reserve(raw.size());
+	for (std::size_t i = 0; i < raw.size(); )
+	{
+		if (raw[i] == '\\' && i + 1 < raw.size())
+		{
+			uint32_t cp = 0;
+			const std::size_t len = co_ucn_parse(raw, i, cp);
+			if (len > 0 && co_ucn_check(cp).empty())
+			{
+				co_utf8_append(out, cp);
+				i += len;
+				continue;
+			}
+			out += raw[i];
+			out += raw[i + 1];
+			i += 2;
+			continue;
+		}
+		out += raw[i];
+		++i;
+	}
+	return out;
+}
+
+// 带前缀字符常量解码为完整码点（跨层单一真值源，供 L/u/U 前缀）。
+//   非转义内容按 UTF-8 变长解码取首码点（源码以 UTF-8 读入）；转义按 ISO C 语义求值，
+//   此处 \x / \NNN 不再钳到 0xFF，而是钳到 Unicode 码点上限 0x10FFFF。
+// 与 co_decode_char 的分工：后者维持「窄字符取首字节、\x 钳 0xFF」的历史口径不动（窄前缀
+// 仍走它、逐字零变化），本函数只服务需要完整码点的宽前缀，避免动到已稳固的窄路径。
+inline uint32_t co_decode_char_wide(const std::string &raw)
+{
+	std::string s = co_expand_ucn(raw); // UCN（\u/\U）先展开为 UTF-8，再走下方既有的变长解码
+	const std::string pre = co_char_lit_prefix(raw);
+	if (!pre.empty()) s = s.substr(pre.size());
+	if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'')
+		s = s.substr(1, s.size() - 2); // 去首尾单引号
+	if (s.empty()) return 0;
+	if (s[0] != '\\')
+	{
+		const unsigned char b0 = static_cast<unsigned char>(s[0]);
+		const auto cont = [&](std::size_t k) {
+			return k < s.size() && (static_cast<unsigned char>(s[k]) & 0xC0) == 0x80;
+		};
+		if (b0 < 0x80) return b0;
+		if ((b0 & 0xE0) == 0xC0 && cont(1))
+			return ((b0 & 0x1FU) << 6) | (static_cast<unsigned char>(s[1]) & 0x3FU);
+		if ((b0 & 0xF0) == 0xE0 && cont(1) && cont(2))
+			return ((b0 & 0x0FU) << 12) | ((static_cast<unsigned char>(s[1]) & 0x3FU) << 6) |
+				(static_cast<unsigned char>(s[2]) & 0x3FU);
+		if ((b0 & 0xF8) == 0xF0 && cont(1) && cont(2) && cont(3))
+			return ((b0 & 0x07U) << 18) | ((static_cast<unsigned char>(s[1]) & 0x3FU) << 12) |
+				((static_cast<unsigned char>(s[2]) & 0x3FU) << 6) |
+				(static_cast<unsigned char>(s[3]) & 0x3FU);
+		return b0; // 截断/非法续字节：按原字节兜底（不崩）
+	}
+	if (s.size() < 2) return static_cast<unsigned char>(s[0]);
+	const char e = s[1];
+	switch (e)
+	{
+	case 'n': return '\n';
+	case 't': return '\t';
+	case 'r': return '\r';
+	case 'a': return '\a';
+	case 'b': return '\b';
+	case 'f': return '\f';
+	case 'v': return '\v';
+	case 'e': return 0x1B;
+	case '\\': return '\\';
+	case '\'': return '\'';
+	case '"': return '"';
+	case '?': return '?';
+	case 'x': case 'X':
+	{
+		uint32_t v = 0; std::size_t i = 2;
+		while (i < s.size())
+		{
+			const char c = s[i]; unsigned d;
+			if (c >= '0' && c <= '9') d = static_cast<unsigned>(c - '0');
+			else if (c >= 'a' && c <= 'f') d = static_cast<unsigned>(c - 'a' + 10);
+			else if (c >= 'A' && c <= 'F') d = static_cast<unsigned>(c - 'A' + 10);
+			else break;
+			v = v * 16 + d; ++i;
+			if (v > 0x10FFFF) v = 0x10FFFF; // 码点上限钳位
+		}
+		return v;
+	}
+	default:
+		if (e >= '0' && e <= '7') // 八进制：ISO C 至多 3 位
+		{
+			uint32_t v = static_cast<uint32_t>(e - '0'); std::size_t i = 2; int n = 1;
+			while (i < s.size() && n < 3)
+			{
+				const char c = s[i];
+				if (c < '0' || c > '7') break;
+				v = v * 8 + static_cast<uint32_t>(c - '0'); ++i; ++n;
+			}
+			return v;
+		}
+		return static_cast<unsigned char>(e);
+	}
+}
+
 // 字符串字面量解码（跨层单一真值源）：raw 为词元原文，形如 "abc" / "a\nb" / L"x"（含首尾双
 // 引号及可能的编码前缀 u8"/u"/U"/L"）。返回解码后的内容字节序列（不含末尾 '\0'）。
 // 转义覆盖与 co_decode_char 对齐（\n \t \r \a \b \f \v \e \\ \' \" \? \xHH / \NNN 八进制）。
 // 调用方按需自行补 '\0'（如 codegen 表达式路径）或用返回值长度推导数组大小（如 parser）。
 inline std::string co_decode_string(const std::string &raw)
 {
-	std::string s = raw;
+	std::string s = co_expand_ucn(raw); // UCN（\u/\U）先展开为 UTF-8，供下游按元素宽度重编码
 	// 剥编码前缀 u8/u/U/L（词法器将前缀并入 text），保证含前缀时仍能正确剥双引号
 	if (!s.empty() && s.front() != '"')
 	{
@@ -305,6 +528,19 @@ inline std::vector<uint32_t> co_decode_utf32(const std::string &raw)
 		cps.push_back(static_cast<uint32_t>(cp)); // 直接存码点，不分代理（与 UTF-16 唯一差异）
 	}
 	return cps;
+}
+
+// 字符串字面量作为**数组对象**时的元素个数（含末尾 '\0'，ISO C §6.4.5p6/p7）。
+// 与 co_str_lit_width 同源定元素宽度：宽 1（窄/u8）→ UTF-8 字节数、宽 2（L/u）→ UTF-16 码元数、
+//   宽 4（U）→ 码点数，各 +1 补终止符。供 sizeof(字面量) 等**不施加数组→指针退化**的语境使用。
+inline std::size_t co_str_lit_len(const std::string &raw)
+{
+	switch (co_str_lit_width(raw))
+	{
+	case 2: return co_decode_utf16(raw).size() + 1;
+	case 4: return co_decode_utf32(raw).size() + 1;
+	default: return co_decode_string(raw).size() + 1;
+	}
 }
 
 }  // namespace colang

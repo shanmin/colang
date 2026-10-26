@@ -400,12 +400,54 @@ LexResult Lexer::next(Token &out, Error &err)
 	pending_space_ = false; // 已消费本段间隔，下段重新累计
 	const char c = peek();
 
-	if (is_ident_nondigit(c))
+	// 标识符起点：字面字符或内联 UCN `\uXXXX`/`\UXXXXXXXX`（ISO C §6.4.3）
+	if (is_ident_nondigit(c) || (c == '\\' && (peek(1) == 'u' || peek(1) == 'U')))
 	{
 		std::string word;
-		while (!eof() && (is_ident_nondigit(peek()) || is_digit(peek())))
+		// 标识符内通用字符名：原文先行展开为 UTF-8 并入词素，与字面量内 UCN（P244）共用
+		//   co_ucn_parse/co_ucn_check 单一真值源；标识符语境额外拒收**全部 < 0xA0 码点**
+		//   （clang -std=c23 实测：'A'/'0'/'$' 均报 cannot be specified by a universal character name），
+		//   故展开后不可能拼出 ASCII 关键字/标点，word 仍可直接查关键字表。
+		auto take_ident_ucn = [&](std::string &msg) -> bool {
+			const std::size_t digits = (peek(1) == 'u') ? 4 : 8;
+			std::string raw = "\\";
+			raw += peek(1);
+			for (std::size_t j = 0; j < digits; ++j)
+			{
+				if (pos_ + 2 + j >= text_.size()) { msg = "invalid universal character name"; return false; }
+				raw += peek(2 + j);
+			}
+			uint32_t cp = 0;
+			if (co_ucn_parse(raw, 0, cp) == 0) { msg = "invalid universal character name"; return false; }
+			msg = co_ucn_check(cp);
+			if (!msg.empty()) return false;
+			if (cp < 0xA0)
+			{
+				msg = (cp >= 0x20 && cp < 0x7F)
+					? std::string("character '") + static_cast<char>(cp) + "' cannot be specified by a universal character name"
+					: "invalid universal character name: code point below 0xA0";
+				return false;
+			}
+			for (std::size_t j = 0; j < 2 + digits; ++j) take();
+			co_utf8_append(word, cp);
+			return true;
+		};
+		for (;;)
 		{
-			word += take();
+			if (eof()) break;
+			const char n = peek();
+			if (is_ident_nondigit(n) || is_digit(n)) { word += take(); continue; }
+			if (n == '\\' && (peek(1) == 'u' || peek(1) == 'U'))
+			{
+				std::string msg;
+				if (!take_ident_ucn(msg))
+				{
+					err = Error{file_, Pos{t.loc.line, t.loc.column}, msg};
+					return LexResult::Error;
+				}
+				continue;
+			}
+			break;
 		}
 		// 前缀紧贴 ' 或 " → 带前缀的字符/字符串常数（如 u8"x" / L'y'）
 		if (peek() == '\'' || peek() == '"')

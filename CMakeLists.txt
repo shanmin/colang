@@ -51,27 +51,80 @@ endif()
 
 # Sources live in per-layer directories, collected recursively
 file(GLOB_RECURSE COLANG_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
+# Project (compiler-private) headers live under src/include/colang, collected
+# recursively. A header edit still forces a real recompile+relink, so it must
+# count as a rebuild for the revision counter. The generated colang_revision.h
+# lives under ${CMAKE_CURRENT_BINARY_DIR}/include, so it is never matched here.
+# NOTE: the Co standard-library headers now live at the top-level include/
+# (shipped to dist/include) and are deliberately NOT globbed here, so editing a
+# stdlib header does not bump the compiler revision counter.
+file(GLOB_RECURSE COLANG_HEADERS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/include/*.h)
 
-# PE version resource: parse version.h (single source of truth) -> configure_file version.rc
+# PE version resource + Revision (4th field) counter (cmake/revision.txt).
+# Parse the three hand-authored components from version.h (single source of truth).
 if(MSVC)
-  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/colang/version.h" _colang_ver_h)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/include/colang/version.h" _colang_ver_h)
   foreach(_comp MAJOR MINOR PATCH)
     string(REGEX MATCH "COLANG_VERSION_${_comp} +([0-9]+)" _m "${_colang_ver_h}")
     set(COLANG_VER_${_comp} "${CMAKE_MATCH_1}")
   endforeach()
   string(REGEX MATCH "COLANG_VERSION_STRING +\"([^\"]+)\"" _m "${_colang_ver_h}")
   set(COLANG_VERSION_STRING "${CMAKE_MATCH_1}")
-  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.rc.in"
-                 "${CMAKE_CURRENT_BINARY_DIR}/version.rc" @ONLY)
+  # read persisted "<version> <revision>" for the non-auto path seed. Use the
+  # recorded counter only when its version matches the current three-segment
+  # version; a front-version change resets the seed to 0 (mirrors the script).
+  set(COLANG_VER_REVISION "0")
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/revision.txt")
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/revision.txt" _rvtxt)
+    if(_rvtxt MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+)[ \r\n\t]+([0-9]+)")
+      set(_seed_ver "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
+      if(_seed_ver STREQUAL COLANG_VERSION_STRING)
+        set(COLANG_VER_REVISION "${CMAKE_MATCH_4}")
+      endif()
+    endif()
+  endif()
+  set(COLANG_VERSION_FULL "${COLANG_VERSION_STRING}.${COLANG_VER_REVISION}")
 endif()
 
-if(MSVC)
-  add_executable(colang ${COLANG_SOURCES} "${CMAKE_CURRENT_BINARY_DIR}/version.rc")
+set(_rev_hdr "${CMAKE_CURRENT_BINARY_DIR}/include/colang/colang_revision.h")
+set(_rc_out  "${CMAKE_CURRENT_BINARY_DIR}/version.rc")
+
+# Revision counter semantics: bump +1 ONLY when a real source changes, and embed
+# the new value the same pass. Achieved with a source-level custom command whose
+# OUTPUTs are the generated revision header + PE resource and whose DEPENDS are
+# the colang sources: it reruns iff a source is newer than those OUTPUTs, which
+# also makes colang relink; a no-op build leaves the OUTPUTs up-to-date so nothing
+# reruns and the number holds. (A TARGET PRE_BUILD step would fire on every build
+# on the VS generator, so it is NOT used.) VS-only: Ninja/Make map PRE_BUILD to
+# PRE_LINK and would loop; other generators seed version.rc and keep fallback 0.
+if(MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
+  add_custom_command(
+    OUTPUT "${_rev_hdr}" "${_rc_out}"
+    COMMAND ${CMAKE_COMMAND}
+      -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -DBINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+      -DVER_MAJOR=${COLANG_VER_MAJOR}
+      -DVER_MINOR=${COLANG_VER_MINOR}
+      -DVER_PATCH=${COLANG_VER_PATCH}
+      -DVER_STRING=${COLANG_VERSION_STRING}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/increment_revision.cmake
+    DEPENDS ${COLANG_SOURCES} ${COLANG_HEADERS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/increment_revision.cmake
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.rc.in
+    COMMENT "bump colang revision (only on source change)")
+  add_executable(colang ${COLANG_SOURCES} "${_rc_out}" "${_rev_hdr}")
+  set_source_files_properties("${_rev_hdr}" PROPERTIES HEADER_FILE_ONLY TRUE)
+elseif(MSVC)
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.rc.in" "${_rc_out}" @ONLY)
+  add_executable(colang ${COLANG_SOURCES} "${_rc_out}")
 else()
   add_executable(colang ${COLANG_SOURCES})
 endif()
 
-target_include_directories(colang PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Generated revision header lives in the binary include dir
+target_include_directories(colang PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+target_include_directories(colang PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/include)
 target_include_directories(colang SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 
 # LLVM components (Phase 0 spike-verified closure, do not trim):

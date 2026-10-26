@@ -8,12 +8,15 @@ Co adopts the C23 attribute spelling: a pair of brackets `[[` `]]` encloses one 
 [[ ATTRIBUTE1, ATTRIBUTE2(...) ]]  declaration
 ```
 
-Two attributes currently carry meaning in Co:
+Five attributes currently carry meaning in Co:
 
 | Attribute | Applies to | Effect |
 | --- | --- | --- |
 | `[[lib("X")]]` | top-level function declarations, global variable declarations | declares that the symbol is supplied by external library `X`; the linker pulls `X` in automatically |
 | `[[deprecated]]`, `[[deprecated("message")]]` | top-level functions, global variables | emits a warning at each reference to the symbol |
+| `[[nodiscard]]`, `[[nodiscard("reason")]]` | functions with a return value (prototypes included) | warns when a call's return value is discarded in statement position; an explicit `(void)f()` does not warn |
+| `[[noreturn]]` | `void` functions | verifies the function never returns: both a `return` in the body and falling off the end warn; call sites are treated as non-returning |
+| `[[subsystem("windows")]]` | entry function (`main` / `WinMain`) | switches the linked artifact to the Windows GUI subsystem (no console) |
 
 `[[` is the only spelling; the `<:` `::>` alternative token spelling from C is not supported by Co.
 
@@ -55,8 +58,75 @@ int use(int x)
 ```
 
 - When the attribute is on a forward declaration and the definition is written elsewhere, they merge by **the same entity** — the call site still warns.
+- **Repeated annotations at the same position are accepted idempotently** (e.g. `[[deprecated, deprecated]]`, or two adjacent attribute lists); the **first message written wins** (first-wins) and later duplicates are ignored — the same rule clang follows.
 - Warnings **do not change the program's exit code** and do not block compilation.
 - `deprecated` on a declaration in local scope is not effective at present.
+
+## `[[nodiscard]]` — the return value must not be discarded
+
+Marking a function with a return value as `[[nodiscard]]` produces a warning whenever a call discards its result in statement position; a reason can spell out what the caller should do:
+
+```
+[[nodiscard]] int check(int x);
+[[nodiscard("handle the result")]] int compute(int x);
+
+int run(int x)
+{
+    check(x);                 // warning: ignoring return value of function declared with 'nodiscard' attribute
+    compute(x);               // same warning, trailing the reason: : handle the result
+    (void)check(x);           // explicit discard counts as intentional — no warning
+    return check(x) + 1;      // using the value — no warning
+}
+```
+
+- The warning text matches clang (`-std=c23`); with a reason, the trailing `: reason` is kept verbatim.
+- **A prototype alone (a declaration without a body) already takes effect**: prototypes and definitions register as the same entity.
+- Marking a function **without a return value** (`void`) is an error: `attribute 'nodiscard' cannot be applied to functions without return value`.
+- Repeated annotations at the same position (`[[nodiscard, nodiscard]]`) are accepted idempotently, same as clang.
+
+## `[[noreturn]]` — declaring that a function never returns
+
+Marking a `void` function `[[noreturn]]` makes the compiler verify it truly never returns: a `return` appearing in the body warns (each occurrence), falling off the end of the body warns once more, and call sites are treated as non-returning — dead code after the call no longer triggers spurious "missing `return`" complaints:
+
+```
+[[noreturn]] void bail(void);
+
+int work(int c)
+{
+    if (c)
+        bail();               // call site treated as non-returning
+    return 0;                 // no spurious "not all paths return a value"
+}
+```
+
+- The warning text matches clang: `function 'h' declared 'noreturn' should not return`.
+- `[[_Noreturn]]` is the deprecated C23 spelling; Co accepts it as synonymous with `[[noreturn]]` (without emitting an extra deprecation warning for the old spelling).
+- Again, **only the annotation matters, not the writing order**: marking a prototype registers it; repeated annotations are accepted idempotently.
+
+## `[[subsystem("windows")]]` — switching the link subsystem
+
+By default Co produces a **console**-subsystem program (it opens a console window at runtime). Marking the entry function with `[[subsystem("windows")]]` switches the linked artifact to the **Windows GUI subsystem** (no console window):
+
+```
+[[subsystem("windows")]]
+int WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow)
+{
+    // create the window, run the message loop...
+    return 0;
+}
+```
+
+There are only two possible values:
+
+- `"windows"`: Windows GUI subsystem, no console.
+- `"console"`: console subsystem (an explicit spelling, equivalent to not marking it).
+
+Constraints and key points:
+
+- **Only takes effect on the entry function (`main` or `WinMain`)**; marking it on any other function emits a warning (without blocking compilation).
+- **Writing two `[[subsystem]]` attributes on one declaration is an error**; a value that is neither `"windows"` nor `"console"` is an error.
+- **Defining `WinMain` already implies the windows subsystem**; you need not also write `[[subsystem("windows")]]` (writing it does not conflict).
+- See the "Program Entry and Execution" chapter for more on entry points and `WinMain`.
 
 ## Feature probing and unrecognized attributes
 
@@ -68,7 +138,7 @@ The preprocessor directive `__has_c_attribute(name)` returns `1` or `0` and can 
 #endif
 ```
 
-- Known attributes that carry no effect in the current batch (such as `nodiscard`, `maybe_unused`, `noreturn`, `fallthrough`, and others) are **accepted silently** — no error, no warning — so that code migrated from C/C++ is not disturbed.
+- Known attributes that still carry no effect (`maybe_unused`, `fallthrough`, and others) are **accepted silently** — no error, no warning — so that code migrated from C/C++ is not disturbed.
 - An unrecognized bare name emits one `unknown attribute 'x' ignored` warning and is skipped, without blocking compilation.
 - A namespaced attribute name (such as `[[colang::lib]]`) is **rejected with an error**: Co does not pretend to support vendor attributes it cannot honor.
 
@@ -78,17 +148,22 @@ The preprocessor directive `__has_c_attribute(name)` returns `1` or `0` and can 
 | --- | --- | --- |
 | Attribute spelling `[[...]]` | adopted from C23 | same as C23 |
 | `[[deprecated]]` | supported (diagnostic layer, not in the artifact) | matches C23 semantics |
-| `[[nodiscard]]` / `[[maybe_unused]]` / `[[noreturn]]`, etc. | accepted but no effect | differs from C23 (C23 has real semantics) |
+| `[[nodiscard]]` / `[[noreturn]]` | first batch of semantics in effect (warnings and verification, clang-shaped) | largely matches C23 (type-level marking etc. see below) |
+| `[[maybe_unused]]` / `[[fallthrough]]` | accepted but no effect | differs from C23 (C23 has real semantics) |
 | `[[lib("X")]]` | newly defined by Co; no such attribute in the C standard | Co-specific |
+| `[[subsystem("windows")]]` | newly defined by Co; no such attribute in the C standard | Co-specific |
 | `<:` `::>` alternative spelling | not supported | differs from C23 |
 
 > **Compatibility note**:
 > 1. `[[lib("X")]]` is a Co-defined attribute. When a real clang/clangd reads `.co`/`.c` files, it warns `-Wunknown-attributes` and ignores it — **this is necessarily so, not a defect**; external tools will not validate library ownership, only the Co compiler consumes it.
 > 2. When migrating from C/C++, `#pragma comment(lib, "X")` and `__declspec(dllimport)` are **neither implemented nor simulated** by this compiler; library ownership must always be rewritten explicitly as `[[lib("X")]]`.
 > 3. `[[deprecated]]` is a front-end diagnostic only; like clang, Co **does not encode it into the artifact's IR**, so it does not propagate to downstream modules that consume the artifact.
+> 4. `[[subsystem("windows")]]` is likewise a Co-defined attribute: a real clang/clangd warns and ignores it as an unknown attribute (**necessarily so, not a defect**); only the Co compiler consumes the subsystem switch.
 
 ## Current boundaries (compiler implementation status)
 
 - `[[lib("X")]]` lowers to a `/DEFAULTLIB` linker directive in the COFF `.drectve` section, deduplicated by first appearance; this relies on the link step consuming the directive and **cannot yet** do "precise per-symbol binding to a specific dll" — per-symbol binding for same-named symbols across multiple dlls is a later linker capability.
-- `[[deprecated]]` is limited to reference-site warnings on top-level functions and global variables.
-- The real effects of `[[nodiscard]]`, `[[maybe_unused]]`, `[[noreturn]]`, `[[align]]`, and others are not yet implemented (currently accepted silently only).
+- `[[deprecated]]` is limited to reference-site warnings on top-level functions and global variables; local declaration positions are inert, and C23's second legal spot (after the declarator) is not modeled.
+- The first batch of `[[nodiscard]]` / `[[noreturn]]` semantics has landed (discard warnings / non-return verification). Boundaries: marking a non-function declaration (e.g. `[[nodiscard]] int x = 7;`) is accepted silently; marking a `struct`/`union` type or a function-pointer type (allowed by C23) is not modeled; the old `[[_Noreturn]]` spelling draws no deprecation warning.
+- `[[maybe_unused]]`, `[[fallthrough]]`, `[[align]]` and others remain silently accepted — Co currently has no "unused variable" or "implicit fallthrough" class warnings for them to suppress; they will be enabled when such warnings land.
+- `[[subsystem("windows")]]` is realized via the linker command-line `-subsystem:windows`, which takes precedence over the static CRT's embedded `.drectve`; the entry then resolves to `WinMainCRTStartup` for `WinMain`, otherwise pinned to `mainCRTStartup`. It is valid only for Windows/COFF targets; the wide variant `wWinMain` is not yet supported.

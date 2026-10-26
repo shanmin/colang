@@ -3,6 +3,15 @@
 本记录按发布版本列出 Co（colang）语言/编译器的主要变化。
 版本策略：0.* 为开发测试版，1.* 为正式版，2.* 为自举版。
 
+## 0.3.1
+- `winapi.co` 模块：以 `import … from "winapi.co"` 取代 `windows.h`，经 SDK 核验提供 215 个 Win32 API 原型、13 个结构/联合体布局、266 个常量；覆盖窗口创建、消息循环、绘制、文本度量等常用 GUI API（暂不含对话框、菜单、通用控件）。
+- Windows GUI 程序：`[[subsystem("windows")]]` 属性（或定义 `WinMain`）产出无控制台窗口程序。
+- Co 层增强：被 import 模块的 `public const int` / `public struct` 等可直接跨模块使用；指定初始化器支持链式设计符与 `union` 匿名成员。
+- C 兼容性扩充：标识符通用字符名（`\uXXXX`）、`u8`/`u`/`U`/`L` 前缀字符常量、`sizeof(字符串字面量)`、`static_assert` 多作用域、`[[nodiscard]]`/`[[noreturn]]`/`[[deprecated]]` 属性。
+- 诊断改进：`const` 只读强制、不完整类型前置诊断、`switch` 非常量 `case` 标签报错，措辞与主流编译器对齐。
+- 修复：全局初始化式误折为 null 导致的运行期崩溃等两族问题。
+- 发布包扁平为 `colang.exe + include/`（免装运行库、免额外配置）；Linux（WSL）构建打通。
+
 ## 0.3.0
 - 链接器内置：`-c` 产 COFF `.obj`，默认动作把目标文件链为可执行文件，**不再依赖外部 `clang`**。
 - 默认静态链接 CRT：产物 exe 免装 VC 运行库即可分发。

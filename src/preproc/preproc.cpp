@@ -604,9 +604,10 @@ private:
 		}
 		if (t.kind == TokKind::Char)
 		{
-			// 字符常量在 #if/#elif 中合法（§6.10.1）；与 parser/codegen 同源 co_decode_char 解码
+			// 字符常量在 #if/#elif 中合法（§6.10.1）；与 parser/codegen 同源 co_decode_char 解码，
+			//   UCN（\u/\U）同样先展开（与 parser 处同口径）。
 			++i_;
-			return static_cast<std::intmax_t>(co_decode_char(t.text));
+			return static_cast<std::intmax_t>(co_decode_char(co_expand_ucn(t.text)));
 		}
 		if (eat_punct("("))
 		{

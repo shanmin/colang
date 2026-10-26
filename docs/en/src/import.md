@@ -75,16 +75,18 @@ printf("mod initialized\n");
 
 Compilation and execution: `mod initialized` prints first (top-level statements emitted in centralized topological order), then the main source's top-level statements execute in source order; the exit code is set by a top-level `return`.
 
-## Current Implementation Boundary (0.3.0)
+## Current Implementation Boundary (0.3.1)
 
 Implemented:
 - Full `.co` consumption pipeline (lexing / parsing / loading / merging / visibility enforcement / linkage strip / entry-model integration);
 - Both named and `*` forms; the `as ModAlias` syntax slot is parsed but its qualified-access semantics are not yet active;
 - Centralized topological execution with first-load semantics; deduplication; cycle detection reporting the full chain;
-- Non-`public` imported symbols are forced to `InternalLinkage` during codegen.
+- Non-`public` imported symbols are forced to `InternalLinkage` during codegen;
+- Cross-module `public struct` / `union` / `enum` type references (usable as value-typed variables, member access, and address-of for passing);
+- Cross-module **bare tags**: a `public` `struct`/`union`/`enum` from an imported module may be referenced with the keyword omitted (`Point p;`; see the "struct / union / enum" chapter);
+- Cross-module **compile-time constants**: a `public const int` from an imported module (e.g. the `WM_*` series in `winapi.co`) is usable in the consumer as a plain read-only value, an array dimension, or a `switch` `case` label; a non-constant label is rejected with `case label does not reduce to an integer constant`.
 
 Not covered in this batch — deferred to later milestones:
 - Module-alias qualified access `m.f()` / `m.x` (parsed but not yet wired into Sema/Codegen);
 - `.obj` / `.dll` / `.so` as importable modules (they must carry compile-time declaration metadata);
-- Cross-module `struct` / `enum` type references (this batch targets functions, globals, and top-level statements);
 - `DllMain` synthesis and top-level body triggering under DLL outputs.

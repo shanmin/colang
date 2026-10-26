@@ -3,6 +3,15 @@
 This record lists major changes to the Co (colang) language/compiler by release version.
 Versioning policy: 0.* = development/test releases, 1.* = official releases, 2.* = bootstrap.
 
+## 0.3.1
+- The `winapi.co` module: `import … from "winapi.co"` replaces `windows.h`, providing 215 Win32 API prototypes, 13 struct/union layouts and 266 constants, all SDK-verified; covers common GUI APIs for window creation, message loops, drawing and text metrics (dialogs, menus and common controls not yet covered).
+- Windows GUI programs: the `[[subsystem("windows")]]` attribute (or defining `WinMain`) produces a console-less windowed program.
+- Co-layer enhancements: `public const int` / `public struct` etc. from an imported module can be used across modules directly; designated initializers support chained designators and anonymous `union` members.
+- C compatibility: universal character names (`\uXXXX`) in identifiers; `u8`/`u`/`U`/`L` prefixed character constants; `sizeof(string literal)`; `static_assert` in multiple scopes; the `[[nodiscard]]`/`[[noreturn]]`/`[[deprecated]]` attributes.
+- Diagnostics: `const` read-only enforcement, up-front incomplete-type diagnostics and rejection of non-constant `switch` `case` labels, with wording aligned to mainstream compilers.
+- Fixes: two families of runtime crashes caused by global initializers being mis-folded to null.
+- Release package flattened to `colang.exe + include/` (no runtime redistributable, no extra configuration); native Linux (WSL) build brought up.
+
 ## 0.3.0
 - Built-in linker: `-c` emits a COFF `.obj`, and the default action links the object into an executable — **no dependency on an external `clang`**.
 - Static CRT linked by default: the produced exe ships without requiring the VC runtime to be installed.

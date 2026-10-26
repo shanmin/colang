@@ -14,7 +14,7 @@
 
 - `public` 是 Co **唯一的可见性关键字**——没有 `private`，也不另设 `export`。它同时承担两件事：标记**模块接口**（可被其他模块 `import`）与**动态库导出**（写入 DLL 导出表）。
 - 未标 `public` 的定义仅在模块内部可见；标了 `public` 才对外可见、才可被导入。
-- `public` 可修饰顶层函数与全局变量；`class` / `struct` 及其成员的 `public` 修饰归 0.4.0。
+- `public` 可修饰顶层函数、全局变量与 `struct` / `union` / `enum` 类型（跨模块类型可见性自 0.3.0/0.3.1 可用）；`class` 及其成员的 `public` 修饰归 0.4.0。
 - imported 的非 `public` 符号在 codegen 强制 `InternalLinkage`——同模块内部引用可解析，但不注入外部可见的 LLVM 值。
 
 ## 模块的形态
@@ -46,10 +46,9 @@
 
 - 模块别名限定访问 `m.f()` / `m.x` 的完整语义（本批 `ModAlias` 语法位已解析但未启用）；
 - `.obj` / `.dll` / `.so` 作可导入模块的声明元数据载体；
-- 跨模块 `struct` / `enum` 类型引用（本批 `import` 主要面向函数、全局变量与顶层裸指令）；
 - DLL 场景下 `DllMain` 合成与顶层段触发时机。
 
-## 当前实装边界（0.3.0）
+## 当前实装边界（0.3.1）
 
 - **模块边界**：一个 `.co` 文件 = 一个模块；模块 key = 规范化绝对路径；跨文件同目录重名以路径唯一化区分。
 - **`public`**：顶层函数与全局变量已可用；产物为动态库时写入导出表（`DLLExportStorageClass`）；本批 `public` **不改 linkage**（非 public 仍默认 ExternalLinkage、但 imported 非 public 会被 codegen strip 到 `InternalLinkage`）。
@@ -57,3 +56,5 @@
 - **动态库产物**：无 `-shared` 选项，编译器按 `-o` 输出路径的扩展名自动切换 DLL / exe 链接模式；输出取为 `*.dll` 即产出含导出表的动态库（并随基名生成导入库 `*.lib`，Windows 实测）。
 - **多文件程序**：经由 `import` 组合多个 `.co` 源文件（0.3.0 已可用）。`-c` 产出的单个 `.obj` 用于查看编译结果；把多个目标文件直接链接为可执行文件的能力尚在学习中（见「编译器命令行」章节）。
 - **模块顶层代码执行**：见「import（模块导入）」章节；本批只覆盖 `.co` 消费路径。
+- **跨模块类型引用**：从模块 `import` 的 `public struct` / `union` / `enum` 可作值类型（成员访问、取地址传参、`sizeof` 均正常），消费方还可**省略关键字裸用标签**（`Point p;`，自 0.3.1）。
+- **跨模块编译期常量**：被导入模块的 `public const int` 在消费方可作只读值、数组维度、`switch` 的 `case` 标签（自 0.3.1，`winapi.co` 的 `WM_*` 系列即此用法）。

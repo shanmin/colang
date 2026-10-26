@@ -59,6 +59,16 @@ struct CType
 	TypeKind kind = TypeKind::Int;
 	bool is_const = false;
 
+	// —— P253：诊断拼写专用的限定符/别名位 ——
+	// 仅供 `describe_type` 还原 clang 形拼写；**不参与**大小、对齐、布局与 `types_compatible`
+	//   判定，故对代码生成零影响（is_const 因其历史职责仍兼作 `_Generic`/lvalue 判定位）。
+	bool is_volatile = false; // 修前 volatile 在解析期被整组丢弃（`volatile int` 打印成 `int`）
+	bool is_restrict = false; // 仅指针位有意义（修前与 const 共用 is_const 占位、不可区分）
+	bool is_atomic = false;   // `_Atomic`：指针位 clang 拼作 `_Atomic(T)`
+	// 使用点书写的 typedef 别名（可含使用点外加的 const/volatile 前缀，如 `const volatile MyInt`）。
+	//   空串 = 非别名类型。别名仅覆盖整棵子树，故拼写时直接原样输出并另出去别名形（`aka`）。
+	std::string alias;
+
 	// Pointer / Array：元素类型
 	CTypePtr base;
 
@@ -103,6 +113,29 @@ inline CTypePtr make_pointer(CTypePtr pointee)
 	return t;
 }
 
+inline CTypePtr make_array(CTypePtr elem, std::size_t n)
+{
+	auto t = std::make_shared<CType>();
+	t->kind = TypeKind::Array;
+	t->base = std::move(elem);
+	t->array_size = n;
+	return t;
+}
+
+// 字符串字面量作**数组对象**时的类型（§6.4.5p6/p7）：char[N]/wchar_t[N]/char32_t[N]，N 含 '\0'。
+// 仅用于**不施加数组→指针退化**的语境（sizeof；§6.3.2.1 的例外）；其余表达式语境仍按
+//   resolve_expr_type / gen_expr 退化为元素指针（如 `char *p = "abc"`、`_Generic("abc", char*:…)`）。
+inline CTypePtr ctype_of_string_literal(const std::string &raw)
+{
+	const std::size_t n = co_str_lit_len(raw);
+	switch (co_str_lit_width(raw))
+	{
+	case 2: return make_array(make_type(TypeKind::WChar), n);
+	case 4: return make_array(make_type(TypeKind::Char32), n);
+	default: return make_array(make_type(TypeKind::Char), n);
+	}
+}
+
 inline CTypePtr make_func_type(CTypePtr ret, std::vector<CTypePtr> ps, bool variadic)
 {
 	auto t = std::make_shared<CType>();
@@ -138,6 +171,15 @@ enum class ExprKind
 struct Expr;
 using ExprPtr = std::shared_ptr<Expr>;
 
+// 指定初始化器的一个设计符步（C11 §6.7.9p6 designator-list）：`.name` 或 `[index]`。
+// 多个设计符可串接成链，如 `.ps[1].y`。
+struct DesigStep
+{
+	bool is_index = false;      // true = [index]，false = .name
+	std::string name;           // is_index == false 时有效
+	std::intmax_t index = 0;    // is_index == true 时有效（-1 = 下标解析失败）
+};
+
 struct Expr
 {
 	ExprKind kind = ExprKind::IntLiteral;
@@ -146,6 +188,10 @@ struct Expr
 
 	// IntLiteral / CharLiteral
 	std::intmax_t int_val = 0;
+
+	// CharLiteral：编码前缀 "u8"/"u"/"U"/"L"（无前缀为空）。
+	//   按 ISO C §6.4.4.4，前缀决定字面量类型；parser 据此置 type 字段。
+	std::string char_prefix;
 
 	// FloatLiteral
 	double float_val = 0.0;
@@ -166,8 +212,10 @@ struct Expr
 	bool postfix = false; // Unary ++/-- 后缀标志
 
 	// 指定初始化器（C99）
-	int desig_index = -1;       // [idx] 数组下标（-1 = 无）
-	std::string desig_field;    // .member 成员名（空 = 无）
+	int desig_index = -1;       // [idx] 数组下标（-1 = 无）；链式时为首级
+	std::string desig_field;    // .member 成员名（空 = 无）；链式时为首级
+	// 完整设计符链（P237）：链长 ≥ 2 时走链式路径，首级仍回填上面两个兼容字段
+	std::vector<DesigStep> desig_chain;
 };
 
 // ============================================================
@@ -250,8 +298,15 @@ struct DeclAttributes
 {
 	bool deprecated = false;
 	std::string deprecated_msg;   // [[deprecated("msg")]] 的消息（可空）
+	// P249：C23 [[nodiscard]] / [[noreturn]]（本批落地为真实语义，见 sema）
+	bool nodiscard = false;
+	std::string nodiscard_msg;    // [[nodiscard("msg")]] 的理由（可空）
+	bool noreturn_attr = false;
 	bool has_lib = false;
 	std::string lib_name;         // [[lib("user32")]] 的链接名（不含 .lib 后缀/路径）
+	// P229 Co 层新属性：[[subsystem("windows")]] → 链接子系统切 Windows GUI（无控制台）。
+	//   仅入口函数（WinMain/main）标注有效；由 codegen 汇聚后经 CompileState 交链接层。
+	bool subsystem_windows = false;
 };
 
 // ============================================================
@@ -274,7 +329,12 @@ struct FuncDecl
 	// P214 C23 属性：[[deprecated]] / [[lib("X")]]
 	bool is_deprecated = false;
 	std::string deprecated_msg;
+	// P249：[[nodiscard]]（返回值不得丢弃）/ [[noreturn]]（永不返回）
+	bool is_nodiscard = false;
+	std::string nodiscard_msg;
+	bool is_noreturn = false;
 	std::string lib_name;    // 空 = 未标注 [[lib]]
+	bool subsystem_windows = false;  // P229：[[subsystem("windows")]] → Windows GUI 子系统
 	StmtPtr body; // CompoundStmt if definition; nullptr if declaration only
 	SourceLoc loc;
 	// P212 loader 归属标记：源模块规范化绝对路径 key；空串 = 主源 TU 本体。
@@ -295,6 +355,11 @@ struct GlobalVar
 	std::string deprecated_msg;
 	std::string lib_name;
 	unsigned align = 0;      // C23 _Alignas 强制对齐（字节；0 = 未指定）
+	// P252：`_Alignas` 跨声明一致性（§6.7.2.1p4）所需事实（比对在 sema 侧做）
+	bool align_specified = false; // 本条声明是否出现过 _Alignas（含 _Alignas(0)；与 align==0「未指定」不可混同）
+	unsigned align_effective = 0; // 本条的结果对齐 = max(_Alignas 值, 类型自然对齐)（clang「A vs B」取此值）
+	SourceLoc align_spec_loc;     // _Alignas 关键字位置（「redeclaration has different alignment」指此列）
+	SourceLoc ident_loc;          // 声明符标识符位置（「must be specified on definition」指此列）
 	SourceLoc loc;
 	std::string source_module_key;  // P212 同 FuncDecl
 };
@@ -379,6 +444,10 @@ struct TranslationUnit
 {
 	std::vector<FuncDecl> funcs;
 	std::vector<GlobalVar> globals;
+	// P256：本模块「public const int 全局名 → 已折常量值」（parser 在全局声明处折叠填充）。
+	//   供跨模块 import 时 harvest_const_seeds 采集、在消费方 parse 期把 import 的 public const int
+	//   作 case 标签/常量表达式穿透求值（此时被并入主 TU 的 merge_imports 尚未运行）。
+	std::vector<std::pair<std::string, std::int64_t>> const_globals;
 	std::vector<StructDef> structs;
 	std::vector<EnumDef> enums;
 	// P3+: union decls (folded into structs with is_union flag)

@@ -35,15 +35,44 @@ bool compile(const CompileOptions &opts, CompileState &state, std::vector<Error>
 	{
 		return true;
 	}
-	if (!parse(opts, state, errors))
+	// P233 Co 层：`.co` 新面若含顶层 import，走「预扫 import → 先加载采集标签种子 →
+	//   带种子单次 parse 主源 → 合并」，使跨模块 public struct/union/enum 可裸用作类型。
+	//   `.c` 与无 import 的 `.co` 保持原「parse → load_and_merge」路径、逐字不变。
+	bool is_co = false;
 	{
-		return false;
+		const std::string &sp = opts.source_path;
+		is_co = sp.size() >= 3 &&
+			(sp.compare(sp.size() - 3, 3, ".co") == 0 || sp.compare(sp.size() - 3, 3, ".CO") == 0);
 	}
-	// P212 Co 层：递归加载并合并 imports（拓序前插子模块 AST 到主 TU）。
-	//   主 TU.imports 为空时快速返回、不做任何修改；-E 模式不会进到此处（前面已短路）。
-	if (!load_and_merge_imports(opts, *state.ast, errors))
+	bool seeded = false;
+	if (is_co)
 	{
-		return false;
+		std::vector<ImportDecl> root_imports;
+		collect_imports(state, root_imports); // 复用 parse_import_decl、只提取顶层 import
+		if (!root_imports.empty())
+		{
+			ImportBundle bundle;
+			if (!load_imports(opts, root_imports, bundle, errors))
+				return false;
+			if (!parse(opts, state, errors, bundle.tag_seeds, bundle.const_seeds))
+				return false;
+			if (!merge_imports(opts, *state.ast, bundle))
+				return false;
+			seeded = true;
+		}
+	}
+	if (!seeded)
+	{
+		if (!parse(opts, state, errors))
+		{
+			return false;
+		}
+		// P212 Co 层：递归加载并合并 imports（拓序前插子模块 AST 到主 TU）。
+		//   主 TU.imports 为空时快速返回、不做任何修改；-E 模式不会进到此处（前面已短路）。
+		if (!load_and_merge_imports(opts, *state.ast, errors))
+		{
+			return false;
+		}
 	}
 	if (!analyze(opts, state, errors))
 	{

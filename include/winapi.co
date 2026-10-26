@@ -1,0 +1,668 @@
+// winapi.co — Win32 API 的 Co 模块化封装（起步集 · 0.3.0 winapi.co 落地）
+//
+// 定位：以 `.co` 模块替代传统 `windows.h` 的「声明 + 库归属」层，供 `import` 按名取用。
+//   本模块只给「无 body 外部原型」：`public` 让符号可被 import 方引用（colang 对无 body
+//   原型不注入 DLL /EXPORT），`[[lib("X")]]` 声明外部实现来自哪个库（→ COFF .drectve
+//   /DEFAULTLIB）。kernel32 系符号经 CRT 默认库直链、无需 [[lib]]。
+//
+// 覆盖范围（起步）：函数封装 + 少量 Win32 结构布局（public struct，供 import 方按系统 ABI 构造/传参）。
+//   DLL 导出的数据符号（只有 __imp_X、无 thunk）与 per-symbol 精确绑定属未建模/后置项，
+//   故此处不纳入任何全局数据变量。全量 API 覆盖长期走 win32metadata + windows-rs 式自动生成、非手写。
+//
+// W 系原型参数用 const wchar_t*，依赖「右值宽字符串字面量降 UTF-16」地基
+//   （调用方以 L"…" 传参，据此报 wchar_t* 并落 UTF-16 码元）。
+//
+// 声明排版（详 PROJECT.md §三 第 9 条）：函数返回指针的 `*` 贴类型侧（`void* f(...)`），
+//   参数/变量指针的 `*` 贴名字侧（`void *p`）。二者解析等价、纯可读性取向。
+//
+// 排列顺序：各库段内按函数名字母序（case-sensitive，A/W 变体自然相邻）；段序 kernel32→user32→gdi32。
+
+// —— Win32 结构布局（public · x64/LLP64 自然对齐；按依赖序 POINT→RECT→MSG→PAINTSTRUCT→WNDCLASS→SYSTEMTIME→LARGE_INTEGER→SIZE→LOGPEN→WNDCLASSEX）——
+// LONG=long(4)·DWORD=unsigned long(4)·句柄/PTR=void*(8)·LPARAM=long long(8)。原型里句柄仍作 void*；已定义布局的 10 类型（9 struct：POINT/RECT/MSG/PAINTSTRUCT/WNDCLASS/SYSTEMTIME/SIZE/LOGPEN/WNDCLASSEX + 1 union：LARGE_INTEGER）指针用具体 struct*/union*（2026-10-23 收紧；2026-10-24 补 SYSTEMTIME 收紧 GetSystemTime/GetLocalTime、补 LARGE_INTEGER〔union+匿名 struct、colang 支持 union〕收紧 QueryPerformance*）。TEXTMETRIC 对应形参仍 void*（字段多、手写布局易错且无运行期校验、交 win32metadata 自动生成）；其余尚无布局的结构亦仍 void*。
+public struct POINT
+{
+	long x;
+	long y;
+};
+public struct RECT
+{
+	long left;
+	long top;
+	long right;
+	long bottom;
+};
+public struct MSG
+{
+	void *hwnd;
+	unsigned long message;
+	void *wParam;
+	long long lParam;
+	unsigned long time;
+	struct POINT pt;
+};
+public struct PAINTSTRUCT
+{
+	void *hdc;
+	int fErase;
+	struct RECT rcPaint;
+	int fRestore;
+	int fIncUpdate;
+	unsigned char rgbReserved[32];
+};
+public struct WNDCLASS
+{
+	unsigned long style;
+	long long (*lpfnWndProc)(void *, unsigned int, void *, long long);
+	int cbClsExtra;
+	int cbWndExtra;
+	void *hInstance;
+	void *hIcon;
+	void *hCursor;
+	void *hbrBackground;
+	const char *lpszMenuName;
+	const char *lpszClassName;
+};
+public struct SYSTEMTIME
+{
+	unsigned short wYear;
+	unsigned short wMonth;
+	unsigned short wDayOfWeek;
+	unsigned short wDay;
+	unsigned short wHour;
+	unsigned short wMinute;
+	unsigned short wSecond;
+	unsigned short wMilliseconds;
+};
+public union LARGE_INTEGER
+{
+	struct { unsigned long LowPart; long HighPart; };
+	long long QuadPart;
+};
+public struct SIZE
+{
+	long cx;
+	long cy;
+};
+public struct LOGPEN
+{
+	struct POINT poPenLocation;
+	int iPenWidth;
+	unsigned long oPenColor;
+};
+// WNDCLASSEX 按 A 系建模（lpszMenuName/lpszClassName 取 const char*，与既存 WNDCLASS 同风格），配 RegisterClassExA 使用；cbSize 须由调用方填 sizeof。
+public struct WNDCLASSEX
+{
+	unsigned long cbSize;
+	unsigned long style;
+	long long (*lpfnWndProc)(void *, unsigned int, void *, long long);
+	int cbClsExtra;
+	int cbWndExtra;
+	void *hInstance;
+	void *hIcon;
+	void *hCursor;
+	void *hbrBackground;
+	const char *lpszMenuName;
+	const char *lpszClassName;
+	void *hIconSm;
+};
+// WNDCLASSEXW = WNDCLASSEX 的宽字符版（lpszMenuName/lpszClassName 取 const wchar_t*），配 RegisterClassExW 使用；布局与 SDK tagWNDCLASSEXW 逐字段一致（cbSize/style 为 UINT、lpfnWndProc 为 WNDPROC、余为句柄 void*）；cbSize 须由调用方填 sizeof。
+public struct WNDCLASSEXW
+{
+	unsigned long cbSize;
+	unsigned long style;
+	long long (*lpfnWndProc)(void *, unsigned int, void *, long long);
+	int cbClsExtra;
+	int cbWndExtra;
+	void *hInstance;
+	void *hIcon;
+	void *hCursor;
+	void *hbrBackground;
+	const wchar_t *lpszMenuName;
+	const wchar_t *lpszClassName;
+	void *hIconSm;
+};
+// MINMAXINFO：WM_GETMINMAXINFO 的 lParam 指向本结构（5 个 POINT）；布局对照 SDK tagMINMAXINFO。
+public struct MINMAXINFO
+{
+	struct POINT ptReserved;
+	struct POINT ptMaxSize;
+	struct POINT ptMaxPosition;
+	struct POINT ptMinTrackSize;
+	struct POINT ptMaxTrackSize;
+};
+// MONITORINFO：GetMonitorInfoW 的第二参数（cbSize 需先填 sizeof）；布局对照 SDK tagMONITORINFO（DWORD cbSize / RECT rcMonitor / RECT rcWork / DWORD dwFlags）。
+public struct MONITORINFO
+{
+	unsigned long cbSize;
+	struct RECT rcMonitor;
+	struct RECT rcWork;
+	unsigned long dwFlags;
+};
+
+// —— Win32 整型常量宏（P225/P226 · `public const int` 起步子集，供 import 按名取用、替代消费方十进制硬编码）——
+//   仅覆盖整型常量宏；MAKEINTRESOURCE/字符串/指针型宏仍需别的机制或维持硬编码（长期交 win32metadata 自动生成）。
+//   机制：被 import 的 const int 全局可作运行期读取/数组维度/switch case 标签（P256：parser eval_const_int 穿透 const 全局/局部 VarRef；常量种子经 loader const_seeds 前置入主源解析期）。
+//   非负哨兵（如 INVALID_FILE_ATTRIBUTES=0xFFFFFFFF）按 `const unsigned long` 声明与消费方同型，免符号位转换。
+//   注：const 限定当前不强制只读（本仓 sema 少诊断），按只读约定使用。
+public const int COLOR_WINDOW = 5;
+public const int CP_UTF8 = 65001;
+public const int CS_HREDRAW = 2;
+public const int CS_VREDRAW = 1;
+public const int CW_USEDEFAULT = -2147483648;
+public const int IDC_ARROW = 32512;
+public const unsigned long INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
+public const int LOGPIXELSX = 88;
+public const int PATCOPY = 0x00F00062;
+public const int PM_NOREMOVE = 0;
+public const int PM_REMOVE = 1;
+public const int SM_CXSCREEN = 78;
+public const int SRCCOPY = 0x00CC0020;
+public const int SW_SHOW = 5;
+public const int VK_SHIFT = 0x10;
+public const int WHITE_BRUSH = 0;
+public const int WM_DESTROY = 2;
+public const int WM_PAINT = 15;
+public const int WM_QUIT = 18;
+public const int WS_OVERLAPPEDWINDOW = 0xCF0000;
+
+// —— Win32 GUI 常量扩展（批次 VII · 范围 A 可发布子集；取值逐个对照 Windows SDK winuser.h / wingdi.h〔10.0.26100.0〕核对）——
+// 窗口样式 WS_*（dwStyle 为 DWORD；仅 WS_POPUP 高位溢出 int，按 const unsigned long 声明，余皆落 int 正区间）
+public const int WS_OVERLAPPED = 0x00000000;
+public const unsigned long WS_POPUP = 0x80000000;
+public const int WS_CHILD = 0x40000000;
+public const int WS_VISIBLE = 0x10000000;
+public const int WS_DISABLED = 0x08000000;
+public const int WS_CAPTION = 0x00C00000;
+public const int WS_BORDER = 0x00800000;
+public const int WS_DLGFRAME = 0x00400000;
+public const int WS_VSCROLL = 0x00200000;
+public const int WS_HSCROLL = 0x00100000;
+public const int WS_SYSMENU = 0x00080000;
+public const int WS_THICKFRAME = 0x00040000;
+public const int WS_MINIMIZEBOX = 0x00020000;
+public const int WS_MAXIMIZEBOX = 0x00010000;
+public const int WS_MINIMIZE = 0x20000000;
+public const int WS_MAXIMIZE = 0x01000000;
+public const int WS_CLIPSIBLINGS = 0x04000000;
+public const int WS_CLIPCHILDREN = 0x02000000;
+public const int WS_GROUP = 0x00020000;
+public const int WS_TABSTOP = 0x00010000;
+// 扩展窗口样式 WS_EX_*
+public const int WS_EX_DLGMODALFRAME = 0x00000001;
+public const int WS_EX_TOPMOST = 0x00000008;
+public const int WS_EX_TRANSPARENT = 0x00000020;
+public const int WS_EX_TOOLWINDOW = 0x00000080;
+public const int WS_EX_WINDOWEDGE = 0x00000100;
+public const int WS_EX_CLIENTEDGE = 0x00000200;
+public const int WS_EX_STATICEDGE = 0x00020000;
+// ShowWindow 命令 SW_*（SW_SHOW=5 已存于上方）
+public const int SW_HIDE = 0;
+public const int SW_SHOWNORMAL = 1;
+public const int SW_SHOWMINIMIZED = 2;
+public const int SW_SHOWMAXIMIZED = 3;
+public const int SW_SHOWNOACTIVATE = 4;
+public const int SW_SHOWMINNOACTIVE = 7;
+public const int SW_SHOWNA = 8;
+public const int SW_RESTORE = 9;
+public const int SW_SHOWDEFAULT = 10;
+// 窗口消息 WM_*（WM_DESTROY=2/WM_PAINT=15/WM_QUIT=18 已存于上方）
+public const int WM_NULL = 0x0000;
+public const int WM_CREATE = 0x0001;
+public const int WM_MOVE = 0x0003;
+public const int WM_SIZE = 0x0005;
+public const int WM_ACTIVATE = 0x0006;
+public const int WM_SETFOCUS = 0x0007;
+public const int WM_KILLFOCUS = 0x0008;
+public const int WM_ENABLE = 0x000A;
+public const int WM_SETTEXT = 0x000C;
+public const int WM_GETTEXT = 0x000D;
+public const int WM_GETTEXTLENGTH = 0x000E;
+public const int WM_CLOSE = 0x0010;
+public const int WM_QUERYENDSESSION = 0x0011;
+public const int WM_ERASEBKGND = 0x0014;
+public const int WM_SYSCOLORCHANGE = 0x0015;
+public const int WM_ENDSESSION = 0x0016;
+public const int WM_SHOWWINDOW = 0x0018;
+public const int WM_SETCURSOR = 0x0020;
+public const int WM_GETMINMAXINFO = 0x0024;
+public const int WM_DRAWITEM = 0x002B;
+public const int WM_MEASUREITEM = 0x002C;
+public const int WM_WINDOWPOSCHANGING = 0x0046;
+public const int WM_WINDOWPOSCHANGED = 0x0047;
+public const int WM_NCCREATE = 0x0081;
+public const int WM_NCDESTROY = 0x0082;
+public const int WM_NCCALCSIZE = 0x0083;
+public const int WM_NCHITTEST = 0x0084;
+public const int WM_NCPAINT = 0x0085;
+public const int WM_NCACTIVATE = 0x0086;
+public const int WM_GETDLGCODE = 0x0087;
+public const int WM_KEYDOWN = 0x0100;
+public const int WM_KEYUP = 0x0101;
+public const int WM_CHAR = 0x0102;
+public const int WM_SYSKEYDOWN = 0x0104;
+public const int WM_SYSKEYUP = 0x0105;
+public const int WM_SYSCHAR = 0x0106;
+public const int WM_TIMER = 0x0113;
+public const int WM_MOUSEMOVE = 0x0200;
+public const int WM_LBUTTONDOWN = 0x0201;
+public const int WM_LBUTTONUP = 0x0202;
+public const int WM_LBUTTONDBLCLK = 0x0203;
+public const int WM_RBUTTONDOWN = 0x0204;
+public const int WM_RBUTTONUP = 0x0205;
+public const int WM_MBUTTONDOWN = 0x0207;
+public const int WM_MBUTTONUP = 0x0208;
+public const int WM_MOUSEWHEEL = 0x020A;
+// Get/SetWindowLong 索引（x64 指针宽度索引用 GWLP_*；均负值，按 const int）
+public const int GWL_WNDPROC = -4;
+public const int GWL_HINSTANCE = -6;
+public const int GWL_HWNDPARENT = -8;
+public const int GWL_ID = -12;
+public const int GWL_STYLE = -16;
+public const int GWL_EXSTYLE = -20;
+public const int GWL_USERDATA = -21;
+public const int GWLP_WNDPROC = -4;
+public const int GWLP_HINSTANCE = -6;
+public const int GWLP_HWNDPARENT = -8;
+public const int GWLP_ID = -12;
+public const int GWLP_USERDATA = -21;
+// DrawText 格式 DT_*
+public const int DT_TOP = 0x00000000;
+public const int DT_LEFT = 0x00000000;
+public const int DT_CENTER = 0x00000001;
+public const int DT_RIGHT = 0x00000002;
+public const int DT_VCENTER = 0x00000004;
+public const int DT_BOTTOM = 0x00000008;
+public const int DT_WORDBREAK = 0x00000010;
+public const int DT_SINGLELINE = 0x00000020;
+public const int DT_EXPANDTABS = 0x00000040;
+public const int DT_CALCRECT = 0x00000400;
+public const int DT_NOCLIP = 0x00000100;
+public const int DT_NOPREFIX = 0x00000800;
+public const int DT_INTERNAL = 0x00001000;
+public const int DT_EDITCONTROL = 0x00002000;
+public const int DT_PATH_ELLIPSIS = 0x00004000;
+public const int DT_END_ELLIPSIS = 0x00008000;
+public const int DT_RTLREADING = 0x00020000;
+public const int DT_WORD_ELLIPSIS = 0x00040000;
+// 画笔样式 PS_* 与端点/接头
+public const int PS_SOLID = 0;
+public const int PS_DASH = 1;
+public const int PS_DOT = 2;
+public const int PS_DASHDOT = 3;
+public const int PS_DASHDOTDOT = 4;
+public const int PS_NULL = 5;
+public const int PS_INSIDEFRAME = 6;
+public const int PS_ALTERNATE = 8;
+public const int PS_ENDCAP_ROUND = 0x00000000;
+public const int PS_ENDCAP_SQUARE = 0x00000100;
+public const int PS_ENDCAP_FLAT = 0x00000200;
+public const int PS_JOIN_ROUND = 0x00000000;
+public const int PS_JOIN_BEVEL = 0x00001000;
+public const int PS_JOIN_MITER = 0x00002000;
+// 映射模式 MM_*
+public const int MM_TEXT = 1;
+public const int MM_LOMETRIC = 2;
+public const int MM_HIMETRIC = 3;
+public const int MM_LOENGLISH = 4;
+public const int MM_HIENGLISH = 5;
+public const int MM_ISOTROPIC = 7;
+public const int MM_ANISOTROPIC = 8;
+// GetStockObject 索引（WHITE_BRUSH=0 已存于上方）
+public const int LTGRAY_BRUSH = 1;
+public const int GRAY_BRUSH = 2;
+public const int DKGRAY_BRUSH = 3;
+public const int BLACK_BRUSH = 4;
+public const int NULL_BRUSH = 5;
+public const int WHITE_PEN = 6;
+public const int BLACK_PEN = 7;
+public const int NULL_PEN = 8;
+public const int OEM_FIXED_FONT = 10;
+public const int ANSI_FIXED_FONT = 11;
+public const int ANSI_VAR_FONT = 12;
+public const int SYSTEM_FONT = 13;
+public const int DEVICE_DEFAULT_FONT = 14;
+public const int DEFAULT_PALETTE = 15;
+public const int DEFAULT_GUI_FONT = 17;
+// 光栅操作 ROP2（dwRop 为 DWORD，按 const unsigned long；SRCCOPY/PATCOPY 已存于上方）
+public const unsigned long BLACKNESS = 0x00000042;
+public const unsigned long NOTSRCCOPY = 0x00330008;
+public const unsigned long SRCERASE = 0x00440328;
+public const unsigned long DSTINVERT = 0x00550009;
+public const unsigned long MERGECOPY = 0x00C000CA;
+public const unsigned long MERGEPAINT = 0x00BB0226;
+public const unsigned long SRCINVERT = 0x00660046;
+public const unsigned long SRCAND = 0x008800C6;
+public const unsigned long SRCPAINT = 0x00EE0086;
+// 文本对齐 TA_*（SetTextAlign）与背景模式 BkMode
+public const int TA_LEFT = 0;
+public const int TA_TOP = 0;
+public const int TA_RIGHT = 2;
+public const int TA_CENTER = 6;
+public const int TA_BOTTOM = 8;
+public const int TA_BASELINE = 24;
+public const int TRANSPARENT = 1;
+public const int OPAQUE = 2;
+// SetStretchBltMode 模式
+public const int BLACKONWHITE = 1;
+public const int WHITEONBLACK = 2;
+// GetSysColor 索引 COLOR_*（COLOR_WINDOW=5 已存于上方）
+public const int COLOR_SCROLLBAR = 0;
+public const int COLOR_BACKGROUND = 1;
+public const int COLOR_ACTIVECAPTION = 2;
+public const int COLOR_INACTIVECAPTION = 3;
+public const int COLOR_MENU = 4;
+public const int COLOR_WINDOWFRAME = 6;
+public const int COLOR_MENUTEXT = 7;
+public const int COLOR_WINDOWTEXT = 8;
+public const int COLOR_CAPTIONTEXT = 9;
+public const int COLOR_ACTIVEBORDER = 10;
+public const int COLOR_INACTIVEBORDER = 11;
+public const int COLOR_APPWORKSPACE = 12;
+public const int COLOR_HIGHLIGHT = 13;
+public const int COLOR_HIGHLIGHTTEXT = 14;
+public const int COLOR_BTNFACE = 15;
+public const int COLOR_BTNSHADOW = 16;
+public const int COLOR_GRAYTEXT = 17;
+public const int COLOR_BTNTEXT = 18;
+public const int COLOR_INACTIVECAPTIONTEXT = 19;
+public const int COLOR_BTNHIGHLIGHT = 20;
+
+// —— Win32 常量扩展（批次 VIII · GUI/编辑框/菜单/DPI/字体子集；取值逐个对照 Windows SDK〔10.0.26100.0〕winuser.h / wingdi.h / windef.h / MultiMon.h / Richedit.h 核对，别名已摊平为整数）——
+// 窗口消息 WM_*（续，接批次 VII）
+public const int WM_SETFONT = 0x0030;
+public const int WM_DISPLAYCHANGE = 0x007E;
+public const int WM_NCLBUTTONDOWN = 0x00A1;
+public const int WM_NCLBUTTONDBLCLK = 0x00A3;
+public const int WM_COMMAND = 0x0111;
+public const int WM_CTLCOLORSTATIC = 0x0138;
+public const int WM_EXITSIZEMOVE = 0x0232;
+public const int WM_DPICHANGED = 0x02E0;
+public const int WM_APP = 0x8000;
+// 编辑框消息 EM_*（winuser.h 经典 EDIT 控件区间；EM_SCROLLCARET 取 0x00B7，非 Richedit 扩展）
+public const int EM_SETSEL = 0x00B1;
+public const int EM_SCROLLCARET = 0x00B7;
+public const int EM_GETLINECOUNT = 0x00BA;
+public const int EM_LINEINDEX = 0x00BB;
+public const int EM_REPLACESEL = 0x00C2;
+// 编辑框样式 ES_*
+public const int ES_MULTILINE = 0x0004;
+public const int ES_AUTOVSCROLL = 0x0040;
+public const int ES_AUTOHSCROLL = 0x0080;
+public const int ES_READONLY = 0x0800;
+// 扩展窗口样式（续）
+public const int WS_EX_LAYERED = 0x00080000;
+// SetWindowPos 标志 SWP_*
+public const int SWP_NOSIZE = 0x0001;
+public const int SWP_NOMOVE = 0x0002;
+public const int SWP_NOZORDER = 0x0004;
+public const int SWP_NOACTIVATE = 0x0010;
+public const int SWP_FRAMECHANGED = 0x0020;
+// SetWindowPos 插入位置伪句柄：真身为 ((HWND)-1)/((HWND)-2)，按整型宏存 -1/-2，调用处以 (void*)HWND_TOPMOST 传参
+public const int HWND_TOPMOST = -1;
+public const int HWND_NOTOPMOST = -2;
+// ShowWindow 命令（续）
+public const int SW_MINIMIZE = 6;
+// 系统度量 SM_*（SM_CXSIZEFRAME 系 SM_CXFRAME 别名，摊平为 32）
+public const int SM_CXSIZEFRAME = 32;
+public const int SM_CXPADDEDBORDER = 92;
+// 菜单 TrackPopupMenu 标志 TPM_*
+public const int TPM_LEFTALIGN = 0x0000;
+public const int TPM_TOPALIGN = 0x0000;
+public const int TPM_RETURNCMD = 0x0100;
+// 菜单条目标志 MF_*
+public const int MF_STRING = 0x0000;
+public const int MF_SEPARATOR = 0x0800;
+public const int MF_CHECKED = 0x0008;
+// 光标/图标标准资源：真身 MAKEINTRESOURCE(n)，按整型宏存裸值（同既有 IDC_ARROW），调用处 LoadCursorW/LoadIconW 以 (void*)IDC_* 传参
+public const int IDC_SIZENS = 32645;
+public const int IDI_APPLICATION = 32512;
+// 系统颜色索引（COLOR_3DFACE 系 COLOR_BTNFACE 别名，摊平为 15）
+public const int COLOR_3DFACE = 15;
+// 字体创建参数（wingdi.h）：OUT_TT_PRECIS 真值 = 4（非 10，10 为 OUT_PS_ONLY_PRECIS）；FF_MODERN = 0x30
+public const int FW_NORMAL = 400;
+public const int DEFAULT_CHARSET = 1;
+public const int OUT_DEFAULT_PRECIS = 0;
+public const int OUT_TT_PRECIS = 4;
+public const int CLIP_DEFAULT_PRECIS = 0;
+public const int CLEARTYPE_QUALITY = 5;
+public const int DEFAULT_PITCH = 0;
+public const int FIXED_PITCH = 1;
+public const int FF_DONTCARE = 0;
+public const int FF_MODERN = 0x30;
+// WM_ACTIVATE wParam（WA_*）与 WM_NCHITTEST 返回值（HT_*）
+public const int WA_INACTIVE = 0;
+public const int HTSYSMENU = 3;
+public const int HTCAPTION = 2;
+public const int HTCLIENT = 1;
+public const int HTCLOSE = 20;
+// 分层窗口属性标志（SetLayeredWindowAttributes）
+public const int LWA_ALPHA = 0x00000002;
+// 多显示器查找标志（MonitorFromRect/MonitorFromWindow）
+public const int MONITOR_DEFAULTTONEAREST = 2;
+// DPI 感知上下文伪句柄：真身 ((DPI_AWARENESS_CONTEXT)-4)（windef.h），按整型宏存 -4，调用 SetProcessDpiAwarenessContext 以 (void*) 传参
+public const int DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4;
+// MessageBox 样式 MB_*（MB_ICONINFORMATION 系 MB_ICONASTERISK 别名，摊平为 0x40）
+public const int MB_OK = 0x00000000;
+public const int MB_ICONINFORMATION = 0x00000040;
+
+// —— kernel32：CRT 默认拉入，无需 [[lib]]（段内按函数名字母序）——
+public int CloseHandle(void *hObject);
+public void ExitProcess(unsigned int uExitCode);
+public int FreeConsole(void);
+public int FreeLibrary(void *hModule);
+public char* GetCommandLineA(void);
+public wchar_t* GetCommandLineW(void);
+public int GetComputerNameA(char *lpBuffer, unsigned long *nSize);
+public int GetComputerNameW(wchar_t *lpBuffer, unsigned long *nSize);
+public void* GetConsoleWindow(void);
+public unsigned long GetCurrentDirectoryA(unsigned long nBufferLength, char *lpBuffer);
+public unsigned long GetCurrentDirectoryW(unsigned long nBufferLength, wchar_t *lpBuffer);
+public void* GetCurrentProcess(void);
+public unsigned long GetCurrentProcessId(void);
+public unsigned long GetCurrentThreadId(void);
+public unsigned long GetEnvironmentVariableA(const char *lpName, char *lpBuffer, unsigned long nSize);
+public unsigned long GetEnvironmentVariableW(const wchar_t *lpName, wchar_t *lpBuffer, unsigned long nSize);
+public unsigned long GetFileAttributesA(const char *lpFileName);
+public unsigned long GetFileAttributesW(const wchar_t *lpFileName);
+public unsigned long GetFullPathNameA(const char *lpFileName, unsigned long nBufferLength, char *lpBuffer, char **lpFilePart);
+public unsigned long GetFullPathNameW(const wchar_t *lpFileName, unsigned long nBufferLength, wchar_t *lpBuffer, wchar_t **lpFilePart);
+public unsigned long GetLastError(void);
+public void GetLocalTime(struct SYSTEMTIME *lpSystemTime);
+public unsigned int GetModuleFileNameA(void *hModule, char *lpFilename, unsigned int n);
+public unsigned int GetModuleFileNameW(void *hModule, wchar_t *lpFilename, unsigned int n);
+public void* GetModuleHandleA(const char *lpModuleName);
+public void* GetModuleHandleW(const wchar_t *lpModuleName);
+public void* GetProcAddress(void *hModule, const char *lpProcName);
+public void* GetProcessHeap(void);
+public unsigned long GetProcessId(void *hProcess);
+public unsigned int GetPrivateProfileIntW(const wchar_t *lpAppName, const wchar_t *lpKeyName, int nDefault, const wchar_t *lpFileName);
+public unsigned long GetPrivateProfileStringW(const wchar_t *lpAppName, const wchar_t *lpKeyName, const wchar_t *lpDefault, wchar_t *lpReturnedString, unsigned long nSize, const wchar_t *lpFileName);
+public void* GetStdHandle(unsigned long nStdHandle);
+public unsigned int GetSystemDirectoryA(char *lpBuffer, unsigned int uBufSize);
+public unsigned int GetSystemDirectoryW(wchar_t *lpBuffer, unsigned int uBufSize);
+public void GetSystemTime(struct SYSTEMTIME *lpSystemTime);
+public unsigned int GetTempPathA(unsigned int nBufferLength, char *lpBuffer);
+public unsigned int GetTempPathW(unsigned int nBufferLength, wchar_t *lpBuffer);
+public unsigned long GetTickCount(void);
+public unsigned long long GetTickCount64(void);
+public unsigned short GetUserDefaultLangID(void);
+public unsigned int GetWindowsDirectoryA(char *lpBuffer, unsigned int uBufSize);
+public unsigned int GetWindowsDirectoryW(wchar_t *lpBuffer, unsigned int uBufSize);
+public void* HeapAlloc(void *hHeap, unsigned long dwFlags, unsigned long long dwBytes);
+public int HeapFree(void *hHeap, unsigned long dwFlags, void *lpMem);
+public void* LoadLibraryA(const char *lpFileName);
+public void* LoadLibraryW(const wchar_t *lpFileName);
+public int MulDiv(int nNumber, int nNumerator, int nDenominator);
+public int MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char *lpMultiByteStr, int cbMultiByte, wchar_t *lpWideCharStr, int cchWideChar);
+public void OutputDebugStringA(const char *lpOutputString);
+public void OutputDebugStringW(const wchar_t *lpOutputString);
+public int QueryPerformanceCounter(union LARGE_INTEGER *lpPerformanceCount);
+public int QueryPerformanceFrequency(union LARGE_INTEGER *lpFrequency);
+public int SetCurrentDirectoryA(const char *lpPathName);
+public int SetCurrentDirectoryW(const wchar_t *lpPathName);
+public int SetEnvironmentVariableA(const char *lpName, const char *lpValue);
+public int SetEnvironmentVariableW(const wchar_t *lpName, const wchar_t *lpValue);
+public int SetLastError(unsigned long dwErrCode);
+public void Sleep(unsigned long dwMilliseconds);
+public void* VirtualAlloc(void *lpAddress, unsigned long long dwSize, unsigned long flAllocType, unsigned long flProtect);
+public int VirtualFree(void *lpAddress, unsigned long long dwSize, unsigned long dwFreeType);
+public int WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags, const wchar_t *lpWideCharStr, int cchWideChar, char *lpMultiByteStr, int cbMultiByte, const char *lpDefaultChar, int *lpUsedDefaultChar);
+public int WritePrivateProfileStringW(const wchar_t *lpAppName, const wchar_t *lpKeyName, const wchar_t *lpString, const wchar_t *lpFileName);
+
+// —— user32：[[lib("user32")]] 声明库归属（段内按函数名字母序）——
+[[lib("user32")]] public int AdjustWindowRect(struct RECT *lpRect, unsigned long dwStyle, int bMenu);
+[[lib("user32")]] public int AdjustWindowRectEx(struct RECT *lpRect, unsigned long dwStyle, int bMenu, unsigned long dwExStyle);
+[[lib("user32")]] public int AppendMenuW(void *hMenu, unsigned int uFlags, unsigned long long uIDNewItem, const wchar_t *lpNewItem);
+[[lib("user32")]] public void* BeginPaint(void *hWnd, struct PAINTSTRUCT *lpPaint);
+[[lib("user32")]] public unsigned int CheckMenuItem(void *hMenu, unsigned int uIDCheckItem, unsigned int uCheck);
+[[lib("user32")]] public int ClientToScreen(void *hWnd, struct POINT *lpPoint);
+[[lib("user32")]] public void* CreatePopupMenu(void);
+[[lib("user32")]] public void* CreateWindowExA(unsigned long dwExStyle, const char *lpClassName, const char *lpWindowName, unsigned long dwStyle, int X, int Y, int nWidth, int nHeight, void *hWndParent, void *hMenu, void *hInstance, void *lpParam);
+[[lib("user32")]] public void* CreateWindowExW(unsigned long dwExStyle, const wchar_t *lpClassName, const wchar_t *lpWindowName, unsigned long dwStyle, int X, int Y, int nWidth, int nHeight, void *hWndParent, void *hMenu, void *hInstance, void *lpParam);
+[[lib("user32")]] public long long DefWindowProcA(void *hWnd, unsigned int Msg, void *wParam, long long lParam);
+[[lib("user32")]] public long long DefWindowProcW(void *hWnd, unsigned int Msg, void *wParam, long long lParam);
+[[lib("user32")]] public int DestroyIcon(void *hIcon);
+[[lib("user32")]] public int DestroyMenu(void *hMenu);
+[[lib("user32")]] public int DestroyWindow(void *hWnd);
+[[lib("user32")]] public long long DispatchMessageA(struct MSG *lpMsg);
+[[lib("user32")]] public long long DispatchMessageW(struct MSG *lpMsg);
+[[lib("user32")]] public int DrawTextA(void *hDC, const char *lpchText, int cchText, struct RECT *lprc, unsigned int format);
+[[lib("user32")]] public int DrawTextW(void *hDC, const wchar_t *lpchText, int cchText, struct RECT *lprc, unsigned int format);
+[[lib("user32")]] public int EnableWindow(void *hWnd, int bEnable);
+[[lib("user32")]] public int EndPaint(void *hWnd, const struct PAINTSTRUCT *lpPaint);
+[[lib("user32")]] public int EqualRect(const struct RECT *lpRect1, const struct RECT *lpRect2);
+[[lib("user32")]] public int FillRect(void *hDC, const struct RECT *lprc, void *hbr);
+[[lib("user32")]] public void* FindWindowA(const char *lpClassName, const char *lpWindowName);
+[[lib("user32")]] public void* FindWindowW(const wchar_t *lpClassName, const wchar_t *lpWindowName);
+[[lib("user32")]] public int FrameRect(void *hDC, const struct RECT *lprc, void *hbr);
+[[lib("user32")]] public void* GetActiveWindow(void);
+[[lib("user32")]] public void* GetCapture(void);
+[[lib("user32")]] public int GetClassNameA(void *hWnd, char *lpClassName, int nMaxCount);
+[[lib("user32")]] public int GetClassNameW(void *hWnd, wchar_t *lpClassName, int nMaxCount);
+[[lib("user32")]] public int GetClientRect(void *hWnd, struct RECT *lpRect);
+[[lib("user32")]] public int GetCursorPos(struct POINT *lpPoint);
+[[lib("user32")]] public void* GetDC(void *hWnd);
+[[lib("user32")]] public void* GetDesktopWindow(void);
+[[lib("user32")]] public void* GetDlgItem(void *hWnd, int nID);
+[[lib("user32")]] public unsigned int GetDpiForSystem(void);
+[[lib("user32")]] public unsigned int GetDpiForWindow(void *hWnd);
+[[lib("user32")]] public void* GetFocus(void);
+[[lib("user32")]] public void* GetForegroundWindow(void);
+[[lib("user32")]] public short GetKeyState(int nVirtKey);
+[[lib("user32")]] public int GetMessageA(struct MSG *lpMsg, void *hWnd, unsigned int wMsgFilterMin, unsigned int wMsgFilterMax);
+[[lib("user32")]] public unsigned int GetMessagePos(void);
+[[lib("user32")]] public int GetMessageTime(void);
+[[lib("user32")]] public int GetMessageW(struct MSG *lpMsg, void *hWnd, unsigned int wMsgFilterMin, unsigned int wMsgFilterMax);
+[[lib("user32")]] public int GetMonitorInfoW(void *hMonitor, struct MONITORINFO *lpmi);
+[[lib("user32")]] public void* GetParent(void *hWnd);
+[[lib("user32")]] public unsigned long GetSysColor(int nIndex);
+[[lib("user32")]] public void* GetSysColorBrush(int nIndex);
+[[lib("user32")]] public int GetSystemMetrics(int nIndex);
+[[lib("user32")]] public int GetSystemMetricsForDpi(int nIndex, unsigned int uDpi);
+[[lib("user32")]] public void* GetWindow(void *hWnd, unsigned int uCmd);
+[[lib("user32")]] public void* GetWindowDC(void *hWnd);
+[[lib("user32")]] public int GetWindowLongA(void *hWnd, int nIndex);
+[[lib("user32")]] public long long GetWindowLongPtrA(void *hWnd, int nIndex);
+[[lib("user32")]] public long long GetWindowLongPtrW(void *hWnd, int nIndex);
+[[lib("user32")]] public int GetWindowLongW(void *hWnd, int nIndex);
+[[lib("user32")]] public int GetWindowRect(void *hWnd, struct RECT *lpRect);
+[[lib("user32")]] public int GetWindowTextA(void *hWnd, char *lpString, int nMaxCount);
+[[lib("user32")]] public int GetWindowTextLengthA(void *hWnd);
+[[lib("user32")]] public int GetWindowTextLengthW(void *hWnd);
+[[lib("user32")]] public int GetWindowTextW(void *hWnd, wchar_t *lpString, int nMaxCount);
+[[lib("user32")]] public int InvalidateRect(void *hWnd, const struct RECT *lpRect, int bErase);
+[[lib("user32")]] public int IsIconic(void *hWnd);
+[[lib("user32")]] public int IsWindow(void *hWnd);
+[[lib("user32")]] public int IsWindowVisible(void *hWnd);
+[[lib("user32")]] public int IsZoomed(void *hWnd);
+[[lib("user32")]] public int KillTimer(void *hWnd, long long uIDEvent);
+[[lib("user32")]] public void* LoadCursorA(void *hInstance, const char *lpCursorName);
+[[lib("user32")]] public void* LoadCursorW(void *hInstance, const wchar_t *lpCursorName);
+[[lib("user32")]] public void* LoadIconA(void *hInstance, const char *lpIconName);
+[[lib("user32")]] public void* LoadIconW(void *hInstance, const wchar_t *lpIconName);
+[[lib("user32")]] public int MessageBoxA(void *hWnd, const char *lpText, const char *lpCaption, unsigned int uType);
+[[lib("user32")]] public int MessageBoxW(void *hWnd, const wchar_t *lpText, const wchar_t *lpCaption, unsigned int uType);
+[[lib("user32")]] public void* MonitorFromRect(const struct RECT *lprc, unsigned long dwFlags);
+[[lib("user32")]] public int MoveWindow(void *hWnd, int X, int Y, int nWidth, int nHeight, int bRepaint);
+[[lib("user32")]] public int PeekMessageA(struct MSG *lpMsg, void *hWnd, unsigned int wMin, unsigned int wMax, unsigned int wRemoveMsg);
+[[lib("user32")]] public int PeekMessageW(struct MSG *lpMsg, void *hWnd, unsigned int wMin, unsigned int wMax, unsigned int wRemoveMsg);
+[[lib("user32")]] public int PostMessageA(void *hWnd, unsigned int Msg, void *wParam, long long lParam);
+[[lib("user32")]] public int PostMessageW(void *hWnd, unsigned int Msg, void *wParam, long long lParam);
+[[lib("user32")]] public void PostQuitMessage(int nExitCode);
+[[lib("user32")]] public int RedrawWindow(void *hWnd, const struct RECT *lprcUpdate, void *hrgnUpdate, unsigned int flags);
+[[lib("user32")]] public short RegisterClassA(struct WNDCLASS *lpWndClass);
+[[lib("user32")]] public unsigned short RegisterClassExA(struct WNDCLASSEX *lpWndClassEx);
+[[lib("user32")]] public unsigned short RegisterClassExW(struct WNDCLASSEXW *lpWndClassEx);
+[[lib("user32")]] public int ReleaseCapture(void);
+[[lib("user32")]] public int ReleaseDC(void *hWnd, void *hDC);
+[[lib("user32")]] public int ScreenToClient(void *hWnd, struct POINT *lpPoint);
+[[lib("user32")]] public int SendMessageA(void *hWnd, unsigned int Msg, void *wParam, long long lParam);
+[[lib("user32")]] public long long SendMessageW(void *hWnd, unsigned int Msg, void *wParam, long long lParam);
+[[lib("user32")]] public void* SetCapture(void *hWnd);
+[[lib("user32")]] public void* SetCursor(void *hCursor);
+[[lib("user32")]] public int SetCursorPos(int x, int y);
+[[lib("user32")]] public void* SetFocus(void *hWnd);
+[[lib("user32")]] public int SetForegroundWindow(void *hWnd);
+[[lib("user32")]] public int SetLayeredWindowAttributes(void *hWnd, unsigned long crKey, unsigned char bAlpha, unsigned long dwFlags);
+[[lib("user32")]] public int SetProcessDpiAwarenessContext(void *value);
+[[lib("user32")]] public long long SetTimer(void *hWnd, long long nIDEvent, unsigned int uElapse, void *lpTimerFunc);
+[[lib("user32")]] public int SetWindowLongA(void *hWnd, int nIndex, int dwNewLong);
+[[lib("user32")]] public long long SetWindowLongPtrA(void *hWnd, int nIndex, long long dwNewLong);
+[[lib("user32")]] public long long SetWindowLongPtrW(void *hWnd, int nIndex, long long dwNewLong);
+[[lib("user32")]] public int SetWindowLongW(void *hWnd, int nIndex, int dwNewLong);
+[[lib("user32")]] public int SetWindowPos(void *hWnd, void *hWndInsertAfter, int X, int Y, int cx, int cy, unsigned int uFlags);
+[[lib("user32")]] public int SetWindowTextA(void *hWnd, const char *lpString);
+[[lib("user32")]] public int SetWindowTextW(void *hWnd, const wchar_t *lpString);
+[[lib("user32")]] public int ShowCursor(int bShow);
+[[lib("user32")]] public int ShowWindow(void *hWnd, int nCmdShow);
+[[lib("user32")]] public int TrackPopupMenu(void *hMenu, unsigned int uFlags, int x, int y, int nReserved, void *hWnd, const struct RECT *prcRect);
+[[lib("user32")]] public int TranslateMessage(struct MSG *lpMsg);
+[[lib("user32")]] public int UnregisterClassA(const char *lpClassName, void *hInstance);
+[[lib("user32")]] public int UpdateWindow(void *hWnd);
+[[lib("user32")]] public int ValidateRect(void *hWnd, const struct RECT *lpRect);
+[[lib("user32")]] public void* WindowFromPoint(struct POINT Point);
+
+// —— gdi32：[[lib("gdi32")]] 声明库归属（段内按函数名字母序；句柄 HDC/HBRUSH/... 统一作 void*）——
+[[lib("gdi32")]] public int Arc(void *hDC, int x1, int y1, int x2, int y2, int xArc1, int yArc1, int xArc2, int yArc2);
+[[lib("gdi32")]] public int BitBlt(void *hDC, int x, int y, int nWidth, int nHeight, void *hSrcDC, int xSrc, int ySrc, unsigned long dwRop);
+[[lib("gdi32")]] public void* CreateCompatibleBitmap(void *hDC, int cx, int cy);
+[[lib("gdi32")]] public void* CreateCompatibleDC(void *hDC);
+[[lib("gdi32")]] public void* CreateFontW(int nHeight, int nWidth, int nEscapement, int nOrientation, int fnWeight, unsigned long fdwItalic, unsigned long fdwUnderline, unsigned long fdwStrikeOut, unsigned long fdwCharSet, unsigned long fdwOutputPrecision, unsigned long fdwClipPrecision, unsigned long fdwQuality, unsigned long fdwPitchAndFamily, const wchar_t *lpszFace);
+[[lib("gdi32")]] public void* CreatePen(int iStyle, int cWidth, unsigned long color);
+[[lib("gdi32")]] public void* CreatePenIndirect(struct LOGPEN *plpen);
+[[lib("gdi32")]] public void* CreateSolidBrush(unsigned long color);
+[[lib("gdi32")]] public int DeleteDC(void *hDC);
+[[lib("gdi32")]] public int DeleteObject(void *ho);
+[[lib("gdi32")]] public int Ellipse(void *hDC, int left, int top, int right, int bottom);
+[[lib("gdi32")]] public unsigned long GetBkColor(void *hDC);
+[[lib("gdi32")]] public int GetClipBox(void *hDC, struct RECT *lprc);
+[[lib("gdi32")]] public int GetDeviceCaps(void *hDC, int nIndex);
+[[lib("gdi32")]] public int GetObjectA(void *h, int cCount, void *lpv);
+[[lib("gdi32")]] public int GetObjectW(void *h, int cCount, void *lpv);
+[[lib("gdi32")]] public unsigned long GetPixel(void *hDC, int x, int y);
+[[lib("gdi32")]] public void* GetStockObject(int fn);
+[[lib("gdi32")]] public int GetStretchBltMode(void *hDC);
+[[lib("gdi32")]] public unsigned long GetTextColor(void *hDC);
+[[lib("gdi32")]] public int GetTextExtentPoint32A(void *hDC, const char *lpString, int c, struct SIZE *lpSize);
+[[lib("gdi32")]] public int GetTextExtentPoint32W(void *hDC, const wchar_t *lpString, int c, struct SIZE *lpSize);
+[[lib("gdi32")]] public int GetTextMetricsA(void *hDC, void *lptm);
+[[lib("gdi32")]] public int LineTo(void *hDC, int x, int y);
+[[lib("gdi32")]] public int MoveToEx(void *hDC, int x, int y, struct POINT *lpPoint);
+[[lib("gdi32")]] public int PatBlt(void *hDC, int x, int y, int nWidth, int nHeight, unsigned long dwRop);
+[[lib("gdi32")]] public int Polygon(void *hDC, const struct POINT *apt, int cpt);
+[[lib("gdi32")]] public int Polyline(void *hDC, const struct POINT *apt, int cpt);
+[[lib("gdi32")]] public int Rectangle(void *hDC, int left, int top, int right, int bottom);
+[[lib("gdi32")]] public int RestoreDC(void *hDC, int nSavedDC);
+[[lib("gdi32")]] public int RoundRect(void *hDC, int left, int top, int right, int bottom, int width, int height);
+[[lib("gdi32")]] public int SaveDC(void *hDC);
+[[lib("gdi32")]] public int SelectClipRgn(void *hDC, void *hrgn);
+[[lib("gdi32")]] public void* SelectObject(void *hDC, void *h);
+[[lib("gdi32")]] public unsigned long SetBkColor(void *hDC, unsigned long color);
+[[lib("gdi32")]] public int SetBkMode(void *hDC, int iBkMode);
+[[lib("gdi32")]] public unsigned long SetPixel(void *hDC, int x, int y, unsigned long color);
+[[lib("gdi32")]] public int SetStretchBltMode(void *hDC, int mode);
+[[lib("gdi32")]] public int SetTextAlign(void *hDC, unsigned int wFlags);
+[[lib("gdi32")]] public unsigned long SetTextColor(void *hDC, unsigned long color);
+[[lib("gdi32")]] public int StretchBlt(void *hDC, int xDest, int yDest, int wDest, int hDest, void *hSrcDC, int xSrc, int ySrc, int wSrc, int hSrc, unsigned long rop);
+[[lib("gdi32")]] public int TextOutA(void *hDC, int x, int y, const char *lpString, int c);
+[[lib("gdi32")]] public int TextOutW(void *hDC, int x, int y, const wchar_t *lpString, int c);

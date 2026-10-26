@@ -366,9 +366,15 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		if (e->type && e->type->kind == TypeKind::BitInt) return e->type;
 		// 字面量携带的类型（§6.4.5.2 选定，含 unsigned int/long/long long）优先采用，
 		// 供常用算术转换/cast 加宽取正确宽度与符号；无符号小字面量仍为 i32。
+		// 带前缀字符常量按其前缀携带 wchar_t/char8_t/char16_t/char32_t（§6.4.4.4），
+		// 同样优先采用——否则 sizeof(L'A') 会落回 int 得 4（应为 2）。
 		if (e->type && (e->type->kind == TypeKind::LongLong ||
 				e->type->kind == TypeKind::Long ||
-				e->type->kind == TypeKind::Int)) return e->type;
+				e->type->kind == TypeKind::Int ||
+				e->type->kind == TypeKind::WChar ||
+				e->type->kind == TypeKind::Char8 ||
+				e->type->kind == TypeKind::Char16 ||
+				e->type->kind == TypeKind::Char32)) return e->type;
 		return make_type(TypeKind::Int);
 	}
 	return nullptr;

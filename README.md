@@ -12,12 +12,12 @@ colang 是 **Co 语言**的编译器。Co 语言基于 C 语言扩展而来，�
 
 ## 下载预编译版本
 
-打包好的编译器可执行文件（含 Co 自制标准头）见
-[Releases](https://github.com/shanmin/colang/releases)。解压后包内附有 `README.md`
-讲解用法，快速上手：
+仓库 `dist/` 目录即附带最新预编译发布包（扁平布局：`colang.exe` 与 Co 自制标准头 `include/` 同级，
+免装任何运行库）；亦可在 [Releases](https://github.com/shanmin/colang/releases) 下载压缩包版本。
+用法与选项详见 [`dist/README.md`](dist/README.md)，快速上手：
 
 ```bat
-bin\colang.exe hello.co -o hello.exe
+dist\colang.exe hello.co -o hello.exe
 ```
 
 ## 从源码构建
@@ -42,9 +42,9 @@ powershell -ExecutionPolicy Bypass -File test\run_tests.ps1
 
 ## 仓库结构
 
-- `src/` — 编译器源码
-- `include/colang/` — 编译器内部头文件
-- `stdlib/include/` — Co 自制标准头（stdio.h、stdint.h 等）
+- `src/` — 编译器源码（含 `src/include/colang/` 编译器内部头文件）
+- `include/` — Co 自制标准头（stdio.h、stdint.h、winapi.co 等，发布时随 colang.exe 同级部署）
+- `dist/` — 预编译发布包（colang.exe + include/ + LICENSE/NOTICE + 包内说明，扁平布局）
 - `test/` — 独立冒烟测试用例（`*.co`）与运行器 `run_tests.ps1`
 - `docs/` — 中 / 英双语 mdBook 文档站，经 CI 自动发布到 GitHub Pages
 

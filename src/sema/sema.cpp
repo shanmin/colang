@@ -17,11 +17,13 @@
 #include "colang/sema.h"
 
 #include "colang/type_resolver.h"
+#include "colang/type_spell.h"
 
 #include <cstddef>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace colang
@@ -61,6 +63,12 @@ public:
 		//   原型与定义分属两条 AST 记录，任一处标注即对整个实体生效。
 		for (const auto &f : tu->funcs)
 			if (f.is_deprecated) dep_funcs_[f.name] = f.deprecated_msg;
+		// P249：[[nodiscard]] / [[noreturn]] 登记表（原型或定义任一处标注即对整个实体生效）
+		for (const auto &f : tu->funcs)
+		{
+			if (f.is_nodiscard) nodiscard_funcs_[f.name] = f.nodiscard_msg;
+			if (f.is_noreturn) noreturn_funcs_.insert(f.name);
+		}
 		for (const auto &g : tu->globals)
 			if (g.is_deprecated) dep_globals_[g.name] = g.deprecated_msg;
 		for (const auto &s : tu->structs)
@@ -76,11 +84,25 @@ public:
 
 		// P214：[[lib("X")]] 语义校验（可挂对象/须纯原型/与 public 互斥/同名不同库冲突）
 		check_attributes(tu);
+		// P252：`_Alignas` 跨声明一致性（同一对象多条声明的对齐须相容）
+		check_alignas_consistency(tu);
+		// P249：[[nodiscard]] 挂在无返回值的函数上是无效标注（clang 同文告警）
+		for (const auto &kv : nodiscard_funcs_)
+		{
+			auto it = funcs_.find(kv.first);
+			if (it != funcs_.end() && it->second->return_type &&
+			    it->second->return_type->kind == TypeKind::Void)
+				warn(it->second->loc, "attribute 'nodiscard' cannot be applied to functions without return value");
+		}
 		// P217：跨模块类型可见性门禁（主源引用导入的非 public struct/enum → 拒）。
 		//   ① 主源全局变量类型 ② 主源函数签名（返回 + 参数） ③ 主源 struct 成员类型。
 		//   ④ 函数体内局部声明/转换由 check_stmt/check_expr 就地触发。
 		for (const auto &g : tu->globals)
-			if (g.source_module_key.empty()) enforce_type_visible(g.type, g.loc);
+			if (g.source_module_key.empty())
+			{
+				enforce_type_visible(g.type, g.loc);
+				if (!g.is_extern) enforce_complete_type(g.type, g.loc, IctxGlobal); // P255：纯声明不分配、clang 允许 extern struct I e;
+			}
 		for (const auto &f : tu->funcs)
 			if (f.source_module_key.empty())
 			{
@@ -89,8 +111,15 @@ public:
 			}
 		for (const auto &s : tu->structs)
 			if (s.source_module_key.empty() && s.is_definition)
-				for (const auto &m : s.members) enforce_type_visible(m.type, s.loc);
+				for (const auto &m : s.members)
+				{
+					enforce_type_visible(m.type, s.loc);
+					enforce_complete_type(m.type, s.loc, IctxField); // P255：字段不完整类型
+				}
 		// 仅检查函数体（全局初始化器暂不查，降低误伤面）
+		// P249：[[noreturn]] 直接登记为「永不返回」，先于控制流推断——使仅有声明（无 body、
+		//   如头文件原型）的 noreturn 函数在调用点同样按不返回处理。
+		for (const auto &n : noreturn_funcs_) dead_ends_.insert(n);
 		compute_dead_ends();
 		for (const auto &f : tu->funcs)
 		{
@@ -121,6 +150,34 @@ public:
 			++idx;
 		}
 		cur_source_module_key_.clear();
+		// P229：WinMain 入口检查——与顶层裸代码互斥；[[subsystem]] 仅入口函数生效。
+		//   置于链接模式闸门之前，使 -c/--emit-llvm 亦能拦下互斥（否则裸码被 codegen 静默丢弃）。
+		//   P231：入口属性仅主模块生效——导入模块（source_module_key 非空）里的 WinMain
+		//   不参与互斥/参数检查、[[subsystem]] 被忽略并报警告（codegen 侧同步不置位）。
+		{
+			const FuncDecl *winmain_fn = nullptr;
+			for (const auto &f : tu->funcs)
+			{
+				if (!f.source_module_key.empty())
+				{
+					if (f.subsystem_windows)
+					{
+						warn(f.loc, "'subsystem' attribute in an imported module has no effect; it is only honored on the main module's entry function 'main' or 'WinMain'");
+					}
+					continue;
+				}
+				if (f.body && f.name == "WinMain") winmain_fn = &f;
+				if (f.subsystem_windows && f.name != "main" && f.name != "WinMain")
+					warn(f.loc, "'subsystem' attribute is only effective on the entry function 'main' or 'WinMain'");
+			}
+			if (winmain_fn)
+			{
+				if (!tu->top_level_body.empty())
+					report(winmain_fn->loc, "'WinMain' entry is incompatible with top-level bare commands; put GUI logic in WinMain");
+				if (winmain_fn->params.size() != 4)
+					report(winmain_fn->loc, "'WinMain' must have 4 parameters (hInstance, hPrevInstance, lpCmdLine, nCmdShow)");
+			}
+		}
 		// 无入口警告：.co 文件，且既无裸指令又无 user main 定义，且链接为 exe 目标
 		const bool is_co = [&]
 		{
@@ -133,7 +190,7 @@ public:
 		bool has_bare = !tu->top_level_body.empty();
 		bool has_user_main = false;
 		for (const auto &f : tu->funcs)
-			if (f.body && f.name == "main") { has_user_main = true; break; }
+			if (f.body && (f.name == "main" || f.name == "WinMain") && f.source_module_key.empty()) { has_user_main = true; break; } // P231：仅主模块
 		if (!has_bare && !has_user_main)
 			warn(SourceLoc{}, "colang: warning: no entry point (no top-level commands and no main); generating empty executable");
 	}
@@ -194,6 +251,95 @@ private:
 			if (g.is_static)
 				report(g.loc, tag + " cannot be combined with 'static'");
 			note_lib(g.name, g.lib_name, g.loc);
+		}
+	}
+
+	// P249：[[nodiscard]] 引用点诊断（C23 §6.7.11）。显式 `(void)f();` 属于有意丢弃返回值，
+	//   不告警（与 clang 一致）；void 返回函数本无返回值，内层已另有无效标注告警。
+	void note_discarded_nodiscard(const ExprPtr &e)
+	{
+		if (!e) return;
+		// `(void)expr` 显式丢弃：C 惯例的「有意忽略」写法
+		if (e->kind == ExprKind::Cast && e->type && e->type->kind == TypeKind::Void) return;
+		if (e->kind != ExprKind::Call || e->name.empty()) return;
+		if (!nodiscard_funcs_.count(e->name)) return;
+		auto it = funcs_.find(e->name);
+		if (it == funcs_.end() || !it->second->return_type) return;
+		if (it->second->return_type->kind == TypeKind::Void) return;
+		const std::string &why = nodiscard_funcs_[e->name];
+		warn(e->loc, "ignoring return value of function declared with 'nodiscard' attribute" +
+			(why.empty() ? std::string() : ": " + why));
+	}
+
+	// —— P252：`_Alignas` 跨声明一致性（§6.7.2.1p4）——
+	// 两条诊断（文本与定位均与 clang 同形）：
+	//   ① 「有声明带 _Alignas、定义没带」→ error '_Alignas' must be specified on definition if
+	//      it is specified on any declaration（指定义的**标识符**，clang 同列）。定义含暂定定义
+	//      （文件作用域无 extern 即定义），纯 extern 声明不算：clang 实测
+	//      `extern _Alignas(16) int c;` + `extern int c;` 零诊断、+ `int c;` 则报错。
+	//   ② 两条声明都带 _Alignas 但**结果对齐**不同 → error redeclaration has different alignment
+	//      requirement (A vs B)（指新那条的 `_Alignas` 关键字，clang 同列）。_Alignas(0) 的结果对齐
+	//      = 类型自然对齐（故 `_Alignas(16)` 后跟 `_Alignas(0)` 在 int 上报 (4 vs 16)，与 clang 一致）。
+	// 顺序敏感：clang 按声明逐条合并，因此需要区分两种「先前记录不带标注」的形态：
+	//   • 先前是**暂定定义或纯 extern 声明**（可回改）→ 后续标注合法并被记住
+	//     （`int a;` + `extern _Alignas(16) int a;` clang rc=0）；
+	//   • 先前是**带初始化式的真定义**（不可回改）→ 后续每条标注各报一次 ①，
+	//     位置指该定义的标识符，且**不记住**其对齐（故不再补报 ②）——clang 实测
+	//     `int a = 1;` + `extern _Alignas(16) int a;` + `extern _Alignas(32) int a;` 得两条 ①。
+	//     即使标注值与自然对齐相等（_Alignas(4) int）也报错：判据是「有没有写标注」。
+	// 只看主源记录（source_module_key 为空）：clang 只能看到当前 TU，导入项计入会凭空报错。
+	void check_alignas_consistency(const TUPtr &tu)
+	{
+		struct Seen
+		{
+			bool specified;
+			unsigned effective;
+			bool locked_def;   // 先前是「未带标注且已定型的真定义」：对齐不可再改
+			SourceLoc def_loc; // 该真定义的标识符位置（回溯报 ① 指此处）
+		};
+		static const std::string cls1 =
+			"'_Alignas' must be specified on definition if it is specified on any declaration";
+		std::unordered_map<std::string, Seen> seen;
+		for (const auto &g : tu->globals)
+		{
+			if (!g.source_module_key.empty()) continue;
+			const bool is_def = (g.init != nullptr) || !g.is_extern; // 定义（含暂定定义）
+			const bool has_init = (g.init != nullptr);               // 已定型的真定义
+			auto it = seen.find(g.name);
+			if (it == seen.end())
+			{
+				seen[g.name] = Seen{ g.align_specified, g.align_effective,
+					(!g.align_specified && has_init), g.ident_loc };
+				continue;
+			}
+			Seen &s = it->second;
+			if (g.align_specified)
+			{
+				if (s.specified)
+				{
+					if (g.align_effective != s.effective)
+						report(g.align_spec_loc, "redeclaration has different alignment requirement (" +
+							std::to_string(g.align_effective) + " vs " + std::to_string(s.effective) + ")");
+				}
+				else if (s.locked_def)
+				{
+					report(s.def_loc, cls1); // 不更新 s：使后续标注再报一次 ①（clang 同形）
+				}
+				else
+				{
+					s.specified = true;
+					s.effective = g.align_effective;
+				}
+			}
+			else
+			{
+				if (s.specified && is_def) report(g.ident_loc, cls1);
+				if (has_init && !s.locked_def)
+				{
+					s.locked_def = true;
+					s.def_loc = g.ident_loc;
+				}
+			}
 		}
 	}
 
@@ -599,6 +745,62 @@ private:
 		}
 	}
 
+	// P255：对「仅有前向声明、无 {} 定义」的 struct/union 作按值分配（局部/全局/字段/数组元素）
+	//   作前置诊断，把 LLVM 校验器的 `Cannot allocate unsized type` 挡在前面、报 clang 同款主错误。
+	//   剥层规则：沿 Array 下探（记 saw_array），遇 Pointer/Function 立即停（不完整类型经指针合法），
+	//   落到 Struct/Union 且 tag 非空、find_struct_def_by_tag 为空 ⇒ 不完整、报错。Enum 不纳入（越界）。
+	//   仅主源触发（cur_source_module_key_ 空），镜像 enforce_type_visible 的门禁以压低回归面。
+	enum IncompleteCtx { IctxVar, IctxField, IctxGlobal };
+
+	void enforce_complete_type(const CTypePtr &t, const SourceLoc &loc, IncompleteCtx ctx)
+	{
+		if (!cur_source_module_key_.empty()) return; // 仅主源；imported 项/函数体自然跳过
+		const CTypePtr *node = &t;                    // 逐层指向当前类型（base 为其成员，AST 存活整趟 sema）
+		bool saw_array = false;
+		while (node && *node)
+		{
+			const CTypePtr &cur = *node;
+			switch (cur->kind)
+			{
+			case TypeKind::Array:
+				saw_array = true;
+				node = &cur->base; // 继续下探元素类型
+				continue;
+			case TypeKind::Pointer:
+			case TypeKind::Function:
+				return; // 指向/返回不完整类型合法，止步
+			case TypeKind::Struct:
+			case TypeKind::Union:
+			{
+				if (cur->tag.empty()) return;                  // 匿名内联定义按完整处理（合成 tag 匹配风险，列为边界）
+				if (find_struct_def_by_tag(cur->tag)) return;  // 有真定义 ⇒ 完整
+				const std::string elem = describe_type(cur);
+				if (saw_array)                          report(loc, "array has incomplete element type " + elem);
+				else if (ctx == IctxField)              report(loc, "field has incomplete type " + elem);
+				else if (ctx == IctxGlobal)             report(loc, "tentative definition has type " + elem + " that is never completed");
+				else                                    report(loc, "variable has incomplete type " + elem);
+				return;
+			}
+			default:
+				return; // 标量/void/enum 不纳入
+			}
+		}
+	}
+
+	// 变量类型查找（内层→外层→全局，未找到返回 null）。P254：提为成员，供
+	//   SemaTypeEnv 与只读检查（需按根变量名回查其声明类型）共用同一口径。
+	CTypePtr lookup_var_type(const std::string &n)
+	{
+		for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it)
+		{
+			auto f = it->find(n);
+			if (f != it->end()) return f->second;
+		}
+		auto g = globals_.find(n);
+		if (g != globals_.end()) return g->second;
+		return nullptr;
+	}
+
 	// 类型解析单一真值源（P140 M2）：委托共享 resolve_expr_type，经 SemaTypeEnv 注入
 	// sema 自有符号表。旧 resolve_type 的保守 null 面（算术/一元/字面量携带类型）现由
 	// 共享解析器算出真类型 → 5 处检查触发面随之收紧（只多判、少漏判，绝不误伤合法程序）。
@@ -609,14 +811,7 @@ private:
 		Sema *self;
 		CTypePtr var_type(const std::string &n)
 		{
-			for (auto it = self->scopes_.rbegin(); it != self->scopes_.rend(); ++it)
-			{
-				auto f = it->find(n);
-				if (f != it->end()) return f->second;
-			}
-			auto g = self->globals_.find(n);
-			if (g != self->globals_.end()) return g->second;
-			return nullptr; // 内层→外层→全局，未找到返回 null
+			return self->lookup_var_type(n);
 		}
 		CTypePtr struct_member(const std::string &tag, const std::string &field)
 		{
@@ -656,6 +851,224 @@ private:
 		return resolve_expr_type(e, env);
 	}
 
+	// —— P254：const 只读强制（可写位置的只读判定，clang 同文诊断）——
+	// clang 把「写入只读对象」归为四形（91 例 clang 探针逐字坐实，_tmp/p254_probe.ps1）：
+	//   A `cannot assign to variable 'X' with const-qualified type 'T'`
+	//   B `read-only variable is not assignable`
+	//   C `cannot assign to non-static data member 'm' with const-qualified type 'T'`
+	//   D `cannot assign to variable 'X' with const-qualified data member 'm'`
+	// 自增/自减与赋值同文（clang 不说 "cannot increment"）；类型拼写走 P252/P253 的
+	//   `describe_type`（typedef 别名双轨 `CI' (aka 'const int')`、数组整维 `const int[3][2]` 自然成立）。
+	// clang 另附 `note: … declared const here`：colang 的 Error 无 note 通道 → 不发（已知差异）。
+	// 判据：把左值沿「根变量 → 目标」展开为**逐层对象类型**，只看「最后一次指针间接」之下的
+	//   对象链（该链之上的 const 属于别的对象，本次写入并不落到那里）：
+	//   全程未经间接 → const 由根变量传播至被写子对象 → 可指名 → A 形；
+	//   经指针间接取得 → 无从指名 → B 形；`->` 是 clang 特例：点指为 const 且箭头直接
+	//   作用于根变量时，诊断锚在**该指针变量本身**、拼写取其声明类型
+	//     （`const S *sp; sp->m = 1;` → A `'sp'` + `'const S *'`；`arr[0]->m` 则不报 / B 形）。
+	//   成员自身声明为 const → C 形（clang 优先按成员定性，70 例：对象也 const 仍报 C 形）。
+	// 不误伤（探针实测 clang 亦放行）：显式强转去 const、`int *const q` 写 `*q`、
+	//   `const int **pp` 写 `*pp`、`S *const arr[2]` 写 `arr[0]->m`、volatile 对象
+	//   （is_volatile 绝不参与只读判定）。
+	enum WriteStep
+	{
+		WS_SUB_ARRAY,   // a[i]（a 为数组）
+		WS_SUB_PTR,     // p[i]（p 为指针）
+		WS_DEREF_ARRAY, // *a（a 为数组，等价 a[0]）
+		WS_DEREF_PTR,   // *p
+		WS_DOT,         // obj.field
+		WS_ARROW        // ptr->field
+	};
+
+	// 左值 → (根变量名, 自根至目标的步序列)。不可分解（Cast/Call/Ternary/Comma/字面量等）返回 false。
+	bool flatten_write_path(const ExprPtr &e, std::vector<std::pair<int, std::string>> &steps,
+	                        std::string &root, int depth)
+	{
+		if (!e || depth > 16) return false;
+		if (e->kind == ExprKind::VarRef) { root = e->name; return true; }
+		if (e->kind == ExprKind::Unary && e->op == "*")
+		{
+			CTypePtr t = resolve_type(e->lhs);
+			if (!t || (t->kind != TypeKind::Array && t->kind != TypeKind::Pointer)) return false;
+			if (!flatten_write_path(e->lhs, steps, root, depth + 1)) return false;
+			steps.emplace_back(t->kind == TypeKind::Array ? WS_DEREF_ARRAY : WS_DEREF_PTR, std::string());
+			return true;
+		}
+		if (e->kind == ExprKind::Binary && e->op == "[]")
+		{
+			CTypePtr t = resolve_type(e->lhs);
+			if (!t || (t->kind != TypeKind::Array && t->kind != TypeKind::Pointer)) return false;
+			if (!flatten_write_path(e->lhs, steps, root, depth + 1)) return false;
+			steps.emplace_back(t->kind == TypeKind::Array ? WS_SUB_ARRAY : WS_SUB_PTR, std::string());
+			return true;
+		}
+		if (e->kind == ExprKind::Member)
+		{
+			if (!flatten_write_path(e->lhs, steps, root, depth + 1)) return false;
+			steps.emplace_back(e->op == "->" ? WS_ARROW : WS_DOT, e->name);
+			return true;
+		}
+		return false;
+	}
+
+	CTypePtr member_type_of(const CTypePtr &obj, const std::string &field)
+	{
+		if (!obj || field.empty()) return nullptr;
+		SemaTypeEnv env{this};
+		return env.struct_member(obj->tag, field);
+	}
+
+	// 聚合类型是否含 const 成员（D 形判据；递归进入嵌套聚合，深度上限防环）
+	bool find_const_member(const CTypePtr &t, std::string &out_name, int depth)
+	{
+		if (!t || depth > 4) return false;
+		if (t->kind != TypeKind::Struct && t->kind != TypeKind::Union) return false;
+		auto it = structs_.find(t->tag);
+		if (it == structs_.end()) return false;
+		for (const auto &m : it->second->members)
+		{
+			if (!m.type) continue;
+			if (m.type->is_const) { out_name = m.name; return true; }
+			if (find_const_member(m.type, out_name, depth + 1)) return true;
+		}
+		return false;
+	}
+
+	// 对象类型是否 const 限定。clang 的 `isConstQualified()` 对**数组类型看元素链**：
+	//   `const int v[3]` 整个数组即算 const 限定（探针 75 例坐实）；colang 把 const 位
+	//   落在叶元素上，故成员定性须沿数组链回推。指针不参与（点指 const ≠ 指针 const）。
+	static bool is_const_obj_type(const CTypePtr &t, int depth)
+	{
+		if (!t || depth > 8) return false;
+		if (t->is_const) return true;
+		if (t->kind == TypeKind::Array) return is_const_obj_type(t->base, depth + 1);
+		return false;
+	}
+
+	// 可写位置（赋值左值、++/-- 操作数）的只读检查
+	void check_write_target(const ExprPtr &L, const SourceLoc &loc)
+	{
+		if (!L) return;
+		std::vector<std::pair<int, std::string>> steps;
+		std::string root;
+		if (!flatten_write_path(L, steps, root, 0) || root.empty()) return;
+		CTypePtr rt = lookup_var_type(root);   // 根变量声明类型（A 形一律拼它——clang 用 ND->getType()）
+		if (!rt) return;
+		const std::string ro = "read-only variable is not assignable";
+
+		// ① 逐层推进：levels[k] = 第 k 步之后那个对象自身的类型（levels[0] = 根变量类型），
+		//    owner[k] = 该层是否由成员选择取得（C 形指名用；`->` 的点指对象层不算成员）。
+		//    `->` 拆为两层（点指对象 + 其成员），使「点指 const」与「成员 const」各自可见。
+		//    记下**最后一次经指针间接**所得对象的层位：该层之上的 const 属于别的对象，
+		//    本次写入并不落到那里（探针 56/58/60 例：`S *const arr[2]; arr[0]->m = 1;` 合法）。
+		std::vector<CTypePtr> levels;
+		std::vector<std::string> owner;   // levels[i] 由哪个成员选择取得（空 = 非成员）
+		std::vector<int> producer;        // 产生 levels[i] 的步型（② 的回溯域依赖它）
+		levels.push_back(rt);
+		owner.push_back(std::string());
+		producer.push_back(-1);
+		int last_ind_level = -1;     // 最后一次间接所得对象在 levels 中的下标（-1 = 全程非间接）
+		bool last_ind_arrow = false; // 该间接是否为 `->`
+		CTypePtr t = rt;
+		for (std::size_t i = 0; i < steps.size(); ++i)
+		{
+			if (!t) return;
+			const int step = steps[i].first;
+			const std::string &field = steps[i].second;
+			CTypePtr next = nullptr;
+			std::string own; // 本层是否由成员选择取得
+			switch (step)
+			{
+			case WS_SUB_ARRAY:  // 数组下标 / 数组解引用：子对象，不跨间接
+			case WS_DEREF_ARRAY:
+				next = t->base;
+				break;
+			case WS_DOT:
+				next = member_type_of(t, field);
+				own = field;
+				break;
+			case WS_SUB_PTR:    // 指针下标 / 解引用：被写对象经指针取得
+			case WS_DEREF_PTR:
+				last_ind_level = static_cast<int>(levels.size());
+				last_ind_arrow = false;
+				next = t->base;
+				break;
+			case WS_ARROW:
+				if (t->kind != TypeKind::Pointer) return;
+				last_ind_level = static_cast<int>(levels.size());
+				last_ind_arrow = true;
+				{
+					CTypePtr pte = t->base;          // 点指对象：不是「成员」，不参与 C 形定性
+					levels.push_back(pte);
+					owner.push_back(std::string());
+					producer.push_back(WS_DEREF_PTR);
+				}
+				next = member_type_of(t->base, field); // 同时选取成员
+				own = field;
+				break;
+			}
+			t = next;
+			levels.push_back(t);
+			owner.push_back(own);
+			producer.push_back(step);
+		}
+		if (!t) return;   // 类型推断不全 → 保守跳过（绝不误伤）
+
+		// ② 写入链上碰得到「const 限定的成员」→ C 形（优先于 A 形，70 例）。
+		//   clang 自最内层往外走这条链，取**最先（最内）遇到的 const 限定成员层**：
+		//   非 const 成员层不截断回溯（90 例 `o.in.j`：j 非 const、in 为 `const struct IN6`
+		//   → 报 'in'；88 例两者皆 const → 报最内层 'j'），但**指针间接截断**（87 例
+		//   `x.v[0]->m`：v 为 `S *const[2]`、m 非 const → 不报）；数组下标不截断（75 例
+		//   `t.v[0]`：v 为 `const int[3]` → 报 'v'；93 例 `o.in[1].j` → 报 'in' + `const struct IN7[2]`）。
+		for (std::size_t i = levels.size(); i-- > 1; )
+		{
+			if (!owner[i].empty())
+			{
+				if (is_const_obj_type(levels[i], 0))
+				{
+					report(loc, "cannot assign to non-static data member '" + owner[i] +
+						"' with const-qualified type " + describe_type(levels[i]));
+					return;
+				}
+				continue; // 本成员非 const → 继续往外找
+			}
+			if (producer[i] != WS_SUB_ARRAY && producer[i] != WS_DEREF_ARRAY) break; // 跨间接 → 停
+		}
+
+		// ③ 被写对象（及其「最后一次间接」之下的子对象链）是否为 const
+		const std::size_t lo = last_ind_level < 0 ? 0 : static_cast<std::size_t>(last_ind_level);
+		for (std::size_t i = lo; i < levels.size(); ++i)
+		{
+			const CTypePtr &lv = levels[i];
+			if (!lv || !lv->is_const) continue;
+			// A 形：全程未跨间接（const 由根变量传播到被写子对象），或 `->` 直接作用于根变量
+			//   本身（clang 把诊断锚回该指针变量，42/59 例）；B 形：经指针间接取得、无从指名。
+			if (lo == 0 || (last_ind_arrow && lo == 1))
+				report(loc, "cannot assign to variable '" + root +
+					"' with const-qualified type " + describe_type(rt));
+			else
+				report(loc, ro);
+			return;
+		}
+
+		// ④ D 形：整体写入一个「含 const 成员」的聚合。clang 按**左值形状**指名：
+		//   变量 → `variable 't'`；成员 → `non-static data member 'in'`；其余 → `lvalue`
+		//   （探针 18/62/63/69 例）。
+		if (t->kind == TypeKind::Struct || t->kind == TypeKind::Union)
+		{
+			std::string m;
+			if (find_const_member(t, m, 0) && !m.empty())
+			{
+				std::string anchor;
+				if (L->kind == ExprKind::VarRef) anchor = "variable '" + root + "'";
+				else if (L->kind == ExprKind::Member) anchor = "non-static data member '" + L->name + "'";
+				else anchor = "lvalue";
+				report(loc, "cannot assign to " + anchor +
+					" with const-qualified data member '" + m + "'");
+			}
+		}
+	}
+
 	// —— 表达式检查 ——
 	void check_expr(const ExprPtr &e)
 	{
@@ -690,13 +1103,22 @@ private:
 			{
 				bool bad = L->kind == ExprKind::IntLiteral || L->kind == ExprKind::FloatLiteral ||
 				           L->kind == ExprKind::CharLiteral || L->kind == ExprKind::StringLiteral ||
-				           L->kind == ExprKind::Call;
+				           L->kind == ExprKind::Call || L->kind == ExprKind::Comma ||
+				           L->kind == ExprKind::Ternary;   // P254：逗号/三元作左值（clang 同文）
+				// P254：`(T)x = 1` —— clang `assignment to cast is illegal, lvalue casts are not supported`，
+				//   定位在强转的 `(`、**仅此一例**（修前 colang 一路走到 IR verifier 报
+				//   `Store operand must be a pointer`）
+				const bool cast_lvalue = L->kind == ExprKind::Cast;
+				if (cast_lvalue) report(L->loc, "assignment to cast is illegal, lvalue casts are not supported");
 				if (!bad && L->kind == ExprKind::VarRef)
 				{
 					CTypePtr t = resolve_type(L);
 					if (t && t->kind == TypeKind::Array) bad = true; // 整数组赋值
 				}
-				if (bad) report(e->loc, "expression is not assignable");
+				if (cast_lvalue) { /* 已报，不叠加「不可赋值」*/ }
+				else if (bad) report(e->loc, "expression is not assignable");
+				// P254：可写位置的 const 只读检查（已判「不可赋值」的不重复报）
+				else check_write_target(L, e->loc);
 			}
 			// C23 模型 B：nullptr（nullptr_t）只能赋给指针类型；赋给类型已知的非指针左值是约束违例。
 			if (L && is_nullptr(e->rhs))
@@ -707,6 +1129,10 @@ private:
 			}
 			break;
 		}
+		case ExprKind::Unary:
+			// P254：++/-- 的操作数是可写位置（clang 与赋值同文，不说 "cannot increment"）
+			if (e->op == "++" || e->op == "--") check_write_target(e->lhs, e->loc);
+			break;
 		case ExprKind::Member:
 		{
 			CTypePtr base = resolve_type(e->lhs);
@@ -820,13 +1246,18 @@ private:
 			if (!scopes_.empty() && !s->var_name.empty())
 				scopes_.back()[s->var_name] = s->var_type;
 			enforce_type_visible(s->var_type, s->loc); // P217：局部声明类型跨模块可见性
+			enforce_complete_type(s->var_type, s->loc, IctxVar); // P255：不完整类型按值分配前置诊断
 			break;
 		}
 		case StmtKind::ExprStmt:
 			if (s->expr) check_expr(s->expr);
+			note_discarded_nodiscard(s->expr); // P249：[[nodiscard]] 返回值被丢弃
 			break;
 		case StmtKind::Return:
 		{
+			// P249：[[noreturn]] 函数体内出现 return（与 clang 同文的函数名形）
+			if (cur_func_ && noreturn_funcs_.count(cur_func_->name))
+				warn(s->loc, "function '" + cur_func_->name + "' declared 'noreturn' should not return");
 			bool is_void = cur_func_ && cur_func_->return_type &&
 				cur_func_->return_type->kind == TypeKind::Void;
 			if (s->expr)
@@ -917,6 +1348,9 @@ private:
 		if (f.return_type && f.return_type->kind != TypeKind::Void &&
 			f.name != "main" && falls_through(f.body))
 			warn(f.loc, "non-void function does not return a value in all control paths");
+		// P249：[[noreturn]] 函数体允许落到末尾（等价于“会返回”）
+		if (noreturn_funcs_.count(f.name) && falls_through(f.body))
+			warn(f.loc, "function declared 'noreturn' should not return");
 		check_stmt(f.body, 0, 0);
 		cur_func_ = nullptr;
 		cur_source_module_key_.clear();
@@ -931,6 +1365,10 @@ private:
 	// P214：[[deprecated]] 登记表（name → 消息，空串 = 无附带理由）
 	std::unordered_map<std::string, std::string> dep_funcs_;
 	std::unordered_map<std::string, std::string> dep_globals_;
+	// P249：[[nodiscard]] / [[noreturn]] 登记表（按名字，不依赖声明/定义归属）
+	//   nodiscard 带可选理由字符串（与 clang 同形的 ": reason" 尾巴）
+	std::unordered_map<std::string, std::string> nodiscard_funcs_;
+	std::unordered_set<std::string> noreturn_funcs_;
 	std::unordered_map<std::string, const StructDef *> structs_;
 	// P217：enum 类型标签→定义（供跨模块类型可见性门禁）
 	std::unordered_map<std::string, const EnumDef *> enums_;

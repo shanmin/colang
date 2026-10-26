@@ -14,7 +14,7 @@ Modules exist to support organizing large projects and to avoid the duplicate-de
 
 - `public` is Co's **only visibility keyword** — there is no `private`, and no separate `export`. It serves two roles at once: marking the **module interface** (importable by other modules) and **dynamic-library export** (written to the DLL export table).
 - A definition without `public` is visible only inside its module; only a `public` definition is externally visible and importable.
-- `public` may modify top-level functions and global variables; `public` on `class` / `struct` and their members is deferred to 0.4.0.
+- `public` may modify top-level functions, global variables, and `struct` / `union` / `enum` types (cross-module type visibility has been available since 0.3.0/0.3.1); `public` on `class` and its members is deferred to 0.4.0.
 - Non-`public` imported symbols are forced to `InternalLinkage` during codegen — references within the same module resolve, but no externally-visible LLVM value is emitted.
 
 ## Forms of a module
@@ -46,10 +46,9 @@ Deferred to later milestones:
 
 - Full semantics of module-alias qualified access `m.f()` / `m.x` (the `ModAlias` syntax slot is parsed but not yet active);
 - The declaration-metadata carrier that lets `.obj` / `.dll` / `.so` become importable modules;
-- Cross-module `struct` / `enum` type references (this batch targets functions, globals, and top-level statements);
 - `DllMain` synthesis and top-level body triggering under DLL outputs.
 
-## Currently implemented boundary (0.3.0)
+## Currently implemented boundary (0.3.1)
 
 - **Module boundary**: one `.co` file = one module; module key = canonical absolute path; same-name files in different directories are distinguished by their paths.
 - **`public`**: usable on top-level functions and global variables; when the artifact is a dynamic library the symbol is written into the export table (`DLLExportStorageClass`). In this batch `public` **does not change linkage** (non-`public` symbols remain `ExternalLinkage` by default, but non-`public` imported symbols are stripped to `InternalLinkage` by codegen).
@@ -57,3 +56,5 @@ Deferred to later milestones:
 - **Dynamic-library artifacts**: there is no `-shared` option, but the compiler switches between DLL and exe link modes automatically from the `-o` output extension. Naming the output `*.dll` produces an export-table-bearing dynamic library (an import library `*.lib` is generated alongside, verified on Windows).
 - **Multi-file programs**: compose several `.co` sources with `import` (available since 0.3.0). The single `.obj` from `-c` is useful for inspecting the compile result; linking several object files directly into an executable is still under development (see the Command Line chapter).
 - **Top-level execution model**: see the "import (Module Import)" chapter; this batch covers only `.co` consumption.
+- **Cross-module type references**: a `public struct` / `union` / `enum` imported from a module is usable as a value type (member access, address-of for passing, and `sizeof` all work); the consumer may also use the tag **with the keyword omitted** (`Point p;`, since 0.3.1).
+- **Cross-module compile-time constants**: a `public const int` from an imported module is usable in the consumer as a read-only value, an array dimension, or a `switch` `case` label (since 0.3.1; the `WM_*` series in `winapi.co` is exactly this use).

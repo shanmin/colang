@@ -9,6 +9,7 @@ Versions follow `MAJOR.MINOR.PATCH`:
 - **0.\*** — Development and testing. Features and syntax may change; no cross-version compatibility guarantee.
 - **1.\*** — Official release. Public contracts are frozen; backward compatibility is guaranteed.
 - **2.\*** — Bootstrapping. The compiler itself rewritten in Co.
+- **3.\*** — Product finalization. Beyond bootstrapping, converged into a final, production-ready stable form.
 
 Within 0.\*, **MINOR** bumps denote milestones (a key Co-layer capability). **PATCH** bumps are small Co-layer prerequisites or C-base fixes between two milestones.
 
@@ -19,9 +20,10 @@ Within 0.\*, **MINOR** bumps denote milestones (a key Co-layer capability). **PA
 | 0.1.0   | C compiler                        | Released |
 | 0.2.0   | Co entry model + `public`         | Released |
 | 0.3.0   | Linking                           | Released |
+| 0.3.1   | Windows GUI & `winapi.co`         | Released |
 | 0.4.0   | `class`                           | Planned  |
 
-Details for 1.\* / 2.\* will be finalized by the maintainer before 0.\* wraps up.
+Details for 1.\* / 2.\* / 3.\* will be finalized by the maintainer before 0.\* wraps up.
 
 ## Released
 
@@ -53,7 +55,17 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - [ ] Module-alias-limited access: `m.f()`, `m.x`.
 - [ ] Refinement of `DllMain` synthesis and top-level body triggering for DLL outputs.
 - [ ] User-visible `argv` (shipped with array-with-length infrastructure).
-- [ ] `winapi.co`: Co-modular wrapping of the Win32 API (declarations and wrapping unified inside a `.co` module, replacing `windows.h`).
+
+### 0.3.1 — Windows GUI & winapi.co
+
+- Windows GUI subsystem and `WinMain` entry: `[[subsystem("windows")]]` or defining `WinMain` switches the artifact to a console-less GUI program; `WinMain` is mutually exclusive with top-level bare statements.
+- `winapi.co` replaces `windows.h`: 215 prototypes / 13 structs / 266 constants (SDK-verified), library attribution via `[[lib(...)]]`; a practical subset of programmatic GUI APIs (window, message loop, memory-DC drawing, clipping, text metrics, system colors).
+- `const` consistency: read-only enforcement (diagnostics matching clang); `public const int` values flow across modules into array dimensions and `switch` `case` labels, with non-constant labels now rejected instead of silently folded to 0.
+- First batch of attribute semantics: `[[nodiscard]]` / `[[noreturn]]` in effect; `[[deprecated]]` same-position duplicates accepted first-wins.
+- C-conformance batch: designated initializers across the chain (chained designators, promoted anonymous aggregates, `union` hosts, mask-merged bit-field initialization, DFS continuation), `sizeof`/`_Alignof` in constant contexts, universal character names (`\uXXXX`/`\UXXXXXXXX`) in identifiers and literals, prefixed character constant typing, `_Alignas` context constraints and cross-declaration consistency, `static_assert` in more scopes.
+- Diagnostics quality: `typedef` alias spelling restoration, column alignment with clang, up-front diagnostics for by-value allocation of incomplete types.
+- Flat single-level release package: `colang.exe + include/` (standard headers located next to the compiler, no `-I` needed).
+- Native Linux (WSL) build brought up.
 
 ## Planned
 

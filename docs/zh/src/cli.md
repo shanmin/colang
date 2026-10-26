@@ -45,9 +45,9 @@ hello.co:5:12  string      "hello\n"
 按优先级从高到低：
 
 1. 命令行 `-I` 给出的目录；
-2. Co 自制标准头目录（`stdio.h`、`stdint.h` 等），由编译器自动定位：先读环境变量 `COLANG_STDLIB`（直接指向标准头目录）；未设置时，从 `colang` 可执行文件所在目录逐级上溯，以其中存在 `stdlib/include/stddef.h` 为标记定位到 `stdlib/include`。
+2. Co 自制标准头目录（`stdio.h`、`stdint.h`、`winapi.co` 等），由编译器自动定位：先读环境变量 `COLANG_STDLIB`（直接指向标准头目录）；未设置时，从 `colang` 可执行文件所在目录逐级上溯（至多 8 层），以其中存在 `include/stddef.h` 为标记定位到该 `include/` 目录。
 
-发布包保持了上述相对布局，因此解压后可直接使用；把编译器挪到别处时，请保持 `bin/` 与 `stdlib/include/` 的相对位置，或改用 `COLANG_STDLIB` 指定。标准头定位不到时，`#include <stdio.h>` 会报 `#include file not found`。
+发布包为扁平单层布局——`colang.exe` 与标准头目录 `include/` 同级放置，解压后可直接使用，`#include <stdio.h>` 与 `import "winapi.co"` 都无需给 `-I`；把编译器挪到别处时，请保持 `colang.exe` 与 `include/` 的同级相对位置，或改用 `COLANG_STDLIB` 指定。标准头定位不到时，`#include <stdio.h>` 会报 `#include file not found`。
 
 ## 链接器：编译器自带
 

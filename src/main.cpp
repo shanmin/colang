@@ -31,7 +31,7 @@ namespace
 
 void print_usage(const char *program)
 {
-	std::printf("colang compiler %s\n\n", COLANG_VERSION_STRING);
+	std::printf("colang compiler %s\n\n", COLANG_VERSION_FULL);
 	std::printf("usage: %s [options] <source.co>\n\n", program);
 	std::printf("options:\n");
 	std::printf("  -h, --help        show this help\n");
@@ -47,7 +47,7 @@ void print_usage(const char *program)
 
 void print_version()
 {
-	std::printf("colang %s\n", COLANG_VERSION_STRING);
+	std::printf("colang %s\n", COLANG_VERSION_FULL);
 	std::printf("LLVM   %s\n", LLVM_VERSION_STRING);
 	std::printf("target %s\n", llvm::sys::getDefaultTargetTriple().c_str());
 }
@@ -69,7 +69,7 @@ bool read_source(const std::string &path, std::string &out)
 	return true;
 }
 
-// 定位 colang 自制标准头目录 <...>/stdlib/include：
+// 定位 colang 自制标准头目录 <...>/include：
 // 优先环境变量 COLANG_STDLIB；否则从可执行文件所在目录逐级上溯，以标记文件 stddef.h 定位。
 // 未找到返回空串（此时仅 -I 显式路径生效，行为与引入本机制前一致）。
 std::string find_stdlib_dir(const std::string &program_path)
@@ -86,7 +86,7 @@ std::string find_stdlib_dir(const std::string &program_path)
 	fs::path dir = fs::absolute(fs::path(program_path), ec).parent_path();
 	for (int depth = 0; depth < 8 && !dir.empty(); ++depth)
 	{
-		fs::path cand = dir / "stdlib" / "include";
+		fs::path cand = dir / "include";
 		if (fs::exists(cand / "stddef.h", ec))
 		{
 			return cand.string();
@@ -339,7 +339,8 @@ int main(int argc, char **argv)
 #endif
 		}
 		const std::vector<std::string> objs{state.obj_path};
-		const bool ok = colang::link_exe(objs, out_path, errors);
+		const bool ok = colang::link_exe(objs, out_path, state.windows_subsystem,
+			state.use_winmain, errors);
 		std::error_code ec;
 		std::filesystem::remove(state.obj_path, ec);
 		if (!ok)

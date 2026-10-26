@@ -1,6 +1,6 @@
 # Program Entry and Execution
 
-> This chapter describes Co's program entry and execution model. **Entry dispatch, optional `main`, top-level `return` and the exit-code model are implemented since 0.2.0; cross-module (`import`) top-level execution in a centralized topological order is implemented since 0.3.0**; command-line `argv` is still not provided (see "Currently implemented boundary" at the end).
+> This chapter describes Co's program entry and execution model. **Entry dispatch, optional `main`, top-level `return` and the exit-code model are implemented since 0.2.0; cross-module (`import`) top-level execution in a centralized topological order is implemented since 0.3.0; the Windows GUI entry `WinMain` and the `[[subsystem("windows")]]` subsystem switch are implemented since 0.3.1**; command-line `argv` is still not provided (see "Currently implemented boundary" at the end).
 
 ## Top-level statements run in order
 
@@ -12,6 +12,23 @@ To stay compatible with C-style code, Co accepts both kinds of program:
 
 - **No `main`**: the program simply runs its top-level statements in order, then ends.
 - **With `main`**: `main` is an ordinary function, entered only **after all top-level statements have run**.
+
+## GUI entry (`WinMain`)
+
+Besides the console entry of "top-level statements / `main`", Co also supports the Windows GUI entry `WinMain`:
+
+```
+int WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow)
+{
+    // create the window, run the message loop...
+    return 0;
+}
+```
+
+- **Fixed signature**: four parameters, returning `int` (the ANSI form; the wide variant `wWinMain` is not yet supported). The return value is the process exit code.
+- **Defining `WinMain` automatically takes the GUI entry**: the artifact is a Windows GUI subsystem program (no console window), with no command-line flag needed.
+- To drop the console while keeping the `main`/top-level entry, mark the entry function with `[[subsystem("windows")]]` (see the "Attributes" chapter).
+- **`WinMain` is mutually exclusive with top-level bare statements**: a file with both `WinMain` and top-level bare statements is a compile error (put the GUI logic inside `WinMain`); `WinMain` must take exactly 4 parameters, otherwise the compiler errors.
 
 ## Process exit code
 
@@ -56,6 +73,7 @@ Since **0.2.0**, entry dispatch and exit-code behavior are implemented as specif
 - `return V;` at the top level ends the whole program immediately with exit code `V`; a bare `return;` uses exit code `0`.
 - A file with neither top-level bare statements nor `main`: when producing an executable, the compiler warns and still emits an empty entry that does nothing and exits with code `0`.
 - Pure C style (no top-level bare statements + a `main`) keeps the traditional C entry chaining and does not enter the synthesized entry.
+- **Windows GUI entry** (since 0.3.1): defining `WinMain` in the source takes the GUI entry (no console); or mark the entry function with `[[subsystem("windows")]]` to switch to the windows subsystem. `WinMain` is mutually exclusive with top-level bare statements and must take 4 parameters.
 
 Not yet provided:
 
