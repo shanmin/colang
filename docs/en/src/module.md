@@ -1,12 +1,12 @@
 # Module
 
-> As of **0.3.0**, the Co module system has landed alongside `import` (`.co` source merge): one `.co` file is one module, `public` is the **single gate** serving both dynamic-library export and cross-module visibility, and top-level statements of imported modules run exactly once at first load in a centralized topological order. Using `.obj` / `.dll` / `.so` as importable modules is deferred to later milestones; module-alias qualified access `m.f()` / `m.x` is likewise deferred.
+> As of **0.3.0**, the Co module system has landed alongside `import` (`.co` source merge): one `.co` file is one module, `public` is the **single gate** serving both dynamic-library export and cross-module visibility, and top-level statements of imported modules run exactly once at first load in a centralized topological order. Since **0.3.2**, modules are promoted to **independent compilation closures** (per-module isolation), **module-alias qualified access** `m.f()` / `m.x` is enabled, and **DLL / WinMain top-level-init carriers** have landed. Using `.obj` / `.dll` / `.so` as importable modules is still deferred to later milestones.
 
 ## One file is one module
 
 **One `.co` source file is one module.** The module is the basic unit Co uses to organize a program and draw interface boundaries: names defined inside a module belong to that module by default; to let other modules use them, mark them `public` explicitly.
 
-A module is **named after its file by default** (the file name without the extension); on import, `as` can give it a local alias (the syntax slot is parsed but qualified access is not yet active — deferred). During loading, the **canonical absolute path** (case-insensitive on Windows) serves as the module's unique key; a module imported from multiple sites is loaded and merged only once.
+A module is **named after its file by default** (the file name without the extension); on import, `as` can give it a local alias used for qualified access `alias.f()` / `alias.x` (enabled since 0.3.2). When the file name is not a valid identifier, the default qualifier is unusable and an explicit `as` alias is required. During loading, the **canonical absolute path** (case-insensitive on Windows) serves as the module's unique key; a module imported from multiple sites is loaded and merged only once.
 
 Modules exist to support organizing large projects and to avoid the duplicate-definition and synchronization costs that C/C++ header (`.h`/`.cpp`) separation brings.
 
@@ -33,6 +33,18 @@ Physically, a module may take different artifact forms:
 
 Top-level statements in an imported module follow "**exactly once at first load** + **centralized topological order**": all imported modules' top-level statements are emitted before the main entry, arranged in DFS-postorder of the dependency closure (dependencies run before dependents). The physical position of `import` lines in the main source has no effect on this order. **`main` of a non-main module is not a load hook** — if a module defines `main`, it is treated as an ordinary function symbol and does not execute automatically. See the "import (Module Import)" chapter.
 
+## Top-level initialization carrier
+
+Top-level code needs an entry point to actually run. Different artifact forms use different carriers (since **0.3.2**):
+
+| Artifact | Carrier | Behavior |
+| --- | --- | --- |
+| Console exe | synthesized `main` | calls each module's initializer in topological order, then runs the main source's top-level statements |
+| GUI exe (`WinMain` entry) | synthesized `WinMain` wrapper | the user's `WinMain` is renamed `__co_WinMain__`; the synthesized `WinMain` runs top-level init/statements first, then forwards (top-level code and `WinMain` are no longer mutually exclusive) |
+| DLL (`-o *.dll`) | synthesized `DllMain` | runs top-level initialization under `DLL_PROCESS_ATTACH` and returns `TRUE` for other reasons; a user-authored `DllMain` is renamed `__co_DllMain__` and forwarded |
+
+So a `.co` dynamic library still initializes when it is loaded, even if it has only a runtime-initialized global and no top-level statements — a dependent host need not call any explicit "init" function.
+
 ## File-scope `static` alongside "omit `public`"
 
 Since 0.3.0:
@@ -44,13 +56,13 @@ Since 0.3.0:
 
 Deferred to later milestones:
 
-- Full semantics of module-alias qualified access `m.f()` / `m.x` (the `ModAlias` syntax slot is parsed but not yet active);
-- The declaration-metadata carrier that lets `.obj` / `.dll` / `.so` become importable modules;
-- `DllMain` synthesis and top-level body triggering under DLL outputs.
+- The declaration-metadata carrier that lets `.obj` / `.dll` / `.so` become **importable** modules (note: *producing* a DLL and *consuming* a DLL-as-module are two different things — the former landed with the 0.3.2 carriers);
+- User-authored `__init__` customization.
 
-## Currently implemented boundary (0.3.1)
+## Currently implemented boundary (0.3.2)
 
 - **Module boundary**: one `.co` file = one module; module key = canonical absolute path; same-name files in different directories are distinguished by their paths.
+- **Independent compilation closures** (since 0.3.2): each module builds its own type/symbol tables and is analyzed on its own before merging; same-name different-layout `struct` types never hijack each other; `#include`-brought environment symbols do not enter the export surface (ambient cut-off).
 - **`public`**: usable on top-level functions and global variables; when the artifact is a dynamic library the symbol is written into the export table (`DLLExportStorageClass`). In this batch `public` **does not change linkage** (non-`public` symbols remain `ExternalLinkage` by default, but non-`public` imported symbols are stripped to `InternalLinkage` by codegen).
 - **`static public`** in either order is legal; semantics match P211.
 - **Dynamic-library artifacts**: there is no `-shared` option, but the compiler switches between DLL and exe link modes automatically from the `-o` output extension. Naming the output `*.dll` produces an export-table-bearing dynamic library (an import library `*.lib` is generated alongside, verified on Windows).

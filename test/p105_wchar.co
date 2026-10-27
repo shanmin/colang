@@ -1,0 +1,39 @@
+/* p105: wchar.h（P9.18）验证。覆盖 wchar_t/wint_t 的 2 字节无符号语义、
+   WEOF 常量、整型提升（零扩展）、窄化存储截断，以及与真实 UCRT wcslen/btowc/wctob 的互操作。
+   全通过 exit 0。 */
+#include <wchar.h>
+
+int main(void)
+{
+    int rc = 0;
+
+    /* 1. 类型宽度：wchar_t / wint_t 均 2 字节（对齐本机 UCRT ground-truth） */
+    if ((int)sizeof(wchar_t) != 2) rc |= 1;
+    if ((int)sizeof(wint_t)  != 2) rc |= 2;
+
+    /* 2. wchar_t 无符号：(wchar_t)-1 存回后按零扩展提升为 65535（非 -1） */
+    wchar_t wmax = (wchar_t)-1;
+    if ((int)wmax != 65535) rc |= 4;
+
+    /* 3. WEOF == 0xFFFF */
+    if ((int)WEOF != 65535) rc |= 8;
+
+    /* 4. 整型提升 + 算术：'B' - 'A' == 1 */
+    wchar_t a = 'A', b = 'B';
+    if ((b - a) != 1) rc |= 16;
+
+    /* 5. 窄化存储截断：赋 0x1FFFF → i16 保留低 16 位 = 0xFFFF */
+    wchar_t big = 0x1FFFF;
+    if ((int)big != 65535) rc |= 32;
+
+    /* 6. 与真实 UCRT wcslen 互操作：手工构造 2 字节宽串（'H','i',0） */
+    wchar_t s[4];
+    s[0] = 'H'; s[1] = 'i'; s[2] = 0; s[3] = 0;
+    if (wcslen(s) != 2) rc |= 64;
+
+    /* 7. btowc / wctob 单字节往返 */
+    if (btowc('Z') != 'Z') rc |= 128;
+    if (wctob((wint_t)'Z') != 'Z') rc |= 256;
+
+    return rc;
+}

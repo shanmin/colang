@@ -19,13 +19,15 @@ struct Pos
 };
 
 // 统一诊断信息；用户可见文本一律英文，输出格式固定为
-//   文件:行:列: error|warning: 消息
+//   文件:行:列: error|warning|note: 消息
+// notes 非空时，主诊断后逐条输出 note（clang 同形）。
 struct Error
 {
 	std::string file;
 	Pos pos;
 	std::string message;
 	bool is_warning = false; // #warning 等非致命诊断
+	std::vector<Error> notes; // 附注（severity 由打印逻辑固定为 "note"）
 };
 
 // token 的源位置：文件 + 行列（行列从 1 起，列按 UTF-8 码点计）。

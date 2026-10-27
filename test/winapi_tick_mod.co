@@ -1,0 +1,10 @@
+// winapi_tick_mod.co — P213 可行性冒烟：以 .co 模块封装 kernel32 函数**原型**（无 body）。
+// 本文件不入 regress 主循环（skip 列表）。
+// 语义验证目标：
+//   - `public` + 纯函数原型（body == nullptr）能被 parser 接受、Sema 视作 imported 可见符号
+//   - loader B 方案源合并把 winapi 原型作为 FuncDecl（无 body）并入主源 TU
+//   - codegen 第一遍为原型 getOrInsertFunction 建立 ExternalLinkage 声明
+//     （public 使其不被 P212 strip 到 InternalLinkage）
+//   - 链接步（0.3.0 起为进程内 lld、不再 shell-out clang）通过 kernel32.lib 自动解析 __imp_GetTickCount / __imp_GetCurrentProcessId
+public unsigned long GetTickCount(void);
+public unsigned long GetCurrentProcessId(void);

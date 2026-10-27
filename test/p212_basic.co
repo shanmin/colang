@@ -1,0 +1,5 @@
+// P212 定向：具名 import 单个 public 函数 + 顶层裸代码拓序前插执行。
+// 期望：exit 0
+import add from "p212_basic_mod.co";
+if (add(3, 4) != 7) return 1;
+return 0;

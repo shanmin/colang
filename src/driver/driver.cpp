@@ -44,6 +44,10 @@ bool compile(const CompileOptions &opts, CompileState &state, std::vector<Error>
 		is_co = sp.size() >= 3 &&
 			(sp.compare(sp.size() - 3, 3, ".co") == 0 || sp.compare(sp.size() - 3, 3, ".CO") == 0);
 	}
+	// 路 B 阶段1c：有效选项——`.co` 含 import 时转正为 per-module（默认单 obj linkInModule 合回）。
+	//   preprocess/parse/load/merge 只读 source/target/include 等、不依 per_module 位，仍传 opts；
+	//   eff 仅供 analyze 分流与 generate 消费。显式 --per-module/--per-module-merge 优先；未显式开关时 `.co`+import 恒走 per-module。
+	CompileOptions eff = opts;
 	bool seeded = false;
 	if (is_co)
 	{
@@ -59,6 +63,12 @@ bool compile(const CompileOptions &opts, CompileState &state, std::vector<Error>
 			if (!merge_imports(opts, *state.ast, bundle))
 				return false;
 			seeded = true;
+			// 转正默认：未显式开 --per-module → per-module 单 obj。
+			if (!opts.per_module)
+			{
+				eff.per_module = true;
+				eff.per_module_single_obj = true;
+			}
 		}
 	}
 	if (!seeded)
@@ -74,11 +84,20 @@ bool compile(const CompileOptions &opts, CompileState &state, std::vector<Error>
 			return false;
 		}
 	}
-	if (!analyze(opts, state, errors))
+	// 路 B 阶段1c：per-module 转正/探针路径（eff.per_module）走 analyze_per_module（ModuleCatalog +
+	//   撞名分流 + ambient 切断）；无 import/.c 走旧单遍 analyze。
+	if (eff.per_module)
+	{
+		if (!analyze_per_module(eff, state, errors))
+		{
+			return false;
+		}
+	}
+	else if (!analyze(eff, state, errors))
 	{
 		return false;
 	}
-	if (!generate(opts, state, errors))
+	if (!generate(eff, state, errors))
 	{
 		return false;
 	}

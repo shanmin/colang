@@ -1,12 +1,14 @@
 /* wchar.h — colang 自制最小标准头 (P9.18)
- * C §7.29：宽字符支持。类型宽度/符号取自本机 UCRT/MSVC ground-truth：
- *   sizeof(wchar_t)=2、wchar_t 为无符号（__WCHAR_TYPE__=unsigned short, __WCHAR_UNSIGNED__=1）；
- *   sizeof(wint_t)=2、同为 unsigned short（MSVC 传统：wint_t 亦 2 字节，非 POSIX 的 4）；WEOF=0xFFFF。
+ * C §7.29：宽字符支持。类型宽度/符号按 target triple 分派（本机 Win/MSVC 参考 ground-truth）：
+ *   wchar_t：Windows-msvc=2/unsigned（`__WCHAR_TYPE__=unsigned short`、`__WCHAR_UNSIGNED__=1`），Linux-gnu=4/signed（glibc wchar_t=int）；
+ *   wint_t：按 target 分派——Windows/UCRT=unsigned short（= wchar_t）、Linux/glibc=unsigned int（≠ wchar_t=int）；
+ *     WEOF = ~(wint_t)0（Win=0xFFFF、Linux=0xFFFFFFFF）。
  * wchar_t 是标准保留类型名，C 里通常由 <stddef.h>/<wchar.h> 以 typedef 提供；colang 为避免
- *   `short`→i32 折叠给不出 2 字节宽度，改由前端内置识别（见 ADR-104 裁定）：词法器把 wchar_t
- *   登记为类型关键字，parser 映射到 TypeKind::WChar，codegen 落 i16 且整型提升走零扩展。
+ *   `short`→i32 折叠给不出确定宽度，改由前端内置识别（见 ADR-104 裁定）：词法器把 wchar_t
+ *   登记为类型关键字，parser 映射到 TypeKind::WChar，codegen 依 TargetInfo.sizeof_wchar 分派 i16（Win）/i32（Linux），符号性依 wchar_signed 定。
  *   因此本头【不再】typedef wchar_t（会与内置类型名冲突），仅补齐其余类型/宏/函数声明。
- * 边界：面向 Windows/UCRT 宿主；glibc(Linux) 下 wchar_t/wint_t 均为 4 字节，待平台分派另议。
+ * 边界：wchar_t 已按 triple 分派（TargetInfo.sizeof_wchar / wchar_signed + resolve_target，rev 58 前已落地）；
+ *   wint_t 已按 target 分派（Win=typedef wchar_t、Linux=typedef unsigned int）——D081 剩余面 ① 闭合。
  */
 #ifndef _COLANG_WCHAR_H
 #define _COLANG_WCHAR_H
@@ -14,16 +16,23 @@
 #include <stddef.h>   /* size_t / ptrdiff_t / NULL */
 #include <stdio.h>    /* FILE */
 
-/* wchar_t：内置关键字类型（2 字节无符号），此处不重复 typedef。 */
+/* wchar_t：内置关键字类型（宽度/符号性随 target 分派，Win=i16/unsigned、Linux=i32/signed），此处不重复 typedef。 */
 
-/* wint_t：与 wchar_t 同宽（本机 UCRT 均为 unsigned short）；可容 WEOF。 */
-typedef wchar_t wint_t;
+/* wint_t：按 target 分派（C11 §7.29.1 + POSIX 要求能容纳 WEOF）：
+ *   Windows/UCRT: wint_t = unsigned short（与 wchar_t 同宽同符、UCRT 实测 ground-truth）；
+ *   Linux/glibc: wint_t = unsigned int（与 wchar_t=int 不同符号、glibc bits/types/wint_t.h 实测）。
+ *   统一 WEOF = ~(wint_t)0：Win=0xFFFF、Linux=0xFFFFFFFF，与两家 SDK 实际定义一致。 */
+#ifdef _WIN32
+typedef wchar_t wint_t;      /* Win: wchar_t=unsigned short 与 UCRT wint_t 同型 */
+#else
+typedef unsigned int wint_t; /* Linux/glibc: wint_t=unsigned int、wchar_t=int 二者符号异 */
+#endif
 
 /* mbstate_t：移位状态，标准仅作对象类型用于 *r* 转换函数的指针形参；此处取最小可寻址尺寸。 */
 typedef unsigned int mbstate_t;
 
 #ifndef WEOF
-#define WEOF ((wint_t)(0xFFFF))
+#define WEOF ((wint_t)~(wint_t)0)
 #endif
 
 /* —— 宽字符串/内存操作（符号由宿主 UCRT 提供）—— */

@@ -1,0 +1,366 @@
+// p215_winapi.co — winapi.co 起步验收 demo（无人值守 · 不弹模态框）
+// 期望：exit 0。要点：
+//   ① `import … from "winapi.co"` 按名解析到 stdlib/include（验证 loader 库模块回退检索）；
+//   ② kernel32 符号经 CRT 默认库直链（GetTickCount* / GetCurrentThreadId / GetModuleHandle* / GetModuleFileNameA / Sleep）；
+//   ③ user32 符号经 `public`+`[[lib("user32")]]` 重导出原型链接（P214 放宽 · .drectve /DEFAULTLIB）；
+//   ③b gdi32 符号经 `[[lib("gdi32")]]` 链接（GetStockObject/CreateSolidBrush/DeleteObject）；
+//   ④ 右值宽字符串地基：L"kernel32.dll" 降 UTF-16 传 const wchar_t*（W 系），窄字面量传 const char*（A 系）。
+// 注：P219 后顶层 `T name = func();` 已可直接初始化（合成 main 头部按声明序 store）；本 demo 保留「声明 + 赋值」两段式（历史受 P211 边界限制，现不影响正确性）。
+import MSG, SYSTEMTIME, LARGE_INTEGER, POINT, GetTickCount, GetTickCount64, GetCurrentThreadId, GetModuleHandleW, GetModuleHandleA, GetModuleFileNameA, Sleep, GetKeyState, GetSystemMetrics, GetDesktopWindow, IsWindow, GetCommandLineA, GetCurrentProcess, GetProcessHeap, MulDiv, GetTempPathA, GetWindowTextLengthA, PeekMessageA, GetStockObject, CreateSolidBrush, DeleteObject, GetSystemTime, QueryPerformanceFrequency, QueryPerformanceCounter, GetCurrentDirectoryA, MultiByteToWideChar, IsWindowVisible, GetDeviceCaps, GetDC, ReleaseDC, GetClassNameA, GetClassNameW, WindowFromPoint, BitBlt, CreateCompatibleDC, DeleteDC, GetBkColor, PatBlt, RoundRect, SetBkColor, SelectObject, GetSystemDirectoryA, GetSystemDirectoryW, GetWindowsDirectoryA, GetWindowsDirectoryW, GetFileAttributesA, GetFullPathNameA, GetCurrentProcessId, GetProcessId, GetComputerNameA, GetComputerNameW, GetEnvironmentVariableA, GetLastError, CP_UTF8, INVALID_FILE_ATTRIBUTES, LOGPIXELSX, PATCOPY, PM_NOREMOVE, SM_CXSCREEN, SRCCOPY, VK_SHIFT, WHITE_BRUSH from "winapi.co";
+import SIZE, WNDCLASSEX, LOGPEN, RECT, AdjustWindowRect, AdjustWindowRectEx, DrawTextA, FillRect, FrameRect, InvertRect, GetSysColor, GetSysColorBrush, ShowCursor, SetCapture, ReleaseCapture, GetCapture, DestroyIcon, MoveWindow, SetWindowPos, GetWindowLongPtrA, SetWindowLongPtrA, RegisterClassExA, CreateWindowExA, UnregisterClassA, DestroyWindow, DefWindowProcA, LoadCursorA, LoadIconA, CreatePen, CreatePenIndirect, CreateCompatibleBitmap, StretchBlt, SaveDC, RestoreDC, GetClipBox, Polyline, Polygon, Arc, SetStretchBltMode, GetStretchBltMode, SelectClipRgn, GetTextExtentPoint32A, SetPixel, GetPixel, LineTo, Rectangle, MoveToEx, SetBkMode, SetTextAlign, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, COLOR_WINDOW, COLOR_WINDOWTEXT, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, DT_CALCRECT, DT_LEFT, DT_SINGLELINE, PS_SOLID, BLACKONWHITE, TA_CENTER, TRANSPARENT, BLACKNESS, GWL_STYLE, GWLP_USERDATA from "winapi.co";
+
+unsigned long tick;
+unsigned long long tick64;
+unsigned long tid;
+void *k_w;
+void *k_a;
+char pathbuf[260];
+unsigned int fnlen;
+int cxscreen;
+void *desk;
+int is_win;
+char *cmdline;
+void *curproc;
+void *heap;
+int md;
+char tmpbuf[64];
+unsigned int tplen;
+int wtlen;
+struct MSG pmsg;
+int peeked;
+void *white_brush;
+void *solid_brush;
+struct SYSTEMTIME st;
+union LARGE_INTEGER qf;
+union LARGE_INTEGER qc;
+char cdbuf[128];
+unsigned long cdlen;
+wchar_t wbuf[16];
+int wn;
+int visible;
+void *sdc;
+int dpi;
+void *iv_sdc;
+void *mdc;
+void *hbr2;
+void *oldb;
+unsigned long bkcur;
+char cnbuf[64];
+wchar_t cwbuf[64];
+int cnlen;
+int cwlen;
+struct POINT ipt;
+void *hitw;
+char sysbuf[260];
+char winbuf[260];
+wchar_t wsysbuf[260];
+wchar_t wwinbuf[260];
+unsigned int syslen;
+unsigned int winlen;
+unsigned int wsyslen;
+unsigned int wwinlen;
+char fpathbuf[260];
+unsigned long attr_exe;
+unsigned long attr_missing;
+unsigned int fpathlen;
+unsigned long pid;
+unsigned long cnsize;
+char cnameA[32];
+wchar_t cnameW[32];
+char envbuf[128];
+unsigned long envlen;
+unsigned long lasterr;
+
+// —— 批次 VII（GUI 常用 API 可发布子集 · 范围 A）：结构/窗口相关全局与窗口过程（回调由 OS 调起，仿 p218 安全模式：仅转 DefWindowProcA）——
+long long WinViiProc(void *hWnd, unsigned int Msg, void *wParam, long long lParam)
+{
+	return DefWindowProcA(hWnd, Msg, wParam, lParam);
+}
+struct RECT avrc;
+struct RECT vdt_rc;
+struct RECT vii_cliprc;
+struct SIZE txtsize;
+struct LOGPEN lp;
+struct WNDCLASSEX wc2;
+struct POINT vii_pts[3];
+void *vii_sdc;
+void *vii_mdc;
+void *vii_bmp;
+void *vii_oldbmp;
+void *vii_pen;
+void *vii_pen2;
+void *vii_oldpen;
+void *vii_brush;
+void *vii_cursor;
+void *vii_icon;
+void *vii_hInst;
+void *vii_hwnd;
+void *vii_cap;
+unsigned long vii_pix_get;
+unsigned long vii_gsc;
+int vii_ret;
+int vii_save;
+unsigned short vii_atom;
+
+tick = GetTickCount();
+if (tick == 0) return 1;
+
+// kernel32 补充：64 位毫秒计数 + 当前线程 id（坐实新增原型可链可跑）
+tick64 = GetTickCount64();
+if (tick64 == 0) return 1;
+tid = GetCurrentThreadId();
+if (tid == 0) return 1;
+
+// W 系：L"kernel32.dll" 经右值宽字符串地基降 UTF-16，传 const wchar_t*；kernel32 已加载 → 句柄非空
+k_w = GetModuleHandleW(L"kernel32.dll");
+if (k_w == nullptr) return 2;
+
+// A 系：窄字面量原样 UTF-8 字节，传 const char*
+k_a = GetModuleHandleA("kernel32.dll");
+if (k_a == nullptr) return 3;
+
+// A 系模块路径（char 数组衰减为 char* 传出）+ 短休
+fnlen = GetModuleFileNameA(k_a, pathbuf, 260);
+if (fnlen == 0) return 4;
+Sleep(1);
+
+// user32：坐实 [[lib("user32")]] 经 .drectve /DEFAULTLIB 链接
+GetKeyState(VK_SHIFT);
+cxscreen = GetSystemMetrics(SM_CXSCREEN);
+if (cxscreen <= 0) return 5;
+desk = GetDesktopWindow();
+if (desk == nullptr) return 6;
+is_win = IsWindow(desk);
+if (is_win == 0) return 7;
+
+// kernel32 补充 II：命令行 / 进程与堆伪句柄 / MulDiv / 临时路径（坐实新增原型可链可跑）
+cmdline = GetCommandLineA();
+if (cmdline == nullptr) return 8;
+curproc = GetCurrentProcess();
+if (curproc == nullptr) return 9;
+heap = GetProcessHeap();
+if (heap == nullptr) return 10;
+md = MulDiv(640, 480, 100);   // 640*480/100 = 3072
+if (md != 3072) return 11;
+tplen = GetTempPathA(64, tmpbuf);
+if (tplen == 0) return 12;
+
+// user32 补充：窗口标题长度 + 非阻塞消息窥视（PM_NOREMOVE=0，无消息返回 0）
+wtlen = GetWindowTextLengthA(desk);
+if (wtlen < 0) return 13;
+peeked = PeekMessageA(&pmsg, nullptr, 0, 0, PM_NOREMOVE);
+
+// gdi32 补充：[[lib("gdi32")]] 链接坐实（SYSTEM 对象与实色画刷，无副作用）
+white_brush = GetStockObject(WHITE_BRUSH);
+if (white_brush == nullptr) return 14;
+solid_brush = CreateSolidBrush(0x0000FF);
+if (solid_brush == nullptr) return 15;
+DeleteObject(solid_brush);
+
+// kernel32 补充 III：系统时间 / 高频计时 / 当前目录 / 编码转换 / 原子自增（坐实批次 III 原型可链可跑）
+GetSystemTime(&st);
+if (st.wYear < 2020) return 20;   // 坐实 SYSTEMTIME 布局：年字段落合理区间（当前 2026）
+if (QueryPerformanceFrequency(&qf) == 0 || qf.QuadPart == 0) return 16;   // 坐实 LARGE_INTEGER 布局：频率必非零
+if (QueryPerformanceCounter(&qc) == 0 || qc.QuadPart == 0) return 17;
+cdlen = GetCurrentDirectoryA(128, cdbuf);
+if (cdlen == 0) return 18;
+wn = MultiByteToWideChar(CP_UTF8, 0, "abc", -1, wbuf, 16);   // cbMB=-1 空终止、cchWC=16 缓冲容量 → 返回 4
+if (wn < 4) return 19;
+
+// user32 补充：桌面窗口可见性（恒为真）
+visible = IsWindowVisible(desk);
+if (visible == 0) return 21;
+
+// gdi32 补充：screen DC 可能不可用 → 仅在有 DC 时取 LOGPIXELSX(88) 并释放
+sdc = GetDC(desk);
+if (sdc != nullptr)
+{
+	dpi = GetDeviceCaps(sdc, LOGPIXELSX);
+	ReleaseDC(desk, sdc);
+}
+
+// —— 批次 IV（P222）：绘图/窗口探测簇 10 新原型坐实可链可跑（内存 DC、绝不落屏、只读窗口识别）——
+iv_sdc = GetDC(desk);
+if (iv_sdc != nullptr)
+{
+	mdc = CreateCompatibleDC(iv_sdc);
+	if (mdc == nullptr) return 30;
+	SetBkColor(mdc, 0);
+	bkcur = GetBkColor(mdc);
+	if (bkcur != 0) return 31;                                        // 坐实 SetBkColor/GetBkColor ABI 往返：刚设 0 即读回 0
+	hbr2 = CreateSolidBrush(0x002244);
+	if (hbr2 == nullptr) return 32;
+	oldb = SelectObject(mdc, hbr2);                                   // 选入画刷（RoundRect/PatBlt 依赖）
+	if (RoundRect(mdc, 0, 0, 8, 8, 2, 2) == 0) return 33;             // 内存 DC 绘制，不上屏
+	if (PatBlt(mdc, 0, 0, 4, 4, PATCOPY) == 0) return 34;
+	if (BitBlt(mdc, 0, 0, 4, 4, mdc, 0, 0, SRCCOPY) == 0) return 35;  // 自拷贝
+	SelectObject(mdc, oldb);                                         // 还原原对象
+	DeleteObject(hbr2);
+	if (DeleteDC(mdc) == 0) return 36;
+	ReleaseDC(desk, iv_sdc);
+}
+
+cnlen = GetClassNameA(desk, cnbuf, 64);
+if (cnlen <= 0) return 37;                                          // 桌面类名（A 系）非空
+cwlen = GetClassNameW(desk, cwbuf, 64);
+if (cwlen <= 0) return 38;                                          // 桌面类名（W 系）非空
+ipt.x = 0;
+ipt.y = 0;
+hitw = WindowFromPoint(ipt);                                        // 传 struct POINT（值传递）；NULL 为合法返回（左上角归属依 shell 态）
+if (hitw != nullptr) { IsWindow(hitw); }                          // 坐实返回值可作句柄复用；不强 gate 业务结果
+
+// —— 批次 V（P223）：文件/目录只读探测簇（4 新原型 + 坐实 2 既存从未调用原型），全程无副作用、不建不删文件 ——
+syslen = GetSystemDirectoryA(sysbuf, 260);
+if (syslen == 0 || syslen >= 260) return 42;          // 系统目录必存在且非空
+winlen = GetWindowsDirectoryA(winbuf, 260);
+if (winlen == 0 || winlen >= 260) return 43;
+wsyslen = GetSystemDirectoryW(wsysbuf, 260);
+if (wsyslen == 0 || wsyslen >= 260) return 44;
+wwinlen = GetWindowsDirectoryW(wwinbuf, 260);
+if (wwinlen == 0 || wwinlen >= 260) return 45;
+
+// 坐实既存但从未调用的 GetFileAttributesA / GetFullPathNameA（存在/不存在的确定性断言）
+attr_exe = GetFileAttributesA(pathbuf);               // pathbuf=kernel32.dll 绝对路径 → 必存在
+if (attr_exe == 0 || attr_exe == INVALID_FILE_ATTRIBUTES) return 46;   // 非 0 且非 INVALID
+attr_missing = GetFileAttributesA("C:\\__colang_no_such_file_8x7__.bin");
+if (attr_missing != INVALID_FILE_ATTRIBUTES) return 47;            // 不存在路径必返回 INVALID_FILE_ATTRIBUTES
+fpathlen = GetFullPathNameA("winapi.co", 260, fpathbuf, nullptr);   // 相对名 → 绝对路径（不要求文件存在）
+if (fpathlen == 0 || fpathlen >= 260) return 48;
+
+// —— 批次 VI（P224）：标识/环境只读探测簇（新原型 GetProcessId + 坐实 5 既存从未调用原型），全只读无副作用 ——
+pid = GetCurrentProcessId();
+if (pid == 0) return 50;                              // 当前进程 id 必非零
+if (GetProcessId(curproc) != pid) return 51;         // GetProcessId(当前进程伪句柄)==GetCurrentProcessId（交叉坐实新原型）
+cnsize = 32;
+if (GetComputerNameA(cnameA, &cnsize) == 0 || cnsize == 0) return 52;   // 机器名必可得
+cnsize = 32;
+if (GetComputerNameW(cnameW, &cnsize) == 0 || cnsize == 0) return 53;
+envlen = GetEnvironmentVariableA("windir", envbuf, 128);   // WINDIR 恒在
+if (envlen == 0) return 54;
+lasterr = GetLastError();                             // 仅坐实调用可链可跑、不断言业务值
+
+	// —— 批次 VII（GUI 常用 API 可发布子集 · 范围 A：程序化窗口/绘制/消息循环）——
+	// 纯函数：AdjustWindowRect/Ex 对定尺客户 RECT 应放大并返回 BOOL 真
+	avrc.left = 0;
+	avrc.top = 0;
+	avrc.right = 100;
+	avrc.bottom = 80;
+	if (AdjustWindowRect(&avrc, WS_OVERLAPPEDWINDOW, 0) == 0) return 60;
+	if ((avrc.right - avrc.left) <= 100 || (avrc.bottom - avrc.top) <= 80) return 61;
+	avrc.left = 0;
+	avrc.top = 0;
+	avrc.right = 100;
+	avrc.bottom = 80;
+	if (AdjustWindowRectEx(&avrc, WS_OVERLAPPEDWINDOW, 0, 0) == 0) return 62;
+	// GetSysColor 只读探测（返回值合法即可，不强 gate 业务色值）
+	vii_gsc = GetSysColor(COLOR_WINDOWTEXT);
+	// 内存 DC 绘图簇（自建 screen DC → 兼容 DC + 兼容位图，全程不落屏）
+	vii_sdc = GetDC(desk);
+	if (vii_sdc != nullptr)
+	{
+		vii_mdc = CreateCompatibleDC(vii_sdc);
+		if (vii_mdc == nullptr) return 63;
+		vii_bmp = CreateCompatibleBitmap(vii_sdc, 32, 32);
+		if (vii_bmp == nullptr) return 64;
+		vii_oldbmp = SelectObject(vii_mdc, vii_bmp);
+		if (vii_oldbmp == nullptr) return 65;
+		lp.poPenLocation.x = 0;
+		lp.poPenLocation.y = 0;
+		lp.iPenWidth = 2;
+		lp.oPenColor = BLACKNESS;
+		vii_pen = CreatePen(PS_SOLID, 1, BLACKNESS);
+		if (vii_pen == nullptr) return 66;
+		vii_pen2 = CreatePenIndirect(&lp);
+		if (vii_pen2 == nullptr) return 67;
+		vii_oldpen = SelectObject(vii_mdc, vii_pen);
+		if (MoveToEx(vii_mdc, 0, 0, nullptr) == 0) return 68;
+		if (LineTo(vii_mdc, 8, 8) == 0) return 69;
+		vii_pts[0].x = 1;
+		vii_pts[0].y = 1;
+		vii_pts[1].x = 8;
+		vii_pts[1].y = 2;
+		vii_pts[2].x = 4;
+		vii_pts[2].y = 9;
+		if (Polyline(vii_mdc, vii_pts, 3) == 0) return 70;
+		if (Polygon(vii_mdc, vii_pts, 3) == 0) return 71;
+		if (Arc(vii_mdc, 0, 0, 16, 16, 16, 0, 0, 16) == 0) return 72;
+		if (Rectangle(vii_mdc, 0, 0, 10, 10) == 0) return 73;
+		SetPixel(vii_mdc, 5, 5, BLACKNESS);
+		vii_pix_get = GetPixel(vii_mdc, 5, 5);
+		if (BitBlt(vii_mdc, 16, 0, 8, 8, vii_mdc, 0, 0, SRCCOPY) == 0) return 74;
+		if (StretchBlt(vii_mdc, 24, 0, 4, 4, vii_mdc, 0, 0, 8, 8, SRCCOPY) == 0) return 75;
+		vii_save = SaveDC(vii_mdc);
+		if (vii_save <= 0) return 76;
+		if (RestoreDC(vii_mdc, vii_save) == 0) return 77;
+		if (GetClipBox(vii_mdc, &vii_cliprc) == 0) return 78;
+		if (GetTextExtentPoint32A(vii_mdc, "hello", 5, &txtsize) == 0) return 79;
+		if (txtsize.cx <= 0 || txtsize.cy <= 0) return 80;
+		SetStretchBltMode(vii_mdc, BLACKONWHITE);
+		if (GetStretchBltMode(vii_mdc) != BLACKONWHITE) return 81;
+		SetTextAlign(vii_mdc, TA_CENTER);   // 返回「先前对齐」(TA_LEFT|TA_TOP=0 亦合法)、非 BOOL；仅坐实可链可跑，不 gate
+		SetBkMode(vii_mdc, TRANSPARENT);
+		SelectClipRgn(vii_mdc, nullptr);
+		vdt_rc.left = 0;
+		vdt_rc.top = 0;
+		vdt_rc.right = 200;
+		vdt_rc.bottom = 200;
+		vii_ret = DrawTextA(vii_mdc, "drawtext", 8, &vdt_rc, DT_CALCRECT | DT_SINGLELINE);
+		if (vii_ret <= 0) return 83;
+		vii_brush = GetSysColorBrush(COLOR_WINDOW);
+		if (vii_brush == nullptr) return 84;
+		vdt_rc.left = 0;
+		vdt_rc.top = 0;
+		vdt_rc.right = 16;
+		vdt_rc.bottom = 16;
+		if (FillRect(vii_mdc, &vdt_rc, vii_brush) == 0) return 85;
+		if (FrameRect(vii_mdc, &vdt_rc, vii_brush) == 0) return 86;
+		if (InvertRect(vii_mdc, &vdt_rc) == 0) return 87;
+		SelectObject(vii_mdc, vii_oldpen);
+		SelectObject(vii_mdc, vii_oldbmp);
+		DeleteObject(vii_pen);
+		DeleteObject(vii_pen2);
+		DeleteObject(vii_bmp);
+		if (DeleteDC(vii_mdc) == 0) return 88;
+		ReleaseDC(desk, vii_sdc);
+	}
+	// 隐藏窗口管理簇（RegisterClassExA 坐实 WNDCLASSEX 布局/cbSize；建窗失败则跳过、仍 exit 0）
+	vii_hInst = GetModuleHandleA(nullptr);
+	vii_cursor = LoadCursorA(nullptr, (const char *)IDC_ARROW);
+	vii_icon = LoadIconA(nullptr, (const char *)IDC_ARROW);
+	wc2.cbSize = sizeof(wc2);
+	wc2.style = CS_HREDRAW | CS_VREDRAW;
+	wc2.lpfnWndProc = &WinViiProc;
+	wc2.cbClsExtra = 0;
+	wc2.cbWndExtra = 0;
+	wc2.hInstance = vii_hInst;
+	wc2.hIcon = vii_icon;
+	wc2.hCursor = vii_cursor;
+	wc2.hbrBackground = (void *)(COLOR_WINDOW + 1);
+	wc2.lpszMenuName = nullptr;
+	wc2.lpszClassName = "CoViiCls";
+	vii_atom = RegisterClassExA(&wc2);
+	if (vii_atom != 0)
+	{
+		vii_hwnd = CreateWindowExA(0, "CoViiCls", "colang gui vii", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 200, 120, nullptr, nullptr, vii_hInst, nullptr);
+		if (vii_hwnd != nullptr)
+		{
+			if (SetWindowPos(vii_hwnd, nullptr, 50, 50, 220, 140, 0) == 0) return 89;
+			if (MoveWindow(vii_hwnd, 60, 60, 240, 160, 0) == 0) return 90;
+			SetWindowLongPtrA(vii_hwnd, GWLP_USERDATA, 0x1234);
+			if (GetWindowLongPtrA(vii_hwnd, GWLP_USERDATA) != 0x1234) return 91;
+			SetCapture(vii_hwnd);
+			vii_cap = GetCapture();
+			ReleaseCapture();
+			ShowCursor(0);
+			ShowCursor(1);
+			DestroyWindow(vii_hwnd);
+		}
+		UnregisterClassA("CoViiCls", vii_hInst);
+	}
+	if (vii_icon != nullptr)
+	{
+		DestroyIcon(vii_icon);
+	}
+	printf("winapi.co VII ok atom=%u textext=%d,%d\n", vii_atom, txtsize.cx, txtsize.cy);
+printf("winapi.co ok tick=%lu tick64=%llu tid=%lu cx=%d md=%d tplen=%u cdlen=%lu wn=%d cn=%d sys=%u pid=%lu env=%lu\n", tick, tick64, tid, cxscreen, md, tplen, cdlen, wn, cnlen, syslen, pid, envlen);
+return 0;

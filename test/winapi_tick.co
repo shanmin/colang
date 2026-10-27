@@ -1,0 +1,12 @@
+// P213 winapi.co 可行性冒烟：以 .co 模块导入两个 kernel32 API 并调用。
+// 期望：exit 0（两个返回值均非零 → 系统时钟 tick 与进程 ID 都应大于 0）
+// 注意：P211 边界——顶层变量初始化式仅折叠恒定表达式，含函数调用需拆「声明 + 赋值」两段。
+import GetTickCount, GetCurrentProcessId from "winapi_tick_mod.co";
+unsigned long tick;
+unsigned long pid;
+tick = GetTickCount();
+pid = GetCurrentProcessId();
+if (tick == 0) return 1;
+if (pid == 0) return 2;
+printf("tick=%lu pid=%lu\n", tick, pid);
+return 0;

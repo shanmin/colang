@@ -1,0 +1,46 @@
+// P4.1 测试: _Bool / long long / inline / restrict / 复合字面量
+int printf(const char *fmt, ...);
+
+// inline 函数
+inline int square(int x) { return x * x; }
+
+// restrict 指针参数
+int sum2(const int *restrict a, const int *restrict b) {
+	return *a + *b;
+}
+
+struct Point { int x; int y; };
+
+int main() {
+	// _Bool
+	_Bool flag = 1;
+	_Bool off = 0;
+	printf("flag=%d off=%d\n", flag, off);  // flag=1 off=0
+
+	// _Bool 隐式转换（非零→1）
+	_Bool b2 = 42;
+	printf("b2=%d\n", b2);  // b2=1
+
+	// long long
+	long long big = 1000000000;
+	printf("big=%d\n", (int)big);   // big=1000000000 (cast to int)
+	long long ll2 = big + 1;
+	printf("ll2_ok=%d\n", (int)ll2 > 0);  // ll2_ok=1
+
+	// inline
+	printf("sq=%d\n", square(7));   // sq=49
+
+	// restrict
+	int x = 10, y = 20;
+	printf("sum2=%d\n", sum2(&x, &y));  // sum2=30
+
+	// 复合字面量 (struct) 返回 ptr
+	struct Point *pp = (struct Point){100, 200};
+	printf("cl_pt=%d %d\n", pp->x, pp->y);  // cl_pt=100 200
+
+	// 复合字面量 (array 显式大小)
+	int *ap = (int[3]){5, 10, 15};
+	printf("cl_arr=%d %d %d\n", ap[0], ap[1], ap[2]);  // cl_arr=5 10 15
+
+	return 0;
+}

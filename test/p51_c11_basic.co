@@ -1,0 +1,42 @@
+// P5.1 测试: _Static_assert / _Alignof / _Alignas / _Noreturn / 匿名struct
+int printf(const char *fmt, ...);
+
+// _Static_assert: 编译期断言
+_Static_assert(1 == 1, "math works");
+_Static_assert(sizeof(int) == 4, "int is 4 bytes");
+_Static_assert(2 + 3 == 5, "arithmetic");
+
+// _Noreturn（跳过即可，不影响功能）
+// _Noreturn void abort(void); // skip for test
+
+// _Alignas（跳过）
+_Alignas(16) int aligned_var;
+
+// 匿名 struct/union 成员
+struct Outer {
+	int x;
+	struct { int a; int b; };  // 匿名 struct
+	int y;
+};
+
+int main() {
+	// _Alignof
+	printf("alignof_int=%d\n", (int)_Alignof(int));         // 4
+	printf("alignof_char=%d\n", (int)_Alignof(char));       // 1
+	printf("alignof_double=%d\n", (int)_Alignof(double));   // 8
+	printf("alignof_ptr=%d\n", (int)_Alignof(int*));        // 8
+
+	// 匿名 struct 成员直接访问
+	struct Outer o;
+	o.x = 10;
+	o.a = 20;  // 匿名成员提升
+	o.b = 30;
+	o.y = 40;
+	printf("o: %d %d %d %d\n", o.x, o.a, o.b, o.y);  // o: 10 20 30 40
+
+	// sizeof(Outer) 验证包含匿名成员
+	// struct Outer: int x(4) + int a(4) + int b(4) + int y(4) = 16
+	printf("sz_outer=%d\n", (int)sizeof(struct Outer));  // 16
+
+	return 0;
+}

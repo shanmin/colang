@@ -67,6 +67,11 @@ public:
 	void set_line(std::size_t l) { line_ = l; col_ = 1; }
 	void set_file(const std::string &f) { file_ = f; }
 
+	// RC 方言字符串模式（PE 资源档③）：置真后，"..." 按 rc.exe 规则切分——
+	// "" 双写视为嵌入引号不终止、单 " 终止、反斜杠不在词法层遮蔽后续字符。
+	// 默认关：C 路径逐字节不变。语义解码留待 rc_decode_string 处理。
+	void set_rc_string_mode(bool b) { rc_str_ = b; }
+
 private:
 	std::string file_;
 	std::string text_;
@@ -75,6 +80,7 @@ private:
 	std::size_t col_ = 1; // UTF-8 码点计列，续字节不增列
 	bool pending_bol_ = true; // 逻辑行首标记的跨调用状态
 	bool pending_space_ = false; // 当前 token 前是否隔了空白/注释（had_space 的跨调用来源）
+	bool rc_str_ = false; // RC 方言字符串模式：scan_literal 走 rc.exe 切分（默认关，C 路径不变）
 
 	bool eof() const { return pos_ >= text_.size(); }
 	char peek(std::size_t off = 0) const;

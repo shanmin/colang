@@ -31,7 +31,9 @@ namespace colang
 struct IntPromo { unsigned bits; bool is_unsigned; };
 
 // 按 C 类型求提升后的整型描述（小于 int 者归入 signed int——int 可表其全部值）
-inline IntPromo int_promo_of(const CTypePtr &t)
+//   long_bits：目标数据模型的 long 位宽（32=LLP64/ILP32，64=LP64）；默认 32 保 Windows
+//   逐字恒等，Linux/LP64 由调用方经 target 传 64（否则 LP64 下 long 全线被当 int 算）。
+inline IntPromo int_promo_of(const CTypePtr &t, unsigned long_bits = 32)
 {
 	if (!t) return {32, false};
 	switch (t->kind)
@@ -41,8 +43,10 @@ inline IntPromo int_promo_of(const CTypePtr &t)
 		return {32, false};
 	case TypeKind::Char32:  // uint32 值域 int 表不下 → 提升为 unsigned int
 		return {32, true};
-	case TypeKind::Int: case TypeKind::Long: case TypeKind::Enum:
+	case TypeKind::Int: case TypeKind::Enum:
 		return {32, t->is_unsigned};
+	case TypeKind::Long:  // 宽度随数据模型：LLP64=32、LP64=64
+		return {long_bits, t->is_unsigned};
 	case TypeKind::LongLong:
 		return {64, t->is_unsigned};
 	case TypeKind::BitInt:
@@ -226,7 +230,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 			return make_type(TypeKind::Int);
 		if (e->op == "-" || e->op == "+" || e->op == "~")
 		{
-			IntPromo p = int_promo_of(resolve_expr_type(e->lhs, env));
+			IntPromo p = int_promo_of(resolve_expr_type(e->lhs, env), env.long_bits());
 			return int_ctype_of(p.bits, p.is_unsigned);
 		}
 		// ++/--（prefix/postfix）结果类型 = 操作数类型（C：后缀值为自增前的旧值，类型同操作数）。
@@ -258,7 +262,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		}
 		if (bop == "<<" || bop == ">>")
 		{
-			IntPromo lp = int_promo_of(lt);
+			IntPromo lp = int_promo_of(lt, env.long_bits());
 			return int_ctype_of(lp.bits, lp.is_unsigned);
 		}
 		if (bop == "==" || bop == "!=" || bop == "<" || bop == ">" ||
@@ -267,7 +271,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		if (bop == "+" || bop == "-" || bop == "*" || bop == "/" || bop == "%" ||
 		    bop == "&" || bop == "|" || bop == "^")
 		{
-			IntPromo res = int_uac(int_promo_of(lt), int_promo_of(rt));
+			IntPromo res = int_uac(int_promo_of(lt, env.long_bits()), int_promo_of(rt, env.long_bits()));
 			return int_ctype_of(res.bits, res.is_unsigned);
 		}
 		return nullptr;

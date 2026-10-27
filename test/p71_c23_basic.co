@@ -1,0 +1,50 @@
+// P7.1 测试: C23 nullptr / bool / true / false / auto / constexpr
+int printf(const char *fmt, ...);
+
+int compute(int x) { return x * 2; }
+double calc(void) { return 3.14; }
+
+// constexpr 全局
+constexpr int MAX_SIZE = 100;
+
+// bool 类型
+bool flag = true;
+bool off = false;
+
+// auto 全局不适用，只在局部
+
+int main() {
+	// nullptr
+	int *p = nullptr;
+	printf("null_check=%d\n", p == 0);  // null_check=1
+
+	// bool / true / false
+	bool b1 = true;
+	bool b2 = false;
+	printf("b1=%d b2=%d\n", b1, b2);  // b1=1 b2=0
+
+	// true/false 直接做整数使用
+	int t = true;
+	int f = false;
+	printf("t=%d f=%d\n", t, f);  // t=1 f=0
+
+	// auto 类型推断
+	auto x = 42;          // int
+	auto y = 3.14;       // double
+	auto z = "hello";    // char*
+	auto w = compute(5); // int (function return)
+	auto v = MAX_SIZE;   // int
+	printf("x=%d\n", x);  // x=42
+	printf("y=%d\n", (int)y);  // y=3
+	printf("z=%s\n", z);  // z=hello
+	printf("w=%d\n", w);  // w=10
+	printf("v=%d\n", v);  // v=100
+
+	// constexpr 使用
+	printf("MAX=%d\n", MAX_SIZE);  // MAX=100
+
+	// bool 声明的 flag/off
+	printf("flag=%d off=%d\n", flag, off);  // flag=1 off=0
+
+	return 0;
+}

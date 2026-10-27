@@ -3,6 +3,15 @@
 This record lists major changes to the Co (colang) language/compiler by release version.
 Versioning policy: 0.* = development/test releases, 1.* = official releases, 2.* = bootstrap.
 
+## 0.3.2
+- Built-in resource compiler: parses `.rc` syntax, supports ICON / BITMAP / RCDATA / STRINGTABLE / VERSIONINFO / ACCELERATORS / DIALOGEX / MENU resource types; output embedded directly into the PE executable (byte-level alignment with rc.exe).
+- Linux cross-compilation & native linking: `--target=x86_64-unknown-linux-gnu` emits ELF objects; the in-process lld ELF linker provides end-to-end executables; LP64 data model (long=8, void*=8, wchar_t=4) correctly dispatched.
+- Per-module compilation model promoted: each module compiles as an independent closure, cross-module same-name symbols are automatically routed (no collision); qualified access `mod.func()` / `mod.var` supported.
+- `wchar_t` fully target-aware: width and signedness follow target (Win unsigned short 2 bytes / Linux int 4 bytes); `wint_t`, `L'…'` overflow judgement, and TC-prefixed characters dispatch correctly.
+- const diagnostics aligned with clang: read-only violations now carry `note: … declared const here` pointing at the declaration site; new `-Wdefault-const-init` warning (function-local const objects or those with const members without initializer).
+- DLL production: synthesised `DllMain` entry carrier, top-level initialisation code driving, `public` functions written into the export table.
+- Multiple fixes in integer literal type selection, bit-field masking, and dynamic CRT linking.
+
 ## 0.3.1
 - The `winapi.co` module: `import … from "winapi.co"` replaces `windows.h`, providing 215 Win32 API prototypes, 13 struct/union layouts and 266 constants, all SDK-verified; covers common GUI APIs for window creation, message loops, drawing and text metrics (dialogs, menus and common controls not yet covered).
 - Windows GUI programs: the `[[subsystem("windows")]]` attribute (or defining `WinMain`) produces a console-less windowed program.

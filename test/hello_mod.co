@@ -1,0 +1,28 @@
+// hello_mod.co — 被 hello.co import 的展示模块
+//
+// 演示 Co 模块系统：
+//   - public 是跨模块可见性的唯一闸门（未标 public 的符号外部不可访问）
+//   - 模块顶层裸代码在首次加载时执行一次（拓序前插于宿主入口之前）
+//   - 支持导出：constexpr 常量、函数、struct 类型
+
+// public constexpr：编译期常量，跨模块可见
+public constexpr int VERSION = 1;
+
+// public struct 值类型定义（import 后宿主可用 Point 作类型）
+public struct Point {
+	int x;
+	int y;
+};
+
+// public 函数（[[nodiscard]] 标记：忽略返回值将触发告警）
+public [[nodiscard]] int add(int a, int b) {
+	return a + b;
+}
+
+// public 纯计算（无 I/O 依赖，演示跨模块函数调用）
+public int magnitude_sq(Point *p) {
+	return p->x * p->x + p->y * p->y;
+}
+
+// 非 public 符号：仅模块内部可见，外部 import 将报错
+static int _helper(int x) { return x * 2; }

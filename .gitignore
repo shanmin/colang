@@ -23,6 +23,12 @@ CMakeFiles/
 /_tmp/
 /_regress_tmp/
 
+# 大型外部测试数据（仅内部回归使用，不纳入公开仓库）
+/test/c-testsuite-master/
+/test/compiler-test-suite-2026-06/
+/test/p8_project/
+/test/sema_negative/
+
 # 发布包（dist）：随仓库分发的编译器主程序豁免于 *.exe 忽略
 !dist/colang.exe
 

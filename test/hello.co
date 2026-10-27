@@ -1,12 +1,61 @@
-/* hello.co — 端到端冒烟用例
- *
- * 目标：colang 编译 -> clang 链接 -> 运行，输出 "Hello, World!" 且 main 返回 0。
- * 判定：run_tests.ps1 以进程退出码为准（0 = 通过）。
- */
-int printf(const char *fmt, ...);
+// hello.co — Co (colang) 编译器特性展示
+//
+// 演示要点：
+//   1. Co 顶层入口模型：裸指令即入口，顶层 return 为退出码（无需 main）
+//   2. 模块 import：具名导入 public 符号（函数/常量/类型）
+//   3. public 可见性闸门：跨模块只暴露 public 成员
+//   4. 自制标准头：#include <stdio.h>（colib colang 提供）
+//   5. C23 auto 类型推断
+//   6. nullptr 空指针字面量
+//   7. constexpr 编译期常量（跨模块可导出）
+//   8. const 只读强制（编译器拒绝写入）
+//   9. struct 值类型 + 指定初始化器
+//  10. [[nodiscard]] 属性（忽略返回值触发告警）
+//  11. 进程内 lld 静态链接（产物零外部依赖，自包含 exe）
+//
+// 编译运行：
+//   colang hello.co -o hello.exe && hello.exe
+//
 
-int main(void)
+#include <stdio.h>
+
+import VERSION, add, magnitude_sq, Point from "hello_mod.co";
+
+// 局部函数演示 C23 特性（auto/nullptr 需在函数体内使用）
+void c23_showcase(void)
 {
-    printf("Hello, World!\n");
-    return 0;
+	// C23 auto 类型推断
+	auto x = 42;
+	auto pi = 3.14;
+	auto msg = "auto works";
+	printf("  auto      : x=%d pi=%d msg=%s\n", x, (int)pi, msg);
+
+	// nullptr 空指针字面量
+	int *p = nullptr;
+	printf("  nullptr   : %s\n", p == nullptr ? "null" : "non-null");
 }
+
+// ━━━ Co 顶层裸指令即入口（无需 main，return 即退出码） ━━━
+
+printf("=== Co (colang) %d \u2014 Feature Demo ===\n", VERSION);
+
+// import 模块函数调用（public 跨模块可见）
+printf("  add(3,4)  : %d\n", add(3, 4));
+
+// C23 auto / nullptr
+c23_showcase();
+
+// struct 值类型 + 指定初始化器 + 跨模块 struct
+Point origin = {.x = 0, .y = 0};
+Point corner = {.x = 3, .y = 4};
+printf("  struct    : origin=(%d,%d) corner=(%d,%d)\n",
+	origin.x, origin.y, corner.x, corner.y);
+printf("  |corner|^2: %d\n", magnitude_sq(&corner));
+
+// const 只读强制（取消下行注释将触发编译错误）
+const int limit = 100;
+// limit = 200;  // error: cannot assign to variable 'limit' with const-qualified type
+printf("  const     : limit=%d\n", limit);
+
+// 顶层 return 即退出码
+return 0;

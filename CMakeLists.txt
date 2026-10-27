@@ -127,23 +127,28 @@ target_include_directories(colang PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/include)
 target_include_directories(colang PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/include)
 target_include_directories(colang SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
 
-# LLVM components (Phase 0 spike-verified closure, do not trim):
-#   front end      — Core / Support / BitWriter / BitReader / TargetParser /
-#                    IRReader / Option / Passes / Coroutines
-#   X86 lowering   — Target / X86 / CodeGen / SelectionDAG / AsmParser /
-#                    Analysis / ScalarOpts / IPO / TransformUtils /
-#                    ObjCARCOpts / InstCombine
-#   lld COFF deps  — Object / BinaryFormat / MC / MCParser / Demangle /
-#                    DebugInfo* / Windows* / LibDriver / LTO / DTLTO
-#   Names must be valid component names so llvm_map_components_to_libnames
-#   computes the ordered dependency closure ("all" does NOT expand here).
-llvm_map_components_to_libnames(COLANG_LLVM_LIBS
+# LLVM components. The front-end + X86 lowering + Object/MC closure is shared
+# by both COFF (Windows) and ELF (Linux) paths; only the debug-info/driver
+# extras are format-specific. Names must be valid component names so
+# llvm_map_components_to_libnames computes the ordered dependency closure
+# ("all" does NOT expand here).
+set(COLANG_LLVM_COMPONENTS
   Core Support BitWriter BitReader TargetParser Target X86
   Analysis ScalarOpts IPO TransformUtils ObjCARCOpts InstCombine
   CodeGen SelectionDAG AsmParser IRReader
   Object BinaryFormat MC MCParser Option Passes Coroutines
-  DebugInfoPDB DebugInfoCodeView DebugInfoDWARF DebugInfoMSF
-  WindowsDriver WindowsManifest LibDriver LTO DTLTO Demangle)
+  Demangle DebugInfoDWARF)
+if(MSVC)
+  # Windows/COFF path: PE debug info + Windows driver + lld-CFF deps.
+  list(APPEND COLANG_LLVM_COMPONENTS
+    DebugInfoPDB DebugInfoCodeView DebugInfoMSF
+    WindowsDriver WindowsManifest LibDriver LTO DTLTO)
+else()
+  # Linux/ELF path: strip the Windows-only components above; lld::elf still
+  # pulls LibDriver/LTO for the linker closure.
+  list(APPEND COLANG_LLVM_COMPONENTS LibDriver LTO DTLTO)
+endif()
+llvm_map_components_to_libnames(COLANG_LLVM_LIBS ${COLANG_LLVM_COMPONENTS})
 
 # lld is shipped as static libs but has no CMake package here. Its public
 # header lld/Common/Driver.h lives in the lld source tree, a sibling of the
@@ -157,10 +162,19 @@ get_filename_component(LLD_INCLUDE_DIR "${LLD_INCLUDE_DIR}" ABSOLUTE)
 target_include_directories(colang SYSTEM PRIVATE "${LLD_INCLUDE_DIR}")
 
 # Link lld libs first (they depend on LLVM, not vice versa), then LLVM closure.
-target_link_libraries(colang PRIVATE
-  "${LLVM_LIBRARY_DIR}/lldCOFF.lib"
-  "${LLVM_LIBRARY_DIR}/lldCommon.lib"
-  ${COLANG_LLVM_LIBS})
+# The linker backend is platform-specific: a Windows build embeds lldCOFF, a
+# Linux build embeds lldELF; the other driver is not compiled in (guarded by
+# LLD_HAS_DRIVER in lld_link.cpp), so we must not request its lib either.
+if(MSVC)
+  set(COLANG_LLD_LIBS
+    "${LLVM_LIBRARY_DIR}/lldCOFF.lib"
+    "${LLVM_LIBRARY_DIR}/lldCommon.lib")
+else()
+  set(COLANG_LLD_LIBS
+    "${LLVM_LIBRARY_DIR}/liblldELF.a"
+    "${LLVM_LIBRARY_DIR}/liblldCommon.a")
+endif()
+target_link_libraries(colang PRIVATE ${COLANG_LLD_LIBS} ${COLANG_LLVM_LIBS})
 
 if(MSVC)
   # Inline code in LLVM/lld backend headers (ModuleSummaryIndex/ScaledNumber and

@@ -160,6 +160,33 @@ The preprocessor directive `__has_c_attribute(name)` returns `1` or `0` and can 
 > 3. `[[deprecated]]` is a front-end diagnostic only; like clang, Co **does not encode it into the artifact's IR**, so it does not propagate to downstream modules that consume the artifact.
 > 4. `[[subsystem("windows")]]` is likewise a Co-defined attribute: a real clang/clangd warns and ignores it as an unknown attribute (**necessarily so, not a defect**); only the Co compiler consumes the subsystem switch.
 
+## Vendor-compatibility extension: `__attribute__` (GCC/Clang)
+
+> **Qualification (added solely for compatibility)**: the syntax in this section is **not ISO C** (no such spelling exists in C89–C23; the standard attributes are the `[[...]]` of the previous section) and is **not a Co dialect feature**. It exists **purely to be compatible with existing source code coming from GCC/Clang** — so such code need not be rewritten site by site just to compile — and is **not part of Co's language design**. For newly written code, prefer the C23 `[[...]]` attributes and `_Alignas(N)`; do not rely on `__attribute__`.
+
+Co accepts the GNU `__attribute__((...))` spelling and handles it in **tiers**:
+
+- **`aligned(N)` — given real semantics**: it raises the alignment of an object / member / `struct`·`union` type / `typedef` (observable via `sizeof`, `_Alignof`, `offsetof`), matching the local clang `-std=c23` verbatim. It is a **one-way promotion** only: alignment becomes `max(natural alignment, N)` and is **never lowered**. `N` must be a power of two, otherwise it is an error (same as clang).
+- **Every other attribute — syntax accepted, semantics ignored, a warning emitted**, in **two levels** by risk:
+  - **Strong warning (may affect memory layout / calling convention / linkage)**: `packed`, the calling-convention family (`stdcall` / `cdecl` / `fastcall` / `thiscall` / `vectorcall`), `section`, `weak`, `alias`, `dllimport` / `dllexport`, `constructor` / `destructor`, and the like. Text shaped like `gnu attribute 'packed' ignored: may affect layout/ABI (non-standard, GCC/Clang compatibility)`.
+  - **Light warning (optimization / diagnostics / informational only; ignoring changes no observable behavior)**: `noinline`, `always_inline`, `format`, `unused`, `used`, `pure`, `const`, `visibility`, `deprecated`, and the like, as well as **unrecognized attribute names**. Text shaped like `gnu attribute 'noinline' ignored (non-standard, GCC/Clang compatibility)`.
+- **None of these warnings block compilation or change the exit code.**
+
+The positions where `__attribute__` may appear (matching GCC): before the declaration specifiers; between the `struct`/`union` keyword and its tag name and between the tag name and `{`; after the closing `}` (before a `typedef`/variable name) and after a `typedef` name; between the return type and the function name; before the type of a cast's abstract declarator; before the `*` inside a function-type parenthesis.
+
+```
+struct __attribute__((aligned(32))) Block { char c; };   // _Alignof(Block) == 32
+int  __attribute__((aligned(16))) giant;                  // raises alignment
+void __attribute__((stdcall)) api(void);                  // accepted + strong warning (stdcall ignored)
+int  __attribute__((noinline)) leaf(void) { return 42; }  // accepted + light warning
+```
+
+> **Compatibility note (important)**:
+> 1. Real GCC/Clang **fully implement** these attributes; Co **honors only `aligned`** and ignores all the rest. If source code relies on `packed` to compact a layout or on a particular calling convention, it **still compiles under Co but behaves differently from GCC/Clang** (the struct is not packed to 1 byte, the calling convention is unchanged) — this is exactly why Co emits a **strong warning** for every ignored "layout/ABI" attribute instead of accepting it silently.
+> 2. When a real layout effect is needed, `aligned` can be rewritten as the C23 `_Alignas(N)`; `packed` and friends have no standard counterpart and thus no equivalent spelling yet.
+> 3. `__declspec(...)` (the MSVC extension) is **out of scope for this extension and not supported**; use `[[lib("X")]]` for library ownership.
+> 4. The rare `aligned` forms (bare `aligned` with no argument, `aligned(_Alignof(T))`, `aligned(type)`) are **downgraded to a light-warning ignore** in this batch.
+
 ## Current boundaries (compiler implementation status)
 
 - `[[lib("X")]]` lowers to a `/DEFAULTLIB` linker directive in the COFF `.drectve` section, deduplicated by first appearance; this relies on the link step consuming the directive and **cannot yet** do "precise per-symbol binding to a specific dll" — per-symbol binding for same-named symbols across multiple dlls is a later linker capability.

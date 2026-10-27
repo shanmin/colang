@@ -1,11 +1,19 @@
-/* stddef.h — colang 自制最小标准头 (P9.0；offsetof 于 P9.3 补齐)
- * 仅含前端可解析的 typedef 与宏；size_t/ptrdiff_t 按 LLP64(Windows x86_64)：8 字节。
+/* stddef.h — colang 自制最小标准头 (P9.0；offsetof 于 P9.3 补齐；数据模型分派于 P2xx)
+ * 仅含前端可解析的 typedef 与宏；size_t/ptrdiff_t 随目标数据模型：
+ *   Linux/LP64(long=8) → 用 long（同 glibc）；Windows/LLP64(long=4) → 用 long long（8 字节）。
  */
 #ifndef _COLANG_STDDEF_H
 #define _COLANG_STDDEF_H
 
+#if defined(__LP64__)
+/* Linux / LP64：long 即 8 字节，size_t/ptrdiff_t 以 long 承载（与 glibc 一致）。 */
+typedef unsigned long size_t;
+typedef long ptrdiff_t;
+#else
+/* Windows / LLP64（及未定义数据模型宏时的默认）：long=4，故以 long long 承载 8 字节。 */
 typedef unsigned long long size_t;
 typedef long long ptrdiff_t;
+#endif
 
 /* C23 §6.2.5/§7.19：nullptr_t —— nullptr 的类型。务实以 void* 别名承载：
  * 表示宽度/对齐同 void*（故 sizeof(nullptr_t)==sizeof(void*)），可隐转任意指针，

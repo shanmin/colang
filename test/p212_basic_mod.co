@@ -1,0 +1,8 @@
+// p212_basic_mod.co — P212 定向测试的被导入模块（本文件不入 regress 主循环、在 skip 列表中）。
+// 语义验证：
+//   - public 函数 add 被主源具名导入
+//   - 顶层裸代码在主源合成 main 之前执行（拓序前插）
+public int add(int a, int b) { return a + b; }
+int helper_local(int x) { return x * 3; }
+public int wrapper(int x) { return helper_local(x); }
+printf("mod-init\n");

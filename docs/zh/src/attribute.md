@@ -160,6 +160,33 @@ int WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow)
 > 3. `[[deprecated]]` 是纯前端诊断，Co 与 clang 一样**不把它编进产物 IR**，因此不会传导到依赖该产物的下游模块。
 > 4. `[[subsystem("windows")]]` 同样是 Co 自定义属性：真 clang/clangd 会按未知属性警告并忽略（**必然如此、非缺陷**）；子系统切换只有 Co 编译器消费。
 
+## 厂商兼容扩展：`__attribute__`（GCC/Clang）
+
+> **定性（仅为兼容性而加）**：本小节的语法**非 ISO C**（C89–C23 皆无此拼写，标准属性是上一节的 `[[...]]`），**也不是 Co 方言特性**。它**纯粹为兼容来自 GCC/Clang 的既有源码而增设**——让这些代码不必为编译而逐处改写——**不属于 Co 的语言设计**。新写代码请优先用 C23 的 `[[...]]` 属性与 `_Alignas(N)`，不要依赖 `__attribute__`。
+
+Co 接受 GNU 的 `__attribute__((...))` 拼写，并**分级**处理：
+
+- **`aligned(N)`——赋予真语义**：抬高对象 / 成员 / `struct`·`union` 类型 / `typedef` 的对齐（可经 `sizeof`、`_Alignof`、`offsetof` 观察到），与本机 clang `-std=c23` 逐字一致。它只做**单向提升**：对齐取 `max(自然对齐, N)`，**永不降低**。`N` 须为 2 的幂，否则报错（与 clang 同）。
+- **其余所有属性——接受语法、忽略语义、发告警**，按风险分**两级**：
+  - **强警告（可能影响内存布局 / 调用约定 / 链接）**：`packed`、调用约定类（`stdcall` / `cdecl` / `fastcall` / `thiscall` / `vectorcall`）、`section`、`weak`、`alias`、`dllimport` / `dllexport`、`constructor` / `destructor` 等。文案形如 `gnu attribute 'packed' ignored: may affect layout/ABI (non-standard, GCC/Clang compatibility)`。
+  - **轻警告（仅优化 / 诊断 / 信息性，忽略不改变可观察行为）**：`noinline`、`always_inline`、`format`、`unused`、`used`、`pure`、`const`、`visibility`、`deprecated` 等，以及**未识别的属性名**。文案形如 `gnu attribute 'noinline' ignored (non-standard, GCC/Clang compatibility)`。
+- **以上告警都不阻断编译、不改变退出码。**
+
+`__attribute__` 可出现的位点（与 GCC 一致）：声明说明符之前；`struct`/`union` 关键字与标签名、标签名与 `{` 之间；闭花括号 `}` 之后（`typedef`/变量名之前）与 `typedef` 名之后；返回类型与函数名之间；cast 的抽象声明符类型之前；函数类型括号内 `*` 之前。
+
+```
+struct __attribute__((aligned(32))) Block { char c; };   // _Alignof(Block) == 32
+int  __attribute__((aligned(16))) giant;                  // 抬高对齐
+void __attribute__((stdcall)) api(void);                  // 接受 + 强警告（stdcall 被忽略）
+int  __attribute__((noinline)) leaf(void) { return 42; }  // 接受 + 轻警告
+```
+
+> **兼容性告知（重要）**：
+> 1. 真 GCC/Clang 会**完整实现**这些属性，Co **只兑现 `aligned`**、其余一律忽略。若源码依赖 `packed` 压缩布局或某种调用约定，它在 Co 下**能编过、但行为与 GCC/Clang 不同**（结构不按 1 字节对齐、调用约定不变）——这正是 Co 对每个被忽略的「布局/ABI 类」属性都发**强警告**、而非静默接受的原因。
+> 2. 需要真实布局效果时，`aligned` 可改写为 C23 的 `_Alignas(N)`；`packed` 等在标准里无对应物、暂无等价写法。
+> 3. `__declspec(...)`（MSVC 扩展）**不在本扩展范围内、不支持**；库归属请用 `[[lib("X")]]`。
+> 4. `aligned` 的罕见形式（无参 `aligned`、`aligned(_Alignof(T))`、`aligned(类型)`）本批**降级为轻警告忽略**。
+
 ## 当前边界（编译器实装状态）
 
 - `[[lib("X")]]` 落地为 COFF `.drectve` 段的 `/DEFAULTLIB` 链接指令，按声明首现序去重；这依赖链接步能消费该指令，**尚不能**做到「同名符号按具体 dll 精确绑定」——多 dll 同名符号的 per-symbol 绑定属后续链接器能力。

@@ -21,6 +21,7 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 | 0.2.0 | Co 入口模型 + `public`           | 已发布  |
 | 0.3.0 | 实现链接                        | 已发布  |
 | 0.3.1 | Windows GUI 与 `winapi.co`      | 已发布  |
+| 0.3.2 | Linux 原生 ELF 工具链            | 开发中  |
 | 0.4.0 | 实现 `class`                   | 计划中  |
 
 后续 1.\* / 2.\* / 3.\* 具体条目将在 0.\* 收官前由维护方主动细化。
@@ -65,9 +66,17 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - C 符合性批次：指定初始化器全链（链式设计符、匿名聚合提升、`union` 宿主、位域初始化掩码写入、DFS 续位）、`sizeof`/`_Alignof` 常量语境扩展、标识符与字面量通用字符名（`\uXXXX`/`\UXXXXXXXX`）、带前缀字符常量定型、`_Alignas` 语境约束与跨声明一致性、`static_assert` 多作用域。
 - 诊断质量：拼写还原 `typedef` 别名、列号拉齐 clang、不完整类型按值分配的前置诊断。
 - 发布包扁平单层：`colang.exe + include/`（标准头随编译器就地定位，无需 `-I`）。
-- Linux（WSL）原生构建打通。
+- Linux（WSL）构建打通：colang 本体已可在 WSL2/Debian 原生构建并跑通回归（此阶段链接仍借助外部工具链）。
 
 ## 计划中
+
+### 0.3.2 — Linux 原生 ELF 工具链（开发中）
+
+- 单一 target/data-model 抽象（`__LP64__`/`__LLP64__`）贯穿预处理宏、类型宽度、代码生成与链接，消除前端与后端的数据模型分裂。
+- Linux 上由进程内 `lld::elf` **静态**链本机 glibc/libgcc 产出原生 ELF 可执行文件（不依赖外部链接器）；`crt1.o`/`libc.a`/`libm.a`/`libgcc` 自动定位。
+- `--target <triple>` 支持交叉产出 ELF 目标文件与 IR。
+- Linux 原生构建 colang（对源码自建 LLVM 23.1，X86+lld）；门槛矩阵（plct）向 Windows 基线对齐。
+- 后续（长尾）：`.so` 动态共享对象、动态 PIE、x86-64 SysV ABI 边角、`winapi.co` 的 ELF 映射、全 stdlib 头 glibc 审计。
 
 ### 0.4.0 — 实现 class
 

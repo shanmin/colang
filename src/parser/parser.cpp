@@ -64,6 +64,8 @@ struct Parser
 	unsigned last_alignas_ = 0; // parse_decl_specifiers 捕获的 _Alignas 强制对齐（字节；0=未指定）
 	// P250：_Alignas 约束检查（§6.7.2.1p3/p4/p6）所需的两项旁路信息
 	SourceLoc last_alignas_loc_;  // 本声明 _Alignas 的位置（诊断指向；仅在 last_alignas_!=0 时有效）
+	SourceLoc gnu_alignas_loc_;   // GNU __attribute__((aligned)) 记录位置（脱糖并入 _Alignas 时供诊断指向）
+		unsigned gnu_decl_align_ = 0;   // GNU __attribute__((aligned)) 提升通道（本声明 aligned 最大值；0=无）：仅取 max 抬升对齐，不触发 _Alignas 约束拒收
 	// 本声明是否出现过 _Alignas（_Alignas(0) 不等于「未出现」：对齐值 0 表示无效果，
 	//   但属性本身仍不得用于 typedef/函数/位域等语境——与 clang 同口径）。
 	bool last_has_alignas_ = false;
@@ -93,6 +95,10 @@ struct Parser
 	std::vector<std::unordered_map<std::string, std::int64_t>> const_local_vals_;
 	// 函数形参名：进入函数体复合语句时注入新作用域
 	std::vector<std::string> pending_param_names_;
+	// 目标 / 数据模型（单一真值源，由 parse() 从 opts.target 注入）：
+	//   驱动编译期 sizeof/_Alignof 的 long/wchar_t/指针宽度。默认构造=Windows/LLP64，
+	//   故 Windows 主机不带 --target 时与旧写死值逐字恒等。
+	TargetInfo target;
 
 	Parser(const std::vector<Token> &tokens, std::vector<Error> &errors)
 		: toks(tokens), errs(errors)
@@ -673,6 +679,110 @@ struct Parser
 		attr_fatal_ = false; // 本位不认领声明，标志不得泄到后续顶层项
 	}
 
+	// ============================================================
+	// GNU __attribute__ 兼容通道（独立于 C23 [[...]]；ADR-104 分级兼容例外）
+	//   定性：为兼容 GCC/Clang 源码而增设——非 ISO C（C89–C23 皆无此语法，标准属性另属 [[...]]），
+	//         亦非 colang 方言。策略：仅 aligned(N) 脱糖并入既有 _Alignas 全链走真语义；其余属性名
+	//         「接受语法 + 忽略 + 警告」（危险类强警告、其余轻警告），不阻断编译。
+	//   返回：本组中 aligned 的最大对齐字节数（0=无 aligned）；非 aligned 者就地发警告。
+	//   与 C23 通道物理隔离（不复用 parse_attributes/last_attrs_，免污染其语义收集）。
+	// ============================================================
+	static std::string gnu_norm_name(const std::string &s)
+	{
+		// 脱去 GNU 惯用的首尾双下划线：__aligned__ -> aligned
+		if (s.size() >= 5 && s.rfind("__", 0) == 0 && s.compare(s.size() - 2, 2, "__") == 0)
+			return s.substr(2, s.size() - 4);
+		return s;
+	}
+	// 布局/ABI 相关属性：忽略它们可能改变内存布局/调用约定/链接，故发强警告（P162 教训：静默错编译比报错更危险）。
+	static bool gnu_is_layout_abi(const std::string &n)
+	{
+		static const char *const v[] = {
+			"packed", "stdcall", "cdecl", "fastcall", "thiscall", "vectorcall",
+			"ms_abi", "sysv_abi", "regparm", "section", "weak", "alias", "ifunc",
+			"dllimport", "dllexport", "constructor", "destructor", "tls_model",
+			"model", "data_members", "align_common", "naked", "optimize"};
+		for (auto p : v) if (n == p) return true;
+		return false;
+	}
+	// 从当前 '(' 之后消费到匹配的 ')'（含嵌套）；用于忽略非 aligned 属性的实参。
+	void skip_balanced_until_close()
+	{
+		int depth = 1; // 调用方已消费左 '('，此处需再匹配一个 ')'
+		while (depth > 0 && !at_end())
+		{
+			if (check_punct("(")) { ++depth; advance(); }
+			else if (check_punct(")")) { --depth; if (depth == 0) { advance(); return; } advance(); }
+			else advance();
+		}
+	}
+	unsigned consume_gnu_attributes()
+	{
+		unsigned aligned_acc = 0;
+		while (check_keyword("__attribute__"))
+		{
+			const SourceLoc kw_loc = peek().loc;
+			advance(); // __attribute__
+			if (!check_punct("(")) { warn(kw_loc, "'__attribute__' expects '('"); break; }
+			advance(); // (
+			if (!check_punct("(")) { warn(kw_loc, "'__attribute__' expects an attribute list in parentheses"); break; }
+			advance(); // (
+			for (;;)
+			{
+				if (check_punct(")")) break; // 内层列表结束，交给收尾双括号
+				if (at_end()) { error(kw_loc, "unterminated '__attribute__'"); return aligned_acc; }
+				const SourceLoc a_loc = peek().loc;
+				std::string raw;
+				if (peek().kind == TokKind::Identifier || peek().kind == TokKind::Keyword)
+					raw = advance().text;
+				else
+					warn(a_loc, "expected attribute name in '__attribute__'");
+				const std::string name = gnu_norm_name(raw);
+				unsigned a_val = 0; bool a_has_arg = false;
+				if (check_punct("("))
+				{
+					if (name == "aligned")
+					{
+						advance(); // (
+						// 支持 aligned(常量表达式)；aligned(alignof(T))/aligned(类型) 等本批降级忽略（罕见）
+						if (check_keyword("_Alignof") || check_keyword("alignof") ||
+							check_keyword("__alignof__") || is_type_start())
+							skip_balanced_until_close();
+						else { ExprPtr ce = parse_assign(); a_val = (unsigned)eval_const_int(ce); a_has_arg = true; expect_punct(")"); }
+					}
+					else
+					{
+						advance(); // (  非 aligned：整组实参平衡吞
+						skip_balanced_until_close();
+					}
+				}
+				if (name == "aligned")
+				{
+					if (a_has_arg)
+					{
+						if (a_val != 0 && (a_val & (a_val - 1)) != 0)
+							error(a_loc, "'aligned' attribute requires a power of two");
+						else if (a_val > aligned_acc) { aligned_acc = a_val; gnu_alignas_loc_ = a_loc; }
+					}
+					else
+						warn(a_loc, "'aligned' without a constant argument is ignored (non-standard, GCC/Clang compatibility)");
+				}
+				else if (!name.empty())
+				{
+					if (gnu_is_layout_abi(name))
+						warn(a_loc, "gnu attribute '" + name + "' ignored: may affect layout/ABI (non-standard, GCC/Clang compatibility)");
+					else
+						warn(a_loc, "gnu attribute '" + name + "' ignored (non-standard, GCC/Clang compatibility)");
+				}
+				if (check_punct(",")) { advance(); continue; }
+				break;
+			}
+			expect_punct(")"); // 内层 )
+			expect_punct(")"); // 外层 )
+		}
+		return aligned_acc;
+	}
+
 	// _BitInt(N) 解析（C23 任意宽度整数）
 	CTypePtr parse_bitint()
 	{
@@ -719,6 +829,8 @@ struct Parser
 			if (it != self->func_return_types_.end()) return it->second;
 			return nullptr;
 		}
+		// 目标数据模型的 long 位宽（供共享解析器整型提升取正确宽度）。
+		unsigned long_bits() const { return static_cast<unsigned>(self->target.sizeof_long) * 8u; }
 	};
 
 	// 编译期常量整数求值（支持 _Static_assert）
@@ -875,10 +987,12 @@ struct Parser
 		switch (t->kind)
 		{
 		case TypeKind::Void: case TypeKind::Bool: case TypeKind::Char: case TypeKind::Char8: return 1;
-		case TypeKind::Short: case TypeKind::WChar: case TypeKind::Char16: return 2;
-		case TypeKind::Int: case TypeKind::Long: case TypeKind::Float: case TypeKind::Enum: case TypeKind::Char32: return 4;
+		case TypeKind::Short: case TypeKind::Char16: return 2;
+		case TypeKind::WChar: return target.sizeof_wchar;
+		case TypeKind::Int: case TypeKind::Float: case TypeKind::Enum: case TypeKind::Char32: return 4;
+		case TypeKind::Long: return target.sizeof_long;
 		case TypeKind::LongLong: case TypeKind::Double: return 8;
-		case TypeKind::Pointer: case TypeKind::Function: return 8; // LLP64
+		case TypeKind::Pointer: case TypeKind::Function: return target.sizeof_pointer; // LLP64/LP64
 		case TypeKind::Array:
 		{
 			int64_t es = const_sizeof_type(t->base);
@@ -900,6 +1014,7 @@ struct Parser
 						if (ms > mx) mx = ms;
 						if (ma > al) al = ma;
 					}
+					if (static_cast<int64_t>(s.align) > al) al = static_cast<int64_t>(s.align);
 					if (static_cast<int64_t>(t->align) > al) al = static_cast<int64_t>(t->align);
 					int64_t r = ((mx + al - 1) / al) * al;
 					return r > 0 ? r : 4;
@@ -913,6 +1028,7 @@ struct Parser
 					if (ma > al) al = ma;
 					off = ((off + ma - 1) / ma) * ma + const_sizeof_type(m.type);
 				}
+				if (static_cast<int64_t>(s.align) > al) al = static_cast<int64_t>(s.align);
 				if (static_cast<int64_t>(t->align) > al) al = static_cast<int64_t>(t->align);
 				int64_t r = ((off + al - 1) / al) * al;
 				return r > 0 ? r : 4;
@@ -983,10 +1099,12 @@ struct Parser
 		switch (t->kind)
 		{
 		case TypeKind::Void: case TypeKind::Bool: case TypeKind::Char: case TypeKind::Char8: natural = 1; break;
-		case TypeKind::Short: case TypeKind::WChar: case TypeKind::Char16: natural = 2; break;
-		case TypeKind::Int: case TypeKind::Long: case TypeKind::Float: case TypeKind::Enum: case TypeKind::Char32: natural = 4; break;
+		case TypeKind::Short: case TypeKind::Char16: natural = 2; break;
+		case TypeKind::WChar: natural = target.sizeof_wchar; break;
+		case TypeKind::Int: case TypeKind::Float: case TypeKind::Enum: case TypeKind::Char32: natural = 4; break;
+		case TypeKind::Long: natural = target.alignof_long; break;
 		case TypeKind::LongLong: case TypeKind::Double: natural = 8; break;
-		case TypeKind::Pointer: case TypeKind::Function: natural = 8; break;
+		case TypeKind::Pointer: case TypeKind::Function: natural = target.sizeof_pointer; break;
 		case TypeKind::Array: natural = const_alignof_type(t->base); break;
 		case TypeKind::BitInt: natural = 1; break; // _BitInt 对齐 = 1
 		case TypeKind::Struct: case TypeKind::Union:
@@ -1001,6 +1119,7 @@ struct Parser
 						int64_t ma = const_member_align(m);
 						if (ma > al) al = ma;
 					}
+					if (static_cast<int64_t>(s.align) > al) al = static_cast<int64_t>(s.align);
 					break;
 				}
 			natural = al;
@@ -1151,15 +1270,17 @@ struct Parser
 				switch (e->type->kind)
 				{
 				case TypeKind::Char: case TypeKind::Char8: bits = 8; break;
-				case TypeKind::Short: case TypeKind::Char16: case TypeKind::WChar: bits = 16; break;
+				case TypeKind::Short: case TypeKind::Char16: bits = 16; break;
+				case TypeKind::WChar: bits = target.sizeof_wchar * 8; break; // 宽度随目标：Win=16、Linux=32
 				case TypeKind::Int: case TypeKind::Long: case TypeKind::Char32: bits = 32; break;
 				case TypeKind::LongLong: bits = 64; break;
 				case TypeKind::BitInt: bits = e->type->bit_width; break;
 				default: bits = 0; break;
 				}
-				switch (e->type->kind) // wchar_t/char8_t/16/32 恒无符号
+				switch (e->type->kind) // wchar_t 符号随目标；char8_t/16/32 恒无符号
 				{
-				case TypeKind::WChar: case TypeKind::Char8: case TypeKind::Char16: case TypeKind::Char32: uns = true; break;
+				case TypeKind::WChar: uns = !target.wchar_signed; break;
+				case TypeKind::Char8: case TypeKind::Char16: case TypeKind::Char32: uns = true; break;
 				default: break;
 				}
 				if (bits > 0 && bits < 64)
@@ -1298,12 +1419,18 @@ struct Parser
 		// —— typedef：各声明符经统一 Decorator（对象/数组/函数指针皆然）——
 		if (is_typedef)
 		{
-			reject_alignas_only_objects(ga_has, ga_loc); // P250：typedef 不得带 _Alignas
+			reject_alignas_only_objects(ga_has, ga_loc); // P250：typedef 不得带 _Alignas（GNU aligned 不属此拒收）
+			// 位点1/4 前置 GNU aligned 提升值（须在声明符解析前捕获，函数指针 typedef 的参数表会清零通道）。
+			const unsigned tgnu = gnu_decl_align_;
 			do
 			{
 				std::string nm;
 				DeclaratorFn d = parse_declarator_rec(nm);
-				typedefs_[nm] = apply_type_align(d(base_type), ga);
+				// 位点后置：typedef 名尾 GNU __attribute__（`typedef int I __attribute__((aligned(16)));`）。
+				//   aligned 施加于别名类型（不入 ga、不逆 P250 reject，与位点3 struct-typedef-aligned 同口径）；余忽略告警。
+				const unsigned tp = consume_gnu_attributes();
+				unsigned tal = ga; if (tgnu > tal) tal = tgnu; if (tp > tal) tal = tp;
+				typedefs_[nm] = apply_type_align(d(base_type), tal);
 			} while (match_punct(","));
 			match_punct(";");
 			return true;
@@ -1330,6 +1457,8 @@ struct Parser
 			expect_punct("(");
 			parse_param_list(fn.params, fn.is_variadic);
 			expect_punct(")");
+			// 位点4：函数声明符尾部 GNU __attribute__（`void foo(void) __attribute__((stdcall));`）。
+			consume_gnu_attributes();
 			if (check_punct("{"))
 			{
 				pending_param_names_.clear();
@@ -1365,6 +1494,7 @@ struct Parser
 		last_register_ = false;
 		last_public_ = false;
 		last_has_alignas_ = false; // P250：入口清零（_Alignas 出现标志，含 _Alignas(0)）
+		gnu_decl_align_ = 0;       // GNU aligned 提升通道入口清零（独立于 _Alignas）
 		last_attrs_ = DeclAttributes(); // P214：中置属性位同样需在入口清空（防递归/上一声明残留）
 		bool cnst_front = false;
 		bool vol_front = false; // P253：volatile 修前被整组丢弃（`volatile int` 丢限定）
@@ -1392,6 +1522,13 @@ struct Parser
 			}
 		};
 		consume_sc_quals();
+		// 位点1：GNU __attribute__ 前缀（非 ISO C，GCC/Clang 兼容；见文件顶 GNU 通道注释）。
+		//   可与存储类/限定符任意交错：前置组在此消费，其后若仍跟存储类，由 _Alignas 循环后的
+		//   consume_sc_quals 兜住。aligned 走**独立提升通道**（gnu_decl_align_）：仅在各对象/成员/
+		//   typedef 落点取 max 抬升对齐，绝不并入 _Alignas 的 acc/last_has_alignas_——因 clang 对 GNU
+		//   __attribute__((aligned)) 不套用 _Alignas 的约束拒收（函数/位域/低于自然对齐均接受）。
+		const unsigned gnu_prefix = consume_gnu_attributes();
+		if (gnu_prefix > gnu_decl_align_) gnu_decl_align_ = gnu_prefix;
 		const bool sc_static = last_static_, sc_extern = last_extern_, sc_typedef = last_typedef_;
 		// C23 _Alignas(...)：§6.7.2.1p6 多个取最大；类型形式取 _Alignof，常量形式取该常量。
 		// 前缀在此消费，避免后续类型解析（struct/typeof 递归）覆盖本声明的对齐值。
@@ -1434,9 +1571,13 @@ struct Parser
 		//   「only applies to variables and fields」）。
 		const bool own_has_alignas = last_has_alignas_;
 		const SourceLoc own_alignas_loc = last_alignas_loc_;
+		const unsigned own_gnu_align = gnu_decl_align_;
+		const SourceLoc own_gnu_loc = gnu_alignas_loc_;
 		CTypePtr r = parse_decl_specifiers_core(top_public);
 		last_has_alignas_ = own_has_alignas;
 		last_alignas_loc_ = own_alignas_loc;
+		gnu_decl_align_ = own_gnu_align;
+		gnu_alignas_loc_ = own_gnu_loc;
 		if (cnst_front && r)
 			r->is_const = true;
 		// P253：volatile/_Atomic 与 const 同一回填口径（clang 将 `int volatile x` 与 `volatile int x` 归一）。
@@ -1470,6 +1611,14 @@ struct Parser
 			if (match_keyword("static")) { last_static_ = true; continue; }
 			if (match_keyword("extern")) { last_extern_ = true; continue; }
 			if (match_keyword("typedef")) { last_typedef_ = true; continue; }
+			// 位点4：GNU __attribute__ 后置（类型说明符与声明符之间，如
+			//   `void __attribute__((stdcall)) f(void)`；非 ISO C，GCC/Clang 兼容）。
+			if (check_keyword("__attribute__"))
+			{
+				const unsigned g2 = consume_gnu_attributes();
+				if (g2 > gnu_decl_align_) gnu_decl_align_ = g2;
+				continue;
+			}
 			break;
 		}
 		last_static_ = last_static_ || sc_static;
@@ -1636,7 +1785,7 @@ struct Parser
 		if (match_keyword("char"))
 			return make_type(TypeKind::Char, cnst);
 		if (match_keyword("wchar_t"))
-			return make_type(TypeKind::WChar, cnst);  // 2 字节无符号（对齐宿主 CRT）
+			return make_type(TypeKind::WChar, cnst);  // 宽度/符号性随 target 分派（Win=i16/unsigned、Linux=i32/signed）；AST 层不置 is_unsigned（由 codegen 读 target 判）
 		// charN_t：恒无符号的独立整型（char8_t=C23/1B、char16_t=C11/2B、char32_t=C11/4B）；
 		//   不可与 signed/unsigned/short/long 复合，故直接 return。
 		if (match_keyword("char8_t"))  { auto t = make_type(TypeKind::Char8,  cnst); t->is_unsigned = true; return t; }
@@ -1712,9 +1861,13 @@ struct Parser
 		{
 			bool is_union = check_keyword("union");
 			advance(); // consume 'struct'/'union'
+			// 位点2：GNU __attribute__ 于 struct/union 关键字与标签名之间（`union __attribute__((packed)) U {`）。
+			unsigned sd_align = consume_gnu_attributes();
 			std::string tag;
 			if (peek().kind == TokKind::Identifier)
 				tag = advance().text;
+			// 位点2：标签名与 '{' 之间（`struct __attribute__((aligned(16))) S {`）。
+			if (auto g = consume_gnu_attributes(); g > sd_align) sd_align = g;
 			if (check_punct("{"))
 			{
 				// 完整定义
@@ -1735,9 +1888,13 @@ struct Parser
 						continue;
 					}
 					CTypePtr mtype = parse_decl_specifiers();
+					const SourceLoc mem_decl_loc = peek().loc; // 成员声明类型起始（备用）
 					unsigned mal = last_alignas_; // 本成员的 _Alignas（后续声明符解析前捕获）
 					const bool mal_has = last_has_alignas_;    // P250
 					const SourceLoc mal_loc = last_alignas_loc_; // P250
+					// 位点1 前置 GNU aligned 走独立 gnu_decl_align_ 通道（不并入 mal——mal 供 _Alignas 专用
+					//   check_alignas_min/reject，GNU 不受该约束）；仅在下方落点取 max 抬 m.align（纯提升）。
+					const unsigned mg = gnu_decl_align_;
 					if (!mtype) { skip_to_semi_or_brace(); continue; }
 					// 匿名 struct/union 成员: type是struct/union且紧跟';'（无成员名）
 					if ((mtype->kind == TypeKind::Struct || mtype->kind == TypeKind::Union)
@@ -1757,7 +1914,8 @@ struct Parser
 							StructMember m;
 							m.name = ""; // 匿名：成员名由 sema/codegen 名提升递归解析
 							m.type = mtype;
-							m.align = last_alignas_;
+							m.align = last_alignas_ > mg ? last_alignas_ : mg;
+							m.loc = mem_decl_loc;
 							sd.members.push_back(std::move(m));
 							match_punct(";");
 							continue;
@@ -1797,16 +1955,23 @@ struct Parser
 							StructMember m;
 							m.name = fp_name;
 							m.type = fp_type;
-							m.align = mal;
+							m.align = mal > mg ? mal : mg;
+							m.loc = mem_decl_loc;
+							// 位点后置：函数指针成员名后 GNU __attribute__（aligned 仅抬 m.align；余忽略告警）。
+							{ const unsigned mp = consume_gnu_attributes(); if (mp > m.align) m.align = mp; }
 							sd.members.push_back(std::move(m));
 							break; // funcptr 不支持逗号分隔多个声明符
 						}
 						dtype = parse_pointer_suffix(dtype);
 						StructMember m;
 						if (!check_punct(":")) // 匿名位域（type : width，无成员名，§6.7.2.1p5）
-							m.name = expect_identifier().text;
+						{ const Token &id = expect_identifier(); m.name = id.text; m.loc = id.loc; }
+						else m.loc = mem_decl_loc;
 						m.type = parse_array_suffix(dtype);
-						m.align = mal;
+						m.align = mal > mg ? mal : mg;
+						// 位点后置：成员名后 GNU __attribute__((aligned)) 仅抬 m.align（纯提升），绝不并入 mal——
+						//   mal 供下方 _Alignas 专用 check_alignas_min/reject，GNU 不受该约束（clang 对 GNU 皆接受）。
+						{ const unsigned mp = consume_gnu_attributes(); if (mp > m.align) m.align = mp; }
 						if (is_void_object_type(m.type))
 							error(peek().loc, "field has incomplete type 'void'");
 						// 位域: name : width
@@ -1824,6 +1989,8 @@ struct Parser
 					match_punct(";");
 				}
 				expect_punct("}");
+				// 位点3：闭 '}' 之后、typedef/变量名之前（`struct S { ... } __attribute__((packed)) x;`）。
+				if (auto g = consume_gnu_attributes(); g > sd_align) sd_align = g;
 				// 匿名 struct/union: 分配合成 tag
 				if (tag.empty() && !sd.members.empty())
 				{
@@ -1835,6 +2002,9 @@ struct Parser
 				sd.tag = tag;
 				// P217：顶层 public 回填——仅最外层被定义的 struct 继承 public（成员循环等内部调用保持默认 false）
 				sd.is_public = sd.is_public || top_public;
+				// GNU __attribute__((aligned(N))) 于 struct/union 类型（位点2/3）：登进 StructDef，
+				//   供后续按 tag 引用（`struct B`）时 const_sizeof/const_alignof 与 codegen 布局一致采用。
+				sd.align = sd_align;
 				// 前置声明已由 begin_definition_tag 登记：原地补全，避免同一 tag 出现两条定义，
 				// 使按 tag 取首个匹配的成员查找（offsetof/sizeof/成员访问）读到空壳。
 				bool completed_in_place = false;
@@ -1880,6 +2050,8 @@ struct Parser
 			st->kind = is_union ? TypeKind::Union : TypeKind::Struct;
 			st->tag = tag;
 			st->is_const = cnst;
+			// aligned 直接抬升聚合类型对齐（独立于 _Alignas acc 链：GNU aligned 于 typedef 合法且有意义）
+			if (sd_align && sd_align > st->align) st->align = sd_align;
 			return st;
 		}
 		// enum
@@ -2037,6 +2209,7 @@ struct Parser
 			}
 			SourceLoc ploc = peek().loc; // 形参声明起点（诊断用）
 			Param p;
+			p.loc = ploc;
 			CTypePtr base = parse_decl_specifiers();
 			reject_alignas(last_has_alignas_, last_alignas_loc_, "a function parameter"); // P250：形参不得带 _Alignas
 			if (!base)
@@ -2362,6 +2535,9 @@ struct Parser
 		unsigned al = last_alignas_; // 本声明的 _Alignas（在后续递归解析前捕获）
 		const bool al_has = last_has_alignas_;    // P250
 		const SourceLoc al_loc = last_alignas_loc_; // P250
+		// 位点1 前置 GNU aligned 走独立 gnu_decl_align_ 通道（声明符解析前捕获，函数指针参数表会清零）；
+		//   仅在各落点取 max 经 apply_type_align 纯提升，绝不并入 al（al 供 _Alignas 专用 check_alignas_min）。
+		const unsigned bgnu = gnu_decl_align_;
 		if (!base_type && !last_auto_) return nullptr;
 		// C23 auto 类型推断: 解析 name + init，然后推断类型
 		if (last_auto_)
@@ -2404,7 +2580,10 @@ struct Parser
 			do {
 				std::string nm;
 				DeclaratorFn d = parse_declarator_rec(nm);
-				typedefs_[nm] = apply_type_align(d(base_type), al);
+				// 位点后置：块级 typedef 名尾 GNU __attribute__（aligned 施加于别名类型；余忽略告警）。
+				const unsigned tp = consume_gnu_attributes();
+				unsigned tal = al; if (bgnu > tal) tal = bgnu; if (tp > tal) tal = tp;
+				typedefs_[nm] = apply_type_align(d(base_type), tal);
 			} while (match_punct(","));
 			match_punct(";");
 			// 返回空 ExprStmt 作占位
@@ -2430,10 +2609,15 @@ struct Parser
 			s->var_name = nm;
 			if (is_void_object_type(s->var_type))
 				error(s->loc, "variable has incomplete type 'void'");
-			check_alignas_min(al, al_loc, s->var_type); // P250：强制对齐不得弱于自然对齐
+			// 位点后置：局部变量声明符尾 GNU __attribute__((aligned))——独立纯提升通道，
+			//   仅经 apply_type_align 抬 s->var_type 并计入 var_align，绝不并入 al（al 供 _Alignas 专用 check_alignas_min）。
+			const unsigned bp = consume_gnu_attributes();
+			const unsigned bgnu_here = bgnu > bp ? bgnu : bp;
+			check_alignas_min(al, al_loc, s->var_type); // P250：_Alignas 强制对齐不得弱于自然对齐（GNU 不套用此约束）
+			if (bgnu_here) s->var_type = apply_type_align(s->var_type, bgnu_here);
 			s->is_static = is_static;
 			s->is_extern = is_extern;
-			s->var_align = al;
+			s->var_align = al > bgnu_here ? al : bgnu_here;
 			if (match_punct("="))
 				s->var_init = check_punct("{") ? parse_init_list() : parse_assign();
 			// 块内函数定义（C 不允许）：函数体只能出现在文件作用域。
@@ -2672,6 +2856,10 @@ struct Parser
 
 	DeclaratorFn parse_declarator_rec(std::string &name, std::vector<Param>* own = nullptr)
 	{
+		// 位点5/6：GNU __attribute__ 可出现于声明符各嵌套层（如函数指针类型 `int(ATTR *)(void)`）。
+		//   必须在入口消费，否则 `__attribute__`（词法为 Identifier）会被 parse_direct_rec 误读为声明符名
+		//   （即 00210 记录的 GCC 式误解析）。此语境 aligned 无对象可施加，值丢弃。
+		consume_gnu_attributes();
 		if (check_punct("*"))
 		{
 			advance();
@@ -2798,8 +2986,14 @@ struct Parser
 	{
 		std::string nm;
 		std::vector<Param> own; // 紧邻标识符的具名参数（分组/返回函数指针的函数定义用）
+		// 位点1/4：本次声明 parse_decl_specifiers 累积的 GNU aligned 提升值须在 parse_declarator_rec 之前捕获
+		//   （函数指针声明符的参数表会再入 parse_decl_specifiers 并清零该通道）。
+		const unsigned gnu_pre = gnu_decl_align_;
 		DeclaratorFn d = parse_declarator_rec(nm, &own);
 		CTypePtr type = d(base_type);
+		// 位点后置：声明符尾 GNU __attribute__（aligned 记入提升通道；其余属性就地警告忽略）。
+		const unsigned gnu_post = consume_gnu_attributes();
+		const unsigned gnu_here = gnu_pre > gnu_post ? gnu_pre : gnu_post;
 		if (type->kind == TypeKind::Function)
 		{
 			reject_alignas_only_objects(ga_has, ga_loc); // P250：函数不得带 _Alignas
@@ -2843,8 +3037,10 @@ struct Parser
 		gv.type = type;
 		if (is_void_object_type(gv.type))
 			error(loc, "variable has incomplete type 'void'");
-		check_alignas_min(ga, ga_loc, gv.type); // P250：强制对齐不得弱于自然对齐
-		gv.align = ga;
+		check_alignas_min(ga, ga_loc, gv.type); // P250：强制对齐不得弱于自然对齐（仅 _Alignas；GNU aligned 纯提升不触发）
+		// GNU aligned 纯提升（取 max、绝不降）：抬升类型节点对齐（供 sizeof/_Alignof/codegen 感知）。
+		if (gnu_here) gv.type = apply_type_align(gv.type, gnu_here);
+		gv.align = ga > gnu_here ? ga : gnu_here;
 		// P252：跨声明一致性所需事实（比对在 sema 侧，那里能看到同一对象的全部声明记录）：
 		//   「出现过 _Alignas」与「结果对齐」分开存——_Alignas(0) 属「出现过但对齐无抬升」，
 		//   clang 的「A vs B」比的是结果对齐（= max(给定值, 自然对齐)）。
@@ -2853,7 +3049,8 @@ struct Parser
 		gv.ident_loc = last_ident_loc_;
 		{
 			const int64_t nat = const_alignof_type(gv.type);
-			const int64_t eff = static_cast<int64_t>(ga) > nat ? static_cast<int64_t>(ga) : nat;
+			const int64_t given = gv.align; // 已并入 _Alignas 与 GNU aligned 的最大提升
+			const int64_t eff = given > nat ? given : nat;
 			gv.align_effective = eff > 0 ? static_cast<unsigned>(eff) : 0;
 		}
 		gv.is_static = is_static;
@@ -3008,27 +3205,57 @@ struct Parser
 	}
 
 	// 判断当前 '('_后_一个_token_是否是类型关键字或 typedef 名（用于 cast 消歧）
-	bool is_type_after_paren() const
+	bool is_type_lead(const Token &t) const
 	{
-		const Token &t = peek(1);
 		if (t.kind != TokKind::Keyword && t.kind != TokKind::Identifier)
 			return false;
-		if (t.text == "void" || t.text == "char" || t.text == "wchar_t" ||
-			t.text == "char8_t" || t.text == "char16_t" || t.text == "char32_t" ||
-			t.text == "short" ||
-			t.text == "int" || t.text == "long" || t.text == "float" ||
-			t.text == "double" || t.text == "signed" || t.text == "unsigned" ||
-			t.text == "const" || t.text == "volatile" || t.text == "struct" || t.text == "union" ||
-			t.text == "enum" || t.text == "_Bool" || t.text == "bool" ||
-			t.text == "_BitInt" || t.text == "typeof" || t.text == "typeof_unqual" ||
-			t.text == "constexpr" || t.text == "_Atomic")
+		const std::string &s = t.text;
+		if (s == "void" || s == "char" || s == "wchar_t" ||
+			s == "char8_t" || s == "char16_t" || s == "char32_t" ||
+			s == "short" ||
+			s == "int" || s == "long" || s == "float" ||
+			s == "double" || s == "signed" || s == "unsigned" ||
+			s == "const" || s == "volatile" || s == "struct" || s == "union" ||
+			s == "enum" || s == "_Bool" || s == "bool" ||
+			s == "_BitInt" || s == "typeof" || s == "typeof_unqual" ||
+			s == "constexpr" || s == "_Atomic")
 			return true;
-		if (typedefs_.count(t.text)) return true;
+		if (typedefs_.count(s)) return true;
 		// P232 Co 层：裸标签名作 cast/参数类型（仅 .co 生效）
 		if (co_mode_ && t.kind == TokKind::Identifier &&
-			(struct_tags_.count(t.text) > 0 || enum_tag_names_.count(t.text) > 0))
+			(struct_tags_.count(s) > 0 || enum_tag_names_.count(s) > 0))
 			return true;
 		return false;
+	}
+	bool is_type_after_paren() const
+	{
+		return is_type_lead(peek(1));
+	}
+	// 站在 '(' 处：判断是否为强制类型转换的左括号。除常规类型起始外，额外越过前置的
+	//   GNU __attribute__((...)) 组再判定（位点5：`((ATTR int(*)(void)) fp)` 中 ATTR 后才是类型）。
+	bool is_cast_open_paren() const
+	{
+		std::size_t off = 1;
+		for (;;)
+		{
+			const Token &t = peek(off);
+			const bool is_kw = (t.kind == TokKind::Keyword || t.kind == TokKind::Identifier);
+			if (!is_kw || t.text != "__attribute__") break;
+			++off; // 越过 __attribute__
+			int depth = 0;
+			while (off < toks.size())
+			{
+				const Token &x = peek(off);
+				if (x.kind == TokKind::Punct && x.text == "(") ++depth;
+				else if (x.kind == TokKind::Punct && x.text == ")")
+				{
+					--depth;
+					if (depth == 0) { ++off; break; }
+				}
+				++off;
+			}
+		}
+		return is_type_lead(peek(off));
 	}
 
 	// 站在声明符起始 '('：判断其后是否为函数指示符参数表（vs 分组声明符）。§6.7.6p6
@@ -3143,7 +3370,7 @@ struct Parser
 	ExprPtr parse_unary()
 	{
 		// 显式类型转换: (type-specifier) unary-expr
-		if (check_punct("(") && is_type_after_paren())
+		if (check_punct("(") && is_cast_open_paren())
 		{
 			auto e = std::make_shared<Expr>();
 			e->kind = ExprKind::Cast;
@@ -3776,7 +4003,20 @@ struct Parser
 			else
 			{
 				e->int_val = co_decode_char_wide(t.text);
-				if ((e->char_prefix == "L" || e->char_prefix == "u") && e->int_val > 0xFFFF)
+				// 宽前缀字面量宽度判据：
+				//   u  → char16_t 恒 16 位（定宽、与 target 无关） → 0xFFFF
+				//   L  → wchar_t 宽度随 target 分派（Win=2 → 0xFFFF；Linux=4 → 0x10FFFF，
+				//         上限取 UTF-32 码点域顶，因码点本身就不超 0x10FFFF、不依赖
+				//         sizeof_wchar*8 的理论上界 0xFFFFFFFF）
+				//   U  → char32_t 恒 32 位（co_decode_char_wide 产的码点天然不超 0x10FFFF）→ 不校验
+				// 修前（rev 58）：L 与 u 同写死 0xFFFF，Linux target 下 wchar_t=4 应容 `L'\U0001F600'`
+				//   (0x1F600) UTF-32 码点、旧判错拒；Win target 下行为逐字不变（回归集恒等）。
+				uint64_t max_val = 0;
+				if (e->char_prefix == "u")                          max_val = 0xFFFF;
+				else if (e->char_prefix == "L" && target.sizeof_wchar <= 2) max_val = 0xFFFF;
+				else if (e->char_prefix == "L" /* && sizeof_wchar >= 3 */ ) max_val = 0x10FFFF; // UTF-32 码点域顶
+				// U 前缀：max_val 保持 0，不触发下面报错
+				if (max_val != 0 && static_cast<uint64_t>(e->int_val) > max_val)
 					error(t.loc, "character too large for enclosing character literal type");
 			}
 			return e;
@@ -3821,6 +4061,7 @@ bool parse(const CompileOptions &opts, CompileState &state, std::vector<Error> &
            const std::vector<ImportConstSeed> &const_seeds)
 {
 	Parser p(state.tokens, errors);
+	p.target = opts.target; // 注入单一目标真值源（数据模型驱动 sizeof/_Alignof）
 	// P232：以源文件后缀界定 Co「新面」；仅 .co 启用裸标签作类型，.c（纯 C 档）逐字维持 ISO C。
 	{
 		const std::string &sp = opts.source_path;

@@ -777,14 +777,31 @@ void Preprocessor::seed_predefined_macros()
 		m.body.push_back(t);
 		macros_[name] = std::move(m);
 	};
-	// —— 平台（OS）分派：_WIN32 在 32/64 位 Windows 上均定义（惯例）——
-	def_num("_WIN32", "1");
-	def_num("_WIN64", "1");
-	// —— 架构 / 字长分派 ——
-	def_num("_M_X64", "100");            // MSVC x64 约定值
-	def_num("__x86_64__", "1");          // 通用 x86-64 约定值
-	def_num("_INTEGRAL_MAX_BITS", "64"); // 最大整型位宽
-	def_num("_MSC_VER", "1951");         // MSVC 兼容版本（本机 clang 实测）
+	// —— 目标 / 数据模型分派（单一真值源：opts_.target，见 target.h）——
+	// 采 GCC 式数据模型宏（与 __x86_64__ 同类）：如实体制当前目标的数据模型
+	//   —— Windows→LLP64(long=4)、Linux→LP64(long=8)。当前仅 x86-64 目标。
+	if (opts_.target.is_linux)
+	{
+		// —— Linux / glibc（ELF, LP64）——
+		def_num("__linux__", "1");
+		def_num("__gnu_linux__", "1");
+		def_num("__ELF__", "1");
+		def_num("__x86_64__", "1");
+		def_num("__LP64__", "1");   // 32 位目标应改 __ILP32__；当前仅 x86-64
+		// 不发：_WIN32/_WIN64/_M_X64/_MSC_VER/_INTEGRAL_MAX_BITS
+	}
+	else
+	{
+		// —— Windows（COFF, LLP64）：MSVC 兼容集 + GCC 式数据模型宏 ——
+		// _WIN32 在 32/64 位 Windows 上均定义（惯例）
+		def_num("_WIN32", "1");
+		def_num("_WIN64", "1");
+		def_num("_M_X64", "100");            // MSVC x64 约定值
+		def_num("__x86_64__", "1");          // 通用 x86-64 约定值
+		def_num("_INTEGRAL_MAX_BITS", "64"); // 最大整型位宽
+		def_num("_MSC_VER", "1951");         // MSVC 兼容版本（本机 clang 实测）
+		def_num("__LLP64__", "1");           // GCC 式数据模型宏（long=4、指针=8）
+	}
 	// 注：__FILE__/__LINE__/__DATE__/__TIME__/__STDC__/__STDC_VERSION__/__STDC_HOSTED__
 	//     由 expand_seq 内置伪宏链特殊处理（并列入 is_defined），此处不重复种入。
 }
@@ -1770,6 +1787,8 @@ bool Preprocessor::handle_include(const std::vector<Token> &line)
 				return true;
 			}
 			src_stack_.push_back(std::make_unique<Src>(cand, std::move(text)));
+			if (opts_.rc_dialect) // RC 方言：新压入源按 rc.exe 规则切串
+				src_stack_.back()->lexer.set_rc_string_mode(true);
 			return true; // 新源已压栈，由主循环从栈顶继续拉取
 		}
 	}
@@ -2313,9 +2332,40 @@ static void concat_adjacent_strings(std::vector<Token> &out)
 	out.swap(merged);
 }
 
+// 自动加载：解析并把 colang.h 压入源栈。压栈范式同 handle_include（angle 形式→仅搜
+// include_dirs；normalize_path + pragma_once_ 去重），区别在找不到时静默跳过、不报错，
+// 且仅由 run() 在压入主源后调用一次。
+void Preprocessor::push_builtin_include(const std::string &name)
+{
+	std::string cand;
+	if (!resolve_header_path(name, false, std::string(), opts_, cand))
+	{
+		return; // 未随编译器附带本头：静默跳过、不影响既有行为
+	}
+	std::string text;
+	if (!read_whole_file(cand, text))
+	{
+		return;
+	}
+	if (pragma_once_.count(normalize_path(cand)))
+	{
+		return; // 防御：colang.h 现用包含守卫而非 #pragma once，此分支当前恒不触发
+	}
+	src_stack_.push_back(std::make_unique<Src>(cand, std::move(text)));
+	if (opts_.rc_dialect) // RC 方言：内建包含源同样按 rc.exe 规则切串
+		src_stack_.back()->lexer.set_rc_string_mode(true);
+}
+
 bool Preprocessor::run(std::vector<Token> &out)
 {
 	src_stack_.push_back(std::make_unique<Src>(opts_.source_path, opts_.source_text));
+	if (opts_.rc_dialect) // RC 方言：主源（.rc）按 rc.exe 规则切串
+		src_stack_.back()->lexer.set_rc_string_mode(true);
+	if (opts_.preload_colang_h)
+	{
+		// 再压 → colang.h 位于主源之上、先被拉取展开，EOF 后弹回主源；本头仅定义宏→零输出 token
+		push_builtin_include("colang.h");
+	}
 	for (;;)
 	{
 		std::vector<Token> line;
@@ -2341,7 +2391,9 @@ bool Preprocessor::run(std::vector<Token> &out)
 	// 阶段 6：相邻字符串字面量拼接（§6.4.5/6.7.9）。宏展开后 token 流中严格相邻的
 	// String token 必为拼接（逗号/分号/运算符均会隔开），故在此单点合并即可让下游
 	// （parser/sema/codegen/全局初始化折叠）一致视单个字面量。c-testsuite 00115。
-	concat_adjacent_strings(out);
+	// RC 方言例外：.rc 合法允许一行并列多个字符串 token（名/类型/文件），不做此合并。
+	if (!opts_.rc_dialect)
+		concat_adjacent_strings(out);
 	return true;
 }
 

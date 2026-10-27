@@ -54,6 +54,10 @@ using CTypePtr = std::shared_ptr<CType>;
 struct Expr;
 using ExprPtr = std::shared_ptr<Expr>;   // 前置声明：CType 需携带 VLA 维度表达式
 
+// 路 B 阶段1b-iii：限定访问绑定字段需引 FuncDecl/GlobalVar 指针——前置声明（完整定义见后）。
+struct FuncDecl;
+struct GlobalVar;
+
 struct CType
 {
 	TypeKind kind = TypeKind::Int;
@@ -216,6 +220,13 @@ struct Expr
 	std::string desig_field;    // .member 成员名（空 = 无）；链式时为首级
 	// 完整设计符链（P237）：链长 ≥ 2 时走链式路径，首级仍回填上面两个兼容字段
 	std::vector<DesigStep> desig_chain;
+
+	// 路 B 阶段1b-iii：限定访问 m.f() / m.x 绑定（sema 决议后挂 AST 指针，codegen 直读、
+	//   不经名字符串复找回）。仅 per-module 转正路径的限定访问填；旧单遍/.c/无 import 恒空、
+	//   codegen 逐字等价零改动。
+	const FuncDecl *q_func = nullptr;    // m.f()/m.f 决议到的目标函数（Member 节点上）
+	const GlobalVar *q_global = nullptr; // m.x 决议到的目标全局变量（Member 节点上）
+	bool module_qualifier = false;       // 基 VarRef 名是模块限定符（非变量），抑制 undeclared 诊断
 };
 
 // ============================================================
@@ -316,6 +327,7 @@ struct Param
 {
 	std::string name;
 	CTypePtr type;
+	SourceLoc loc; // 形参声明起始位置（诊断 note 用）
 };
 
 struct FuncDecl
@@ -340,6 +352,9 @@ struct FuncDecl
 	// P212 loader 归属标记：源模块规范化绝对路径 key；空串 = 主源 TU 本体。
 	//   仅 loader 在合并前写入；parser/sema/codegen 默认空即视为「主源」。
 	std::string source_module_key;
+	// 路 B 阶段2-c：sema 撞名分流裁定的 LLVM 链接符号名（空 = 用 name）。
+	//   跨模块同名需共存时挂 dunder 合成名 `__<stem>__<name>`（仍合法 C 标识符）；codegen 取符号一律走此。
+	std::string symbol_name;
 };
 
 struct GlobalVar
@@ -362,6 +377,8 @@ struct GlobalVar
 	SourceLoc ident_loc;          // 声明符标识符位置（「must be specified on definition」指此列）
 	SourceLoc loc;
 	std::string source_module_key;  // P212 同 FuncDecl
+	// 路 B 阶段2-c：sema 撞名分流裁定的 LLVM 链接符号名（空 = 用 name；同 FuncDecl）。
+	std::string symbol_name;
 };
 
 // ============================================================
@@ -373,6 +390,7 @@ struct StructMember
 	CTypePtr type;
 	int bit_width = -1;  // -1 = 普通成员; >=0 = 位域宽度
 	unsigned align = 0;  // C23 _Alignas 成员强制对齐（字节；0 = 未指定）
+	SourceLoc loc;       // 成员声明起始位置（诊断 note 用）
 };
 
 struct StructDef
@@ -381,6 +399,7 @@ struct StructDef
 	bool is_union = false;
 	bool is_definition = false; // 带 { ... } 的完整定义（false = 仅前置引用，成员表为空不代表空类型）
 	std::vector<StructMember> members;
+	unsigned align = 0;   // GNU __attribute__((aligned(N))) 施加于 struct/union 类型本身（字节；0=未指定）
 	SourceLoc loc;
 	bool is_public = false;         // P212：struct 定义可标 public 参与 import
 	std::string source_module_key;  // P212 同 FuncDecl
@@ -464,6 +483,9 @@ struct TranslationUnit
 	//   主源自身的顶层裸语句 = top_level_body[imported_top_level_body_count .. end)。
 	//   sema 走查可见性时对 index < 本字段的项目跳过（视为 imported 内部事务、不查跨模块可见性）。
 	std::size_t imported_top_level_body_count = 0;
+	// --per-module 探针（路 B）：逐模块顶层裸句分段视图（拓序：最深依赖在前）。
+	//   双写字段：top_level_body 照旧摊平前插、既有路径零变动；仅 codegen 分桶模式读此。key＝规范化绝对路径。
+	std::vector<std::pair<std::string, std::vector<StmtPtr>>> top_level_segments;
 };
 
 using TUPtr = std::shared_ptr<TranslationUnit>;

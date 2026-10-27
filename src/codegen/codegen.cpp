@@ -21,7 +21,9 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <cctype>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -32,6 +34,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 
@@ -79,6 +82,8 @@ struct CodeGenImpl
 	std::unique_ptr<llvm::Module> module;
 	llvm::IRBuilder<> builder;
 	std::vector<Error> &errs;
+	// 目标 / 数据模型（由 generate() 从 opts.target 注入）：驱动三元组与 long/wchar_t 的 LLVM 类型宽度。
+	TargetInfo target_;
 	// 局部符号表：变量名 -> alloca/GlobalVariable 指针
 	std::unordered_map<std::string, llvm::Value*> vars_;
 	// 全局符号表
@@ -140,11 +145,164 @@ struct CodeGenImpl
 	// 文件作用域复合字面量物化的匿名静态全局对象命名计数（00149/00150）
 	int anon_ctr_ = 0;
 
-	CodeGenImpl(const std::string &mod_name, std::vector<Error> &errors)
-		: builder(ctx), errs(errors)
+	// —— --per-module 探针（路 B 竖切片，2026-10-26）：逐模块分桶多 llvm::Module。——
+	//   per_module_=false 时全部新逻辑短路、gen_tu/pipeline/finish_entry 行为与现状逐字等价（零回归）。
+	bool per_module_ = false;                        // generate() 从 opts 注入
+	// 路 B 阶段2-b/1c：单 obj 合回标志——linkInModule 会丢弃导入桶的 .drectve private 全局
+	//   （仅 ExternalLinkage 函数/__init__ 存活），故合并态须由主桶统一发射全量 lib 指令。
+	bool per_module_single_obj_ = false;             // generate() 从 opts 注入
+	// 路 B 阶段3：产出形态——`-o *.dll` 判定（driver→codegen 透传）。为真时入口合成
+	//   从 main 改合成 DllMain（顶层初始化载体）；exe 恒 false、与旧逐字等价。
+	bool output_is_dll_ = false;                     // generate() 从 opts 注入
+	// 路 B 阶段3：`.co` 新面标志（仅 .co 的 WinMain/DllMain 载体参与顶层初始化捕获，
+	//   纯 C 档恒 false、逐字不变）。
+	bool is_co_ = false;                             // generate() 从 opts 注入
+	std::string cur_bucket_key_;                     // 当前发射桶的 source_module_key（""＝主桶）
+	std::vector<std::unique_ptr<llvm::Module>> done_buckets_; // 已完结模块桶（待逐桶 emit_object_file）
+	std::unordered_map<std::string, const FuncDecl *> canon_; // 规范声明表（升格自 gen_tu 局部、跨桶共享）
+	// 路 B 阶段2-c：当前桶的 TU 指针（供分桶裸名→符号解析查本桶自有定义）；非分桶不使用。
+	const TranslationUnit *cur_tu_ = nullptr;
+	std::unordered_map<std::string, std::string> gdef_bucket_; // 全局变量名 → 定义桶 key（仅分桶模式填）
+	std::vector<std::string> imported_init_names_; // 拓序排列的各导入桶 __init__ 函数名（仅分桶模式填）
+	// 顶层非恒定运行的 pending store 条目（P219；自 gen_tu 局部升格供分桶复用）
+	struct TlPendingInit { llvm::GlobalVariable *gvar; ExprPtr init; CTypePtr ctype; };
+
+	// 建一个带三元组/DataLayout 的模块（构造器同款设置，抽成函数供逐桶复用）。
+	std::unique_ptr<llvm::Module> make_module(const std::string &mod_name)
+	{
+		auto m = std::make_unique<llvm::Module>(mod_name, ctx);
+		llvm::Triple triple(target_.triple);
+		m->setTargetTriple(triple);
+		std::string dl_str;
+		if (triple.isArch64Bit() && triple.isOSWindows())
+			dl_str = "e-m:w-p270:32:32-p271:32:32-i64:64-f80:32-n8:16:32:64-S128";
+		else if (triple.isArch64Bit())
+			dl_str = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
+		else
+			dl_str = "e-m:e-p:32:32-i64:64-f80:32-n8:16:32-a:0:32-S128";
+		m->setDataLayout(dl_str);
+		return m;
+	}
+
+	// 切桶：换当前模块、重置桶内符号表（类型缓存在 ctx 层、跨桶合法保留；
+	//   annexk handler 是模块内私有 GV，跨桶残留即非法引用、必须清）。
+	void begin_bucket(std::unique_ptr<llvm::Module> m, const std::string &key)
+	{
+		module = std::move(m);
+		cur_bucket_key_ = key;
+		globals_.clear();
+		annexk_handler_gv_ = nullptr;
+	}
+
+	// 实体是否属于当前桶（非分桶模式恒真＝现状全部摊单桶）。
+	bool in_cur_bucket(const std::string &key) const
+	{
+		if (!per_module_)
+			return true;
+		return key == cur_bucket_key_;
+	}
+
+	// 统一函数引用决议：本桶已有→直用；非分桶→旧 getFunction 语义逐字等价；
+	//   分桶且他桶有定义/原型→当前桶造 External 声明（链接器归并定义）。
+	// 路 B 阶段2-c：入参为裸名，内部解析为应使用的 LLVM 符号（symbol_name 命中时用之）。
+	llvm::Function *func_ref(const std::string &nm)
+	{
+		const std::string sym = resolve_func_symbol(nm);
+		if (llvm::Function *F = module->getFunction(sym))
+			return F;
+		if (!per_module_)
+			return nullptr;
+		auto it = canon_.find(nm);
+		if (it == canon_.end())
+			return nullptr;
+		llvm::FunctionType *ft = to_func_type(*it->second);
+		llvm::FunctionCallee FC = module->getOrInsertFunction(sym, ft);
+		if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee()))
+			F->addFnAttr("uwtable");
+		return llvm::dyn_cast<llvm::Function>(FC.getCallee());
+	}
+
+	// 路 B 阶段2-c：定义/引用统一符号名（symbol_name 空→裸名；默认路径恒空、逐字等价）。
+	static std::string func_symbol(const FuncDecl &fn)
+	{
+		return fn.symbol_name.empty() ? fn.name : fn.symbol_name;
+	}
+	// 路 B 阶段2-c：分桶下把裸名解析为应使用的 LLVM 符号——本桶自有 decl 优先，其次 canon_ 目标；
+	//   非分桶恒返回裸名（默认路径零改动）。
+	std::string resolve_func_symbol(const std::string &nm)
+	{
+		if (!per_module_) return nm;
+		if (cur_tu_)
+			for (const auto &f : cur_tu_->funcs)
+				if (f.name == nm && f.source_module_key == cur_bucket_key_)
+					return func_symbol(f);
+		auto it = canon_.find(nm);
+		if (it != canon_.end()) return func_symbol(*it->second);
+		return nm;
+	}
+
+	// 统一全局变量引用决议（同上；声明类型取 global_types_ 登记表，与定义桶经
+	//   to_llvm_alloca_type 同源一致）。本桶将有定义但尚未发射→仍回 null（前向 ref 旧口径）。
+	llvm::GlobalVariable *global_ref(const std::string &nm)
+	{
+		auto git = globals_.find(nm);
+		if (git != globals_.end())
+			return git->second;
+		if (!per_module_)
+			return nullptr;
+		auto bit = gdef_bucket_.find(nm);
+		if (bit == gdef_bucket_.end() || bit->second == cur_bucket_key_)
+			return nullptr;
+		auto tit = global_types_.find(nm);
+		if (tit == global_types_.end() || !tit->second ||
+			tit->second->kind == TypeKind::Void)
+			return nullptr;
+		llvm::Type *ty = to_llvm_alloca_type(tit->second);
+		auto *gvar = new llvm::GlobalVariable(*module, ty, false,
+			llvm::GlobalValue::ExternalLinkage, nullptr, nm);
+		globals_[nm] = gvar;
+		return gvar;
+	}
+
+	// 路 B 阶段1b-iii：全局变量统一符号名（symbol_name 空→裸名；与函数 func_symbol 同口径）。
+	//   仅作 LLVM GlobalVariable 的**发射名**，内部 globals_/global_types_ 仍按裸名键控（零回归）。
+	static std::string global_symbol(const GlobalVar &gv)
+	{
+		return gv.symbol_name.empty() ? gv.name : gv.symbol_name;
+	}
+
+	// 路 B 阶段1b-iii：限定访问目标函数引用（按 symbol 解析，他桶定义经 linkInModule 归并）。
+	llvm::Function *qualified_func_ref(const FuncDecl *f)
+	{
+		const std::string sym = func_symbol(*f);
+		if (llvm::Function *F = module->getFunction(sym))
+			return F;
+		llvm::FunctionType *ft = to_func_type(*f);
+		llvm::FunctionCallee FC = module->getOrInsertFunction(sym, ft);
+		if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee()))
+			F->addFnAttr("uwtable");
+		return llvm::cast<llvm::Function>(FC.getCallee());
+	}
+
+	// 路 B 阶段1b-iii：限定访问目标全局变量取址（他桶定义→本造 External 声明，合并后由链接器归并）。
+	llvm::Value *qualified_global_addr(const ExprPtr &e)
+	{
+		const GlobalVar *g = e->q_global;
+		const std::string sym = global_symbol(*g);
+		if (llvm::GlobalVariable *gv = module->getGlobalVariable(sym))
+			return gv;
+		llvm::Type *ty = g->type ? to_llvm_alloca_type(g->type)
+			: llvm::Type::getInt32Ty(ctx); // 类型缺失兵底（不应发生，sema 已拦 void）
+		auto *gvar = new llvm::GlobalVariable(*module, ty, false,
+			llvm::GlobalValue::ExternalLinkage, nullptr, sym);
+		return gvar;
+	}
+
+	CodeGenImpl(const std::string &mod_name, const TargetInfo &tgt, std::vector<Error> &errors)
+		: builder(ctx), errs(errors), target_(tgt)
 	{
 		module = std::make_unique<llvm::Module>(mod_name, ctx);
-		llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
+		llvm::Triple triple(target_.triple);
 		module->setTargetTriple(triple);
 		// 设置 DataLayout（x86_64 Windows，指针 8B，int 4B）
 		std::string dl_str;
@@ -179,12 +337,17 @@ struct CodeGenImpl
 		case TypeKind::Char32:
 			return llvm::Type::getInt32Ty(ctx);  // char32_t: i32（4 字节恒无符号）
 		case TypeKind::WChar:
-			return llvm::Type::getInt16Ty(ctx);  // wchar_t: i16（2 字节，对齐宿主 CRT unsigned short）
+			// wchar_t 宽度随目标：Windows 2（i16）、Linux/glibc 4（i32）
+			return target_.sizeof_wchar == 4 ? llvm::Type::getInt32Ty(ctx)
+			                                 : llvm::Type::getInt16Ty(ctx);
 		case TypeKind::Short:
 			return llvm::Type::getInt16Ty(ctx);  // short: i16（2 字节，signed/unsigned 由 is_unsigned 区分）
 		case TypeKind::Int:
+			return llvm::Type::getInt32Ty(ctx); // int 恒 i32
 		case TypeKind::Long:
-			return llvm::Type::getInt32Ty(ctx); // LLP64: int=i32, long=i32
+			// long 随数据模型：LLP64(Windows)=i32、LP64(Linux)=i64
+			return target_.sizeof_long == 8 ? llvm::Type::getInt64Ty(ctx)
+			                               : llvm::Type::getInt32Ty(ctx);
 		case TypeKind::LongLong:
 			return llvm::Type::getInt64Ty(ctx); // long long = i64
 		case TypeKind::Float:
@@ -309,18 +472,22 @@ struct CodeGenImpl
 	{
 		auto it = struct_types_.find(tag);
 		if (it != struct_types_.end()) return it->second;
+		// 路 B 阶段2：分桶模式下 LLVM 类型名携模块短名前缀（struct.<stem>.<tag>），使单 obj
+		//   linkInModule 合流时跨模块同名异布局 struct 不再同名冲突（h4 根因另一半）。主桶（空 key）不加前缀。
+		const std::string tname = "struct." +
+			(per_module_ && !cur_bucket_key_.empty() ? dunderize(cur_bucket_key_) + "." : std::string()) + tag;
 		// 查找定义
 		auto def_it = struct_defs_.find(tag);
 		if (def_it == struct_defs_.end())
 		{
 			// 未定义，返回空 struct
-			auto *st = llvm::StructType::create(ctx, "struct." + tag);
+			auto *st = llvm::StructType::create(ctx, tname);
 			struct_types_[tag] = st;
 			return st;
 		}
 		const StructDef *sd = def_it->second;
 		// 先创建 opaque（支持自引用）
-		auto *st = llvm::StructType::create(ctx, "struct." + tag);
+		auto *st = llvm::StructType::create(ctx, tname);
 		struct_types_[tag] = st;
 		const auto &DL = module->getDataLayout();
 
@@ -337,6 +504,7 @@ struct CodeGenImpl
 				unsigned ea = member_effective_align(m);
 				if (ea > al) al = ea;
 			}
+			if (sd->align > al) al = sd->align; // GNU __attribute__((aligned)) 于 union 类型
 			if (max_sz == 0) max_sz = 1;
 			max_sz = ((max_sz + al - 1) / al) * al; // 尾部补到有效对齐（数组步长/对象对齐一致）
 			struct_align_[tag] = al;
@@ -360,6 +528,7 @@ struct CodeGenImpl
 				if (sa != struct_align_.end() && sa->second > nat) needs_manual = true;
 			}
 		}
+		if (sd->align > 0) needs_manual = true; // 类型级 aligned：需尾部补到该对齐，走手工布局
 
 		if (needs_manual && !has_bitfield)
 		{
@@ -367,7 +536,7 @@ struct CodeGenImpl
 			std::vector<llvm::Type*> fields;
 			std::vector<unsigned> pos_map;
 			uint64_t off = 0;
-			unsigned sal = 1;
+			unsigned sal = sd->align ? sd->align : 1;
 			for (const auto &m : sd->members)
 			{
 				llvm::Type *mt = to_llvm_alloca_type(m.type);
@@ -462,6 +631,7 @@ struct CodeGenImpl
 				unsigned ea = member_effective_align(m);
 				if (ea > sal) sal = ea;
 			}
+			if (sd->align > sal) sal = sd->align; // 位域+类型级 aligned 罕见组合：至少抬高 struct_align_（alloca/数组步长）
 			struct_align_[tag] = sal;
 		}
 		return st;
@@ -491,16 +661,286 @@ struct CodeGenImpl
 		return llvm::FunctionType::get(ret_ty, param_tys, fn.is_variadic);
 	}
 
-	// —— 翻译单元 ——
-	void gen_tu(const TranslationUnit &tu)
+	// —— --per-module 探针：dunderize 与 __init__ 合成辅助 ——
+	// 非标识符字符转 `_`；对路径型模块键取文件 stem 作短名（例 `x/counter.co` → `counter`）。
+	// 空/异常输入回退 `mod`。仅保证 LLVM 符号名字符合法，不做同名唯一化（不同 stem 罕见撞名，
+	// 由链接器自然报错；探针阶段可接受）。
+	static std::string dunderize(const std::string &key)
 	{
+		std::string base = key;
+		// 取路径 stem（分隔符以 '/' 或 '\' 均处理）
+		{
+			const auto pos = base.find_last_of("/\\");
+			if (pos != std::string::npos) base = base.substr(pos + 1);
+			const auto dot = base.find_last_of('.');
+			if (dot != std::string::npos) base = base.substr(0, dot);
+		}
+		if (base.empty()) base = "mod";
+		std::string out;
+		out.reserve(base.size());
+		for (char c : base)
+		{
+			const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			                (c >= '0' && c <= '9') || c == '_';
+			out.push_back(ok ? c : '_');
+		}
+		if (!(out[0] >= 'a' && out[0] <= 'z') && !(out[0] >= 'A' && out[0] <= 'Z') && out[0] != '_')
+			out.insert(out.begin(), '_');
+		return out;
+	}
+
+	// 非主桶：将该桶的 tl_pending_inits + 该桶 top_level_segments 条目包进 void @__init__<dunder>__()。
+	// 无内容则跳过（不产生空 __init__）。ExternalLinkage 语义＝public（P212 谓词自动豁免），
+	// 但不打 DLLExport（裁定⑥）。主桶 synthetic main 会跨桶调用此符号。
+	void synthesize_bucket_init(const TranslationUnit &tu,
+	                            std::vector<TlPendingInit> &tl_pending_inits)
+	{
+		if (cur_bucket_key_.empty()) return;
+		// 收集本桶顶层裸句（loader 双写的 top_level_segments）
+		const std::vector<StmtPtr> *seg_body = nullptr;
+		for (const auto &kv : tu.top_level_segments)
+			if (kv.first == cur_bucket_key_) { seg_body = &kv.second; break; }
+		const bool has_stmts = seg_body && !seg_body->empty();
+		const bool has_pending = !tl_pending_inits.empty();
+		if (!has_stmts && !has_pending) return;
+		const std::string fname = "__init__" + dunderize(cur_bucket_key_) + "__";
+		llvm::FunctionType *ft = llvm::FunctionType::get(
+			llvm::Type::getVoidTy(ctx), /*isVarArg=*/false);
+		auto *F = llvm::Function::Create(ft, llvm::GlobalValue::ExternalLinkage,
+			fname, module.get());
+		F->addFnAttr("uwtable");
+		auto *entry = llvm::BasicBlock::Create(ctx, "entry", F);
+		builder.SetInsertPoint(entry);
+		{
+			auto saved_vars = vars_;
+			auto saved_types = var_types_;
+			vars_.clear();
+			var_types_.clear();
+			loop_stack_.clear();
+			label_blocks_.clear();
+			case_label_bb_.clear();
+			pending_gotos_.clear();
+			cur_func_name_ = fname;
+			in_synthesized_main_body_ = true; // 允许 return; 兜底为 ret void
+			for (auto &pi : tl_pending_inits)
+			{
+				llvm::Type *vt = pi.gvar->getValueType();
+				llvm::Value *v = gen_expr(pi.init);
+				if (v && v->getType() != vt)
+					v = convert_value(v, vt, get_expr_ctype(pi.init));
+				if (v) builder.CreateStore(v, pi.gvar);
+			}
+			if (has_stmts)
+				for (const auto &s : *seg_body)
+					if (s) gen_stmt(s, F);
+			in_synthesized_main_body_ = false;
+			llvm::BasicBlock *tail = builder.GetInsertBlock();
+			if (!tail || tail->empty() || !tail->back().isTerminator())
+				builder.CreateRetVoid();
+			for (llvm::BasicBlock &bb : *F)
+			{
+				if (bb.empty())
+				{
+					builder.SetInsertPoint(&bb);
+					builder.CreateUnreachable();
+				}
+			}
+			vars_ = std::move(saved_vars);
+			var_types_ = std::move(saved_types);
+			cur_func_name_.clear();
+		}
+		tl_pending_inits.clear(); // 已消费到 __init__
+	}
+
+	// 路 B 阶段3：顶层初始化主体——按拓序调各导入桶 __init__ + 写回本桶 pending 初值 +
+	//   主桶顶层裸句。调用前须已 SetInsertPoint 到目标 entry、清空 vars_/循环栈、
+	//   置 in_synthesized_main_body_=true。main/DllMain/WinMain 三载体共用同一初始化序。
+	void emit_top_level_init(const TranslationUnit &tu, std::vector<TlPendingInit> &tl_pending_inits,
+	                         llvm::Function *F)
+	{
+		if (per_module_ && !imported_init_names_.empty())
+		{
+			llvm::FunctionType *void_ft = llvm::FunctionType::get(
+				llvm::Type::getVoidTy(ctx), /*isVarArg=*/false);
+			for (const auto &iname : imported_init_names_)
+			{
+				llvm::FunctionCallee FC = module->getOrInsertFunction(iname, void_ft);
+				builder.CreateCall(FC);
+			}
+		}
+		for (auto &pi : tl_pending_inits)
+		{
+			llvm::Type *vt = pi.gvar->getValueType();
+			llvm::Value *v = gen_expr(pi.init);
+			if (v && v->getType() != vt)
+				v = convert_value(v, vt, get_expr_ctype(pi.init));
+			if (v) builder.CreateStore(v, pi.gvar);
+		}
+		const std::size_t tl_start = per_module_ ? tu.imported_top_level_body_count : 0;
+		for (std::size_t i = tl_start; i < tu.top_level_body.size(); ++i)
+			if (tu.top_level_body[i]) gen_stmt(tu.top_level_body[i], F);
+	}
+
+	// 路 B 阶段3：DLL 产出时的顶层初始化载体——合成 BOOL DllMain(void*, unsigned long, void*)。
+	//   头部 reason != DLL_PROCESS_ATTACH(1) → 直返 TRUE(1)；attach 分支自然跑完顶层初始化后返 TRUE。
+	//   用户自定义 DllMain（标准签名）改名 __co_DllMain__ 转发（非 attach 原因亦转发）。
+	void synthesize_dllmain(const TranslationUnit &tu, std::vector<TlPendingInit> &tl_pending_inits)
+	{
+		llvm::Function *old_dm = module->getFunction("DllMain");
+		if (old_dm) old_dm->setName("__co_DllMain__");
+		// 标准签名仅当 (ptr,i32,ptr)->i32 时转发（其它手写形不强行适配，避免 verifier 碎）。
+		bool forward_user = false;
+		if (old_dm)
+		{
+			llvm::FunctionType *oft = old_dm->getFunctionType();
+			forward_user = oft->getNumParams() == 3 && !oft->isVarArg() &&
+				llvm::cast<llvm::PointerType>(oft->getParamType(0)) &&
+				oft->getParamType(1)->isIntegerTy(32) &&
+				llvm::cast<llvm::PointerType>(oft->getParamType(2)) &&
+				oft->getReturnType()->isIntegerTy(32);
+		}
+		llvm::Type *I32 = llvm::Type::getInt32Ty(ctx);
+		llvm::Type *PTR = llvm::PointerType::getUnqual(ctx);
+		llvm::FunctionType *ft = llvm::FunctionType::get(I32, {PTR, I32, PTR}, false);
+		auto *F = llvm::Function::Create(ft, llvm::GlobalValue::ExternalLinkage,
+			"DllMain", module.get());
+		F->addFnAttr("uwtable");
+		{
+			auto saved_vars = vars_;
+			auto saved_types = var_types_;
+			vars_.clear();
+			var_types_.clear();
+			loop_stack_.clear();
+			label_blocks_.clear();
+			case_label_bb_.clear();
+			pending_gotos_.clear();
+			cur_func_name_ = "DllMain";
+			// entry：reason 分岔
+			auto *entry = llvm::BasicBlock::Create(ctx, "entry", F);
+			builder.SetInsertPoint(entry);
+			auto ai = F->arg_begin();
+			llvm::Value *hinst = &*ai++;
+			llvm::Value *reason = &*ai;
+			llvm::Value *reserved = &*++ai;
+			llvm::Value *is_attach = builder.CreateICmpEQ(reason, llvm::ConstantInt::get(I32, 1));
+			auto *attach_bb = llvm::BasicBlock::Create(ctx, "attach", F);
+			auto *cont_bb = llvm::BasicBlock::Create(ctx, "cont", F);
+			builder.CreateCondBr(is_attach, attach_bb, cont_bb);
+			// attach：跑顶层初始化，未终止则跳 cont
+			builder.SetInsertPoint(attach_bb);
+			in_synthesized_main_body_ = true;
+			emit_top_level_init(tu, tl_pending_inits, F);
+			in_synthesized_main_body_ = false;
+			{
+				llvm::BasicBlock *cur = builder.GetInsertBlock();
+				if (!cur || cur->empty() || !cur->back().isTerminator())
+					builder.CreateBr(cont_bb);
+			}
+			// cont：转发用户 DllMain（若有）否则返 TRUE(1)
+			builder.SetInsertPoint(cont_bb);
+			if (forward_user)
+			{
+				std::vector<llvm::Value *> cargs{hinst, reason, reserved};
+				llvm::Value *r = builder.CreateCall(old_dm, cargs);
+				builder.CreateRet(r);
+			}
+			else
+			{
+				builder.CreateRet(llvm::ConstantInt::get(I32, 1));
+			}
+			for (llvm::BasicBlock &bb : *F)
+				if (bb.empty()) { builder.SetInsertPoint(&bb); builder.CreateUnreachable(); }
+			tl_pending_inits.clear(); // 已消费
+			vars_ = std::move(saved_vars);
+			var_types_ = std::move(saved_types);
+			cur_func_name_.clear();
+		}
+	}
+
+	// 路 B 阶段3：.co GUI exe（WinMain 入口）的顶层初始化载体——用户 WinMain 改名
+	//   __co_WinMain__，合成新 WinMain（同签名）= 顶层初始化→转发 __co_WinMain__、以其返回为退出码。
+	void synthesize_winmain_wrapper(const TranslationUnit &tu, std::vector<TlPendingInit> &tl_pending_inits)
+	{
+		llvm::Function *old_wm = module->getFunction("WinMain");
+		if (!old_wm) return; // 无用户 WinMain（不应达），不包裹
+		old_wm->setName("__co_WinMain__");
+		llvm::FunctionType *ft = old_wm->getFunctionType();
+		auto *F = llvm::Function::Create(ft, llvm::GlobalValue::ExternalLinkage,
+			"WinMain", module.get());
+		F->addFnAttr("uwtable");
+		{
+			auto saved_vars = vars_;
+			auto saved_types = var_types_;
+			vars_.clear();
+			var_types_.clear();
+			loop_stack_.clear();
+			label_blocks_.clear();
+			case_label_bb_.clear();
+			pending_gotos_.clear();
+			cur_func_name_ = "WinMain";
+			auto *entry = llvm::BasicBlock::Create(ctx, "entry", F);
+			builder.SetInsertPoint(entry);
+			in_synthesized_main_body_ = true;
+			emit_top_level_init(tu, tl_pending_inits, F);
+			in_synthesized_main_body_ = false;
+			llvm::BasicBlock *tail = builder.GetInsertBlock();
+			if (!tail || tail->empty() || !tail->back().isTerminator())
+			{
+				std::vector<llvm::Value *> cargs;
+				for (llvm::Value &A : F->args()) cargs.push_back(&A);
+				if (ft->getReturnType()->isVoidTy())
+				{
+					builder.CreateCall(old_wm, cargs);
+					builder.CreateRetVoid();
+				}
+				else
+				{
+					llvm::Value *r = builder.CreateCall(old_wm, cargs);
+					builder.CreateRet(r);
+				}
+			}
+			for (llvm::BasicBlock &bb : *F)
+				if (bb.empty()) { builder.SetInsertPoint(&bb); builder.CreateUnreachable(); }
+			tl_pending_inits.clear(); // 已消费
+			vars_ = std::move(saved_vars);
+			var_types_ = std::move(saved_types);
+			cur_func_name_.clear();
+		}
+	}
+
+	// —— 翻译单元 ——
+	// --per-module：逐桶发射管线主体（全局第零遍/函数声明第一遍/drectve/定义第二遍）。
+	//   非分桶模式 in_cur_bucket 恒真，本函数与旧 gen_tu 主体逐字等价（零回归）；
+	//   入口标志与合成 main 移至 finish_entry（仅主桶跑）。
+	void pipeline(const TranslationUnit &tu, std::vector<TlPendingInit> &tl_pending_inits)
+	{
+		cur_tu_ = &tu; // 路 B 阶段2-c：供分桶裸名→符号解析查本桶自有定义
 		// 预注册 struct/union 定义（供 get_struct_type 查询）。空定义（`struct s {};`
 		//   的 GNU 扩展）也要注册：否则被当作未定义 → opaque %struct. → 全局/局部
 		//   对象 "unsized type"（CTS 0186 族）。
-		for (const auto &sd : tu.structs)
+		// 路 B 阶段2：分桶模式按桶隔离结构体表——每桶清空重登记，消灭跨模块同名 tag 的 last-wins 劫持（h4 根因）。
+		//   登记序：先他桶 public 定义（供跨模块引用）、后本桶自有定义（同名覆盖，本模块自引用恒绑自身布局）。
+		//   非分桶模式（per_module_=false）保持原单次登记、行为与现状逐字等价（零回归）。
+		if (per_module_)
 		{
-			if (!sd.tag.empty() && sd.is_definition)
-				struct_defs_[sd.tag] = &sd;
+			struct_defs_.clear();
+			struct_types_.clear();
+			struct_align_.clear();
+			struct_pos_map_.clear();
+			bitfield_access_.clear();
+			field_index_map_.clear();
+			for (const auto &sd : tu.structs)
+				if (!sd.tag.empty() && sd.is_definition && sd.is_public && !in_cur_bucket(sd.source_module_key))
+					struct_defs_[sd.tag] = &sd;
+			for (const auto &sd : tu.structs)
+				if (!sd.tag.empty() && sd.is_definition && in_cur_bucket(sd.source_module_key))
+					struct_defs_[sd.tag] = &sd;
+		}
+		else
+		{
+			for (const auto &sd : tu.structs)
+				if (!sd.tag.empty() && sd.is_definition)
+					struct_defs_[sd.tag] = &sd;
 		}
 		// 同名函数的「规范声明」归并：无原型声明（`void out();`）与其带形参定义
 		//   （`void out(int*, ...)`）在 tu.funcs 中是两条记录，LLVM 的 Function 类型
@@ -508,7 +948,8 @@ struct CodeGenImpl
 		//   形参（形参无 alloca，引用退化为 `load i32, i32 0`），调用点亦与函数签名
 		//   不符（verifier 报 Load/Store/Call 类错误）。故按名归并：优先带 body 的
 		//   定义，其次首个声明，作为预声明/类型登记的唯一依据。
-		std::unordered_map<std::string, const FuncDecl *> canon;
+		canon_.clear();
+		std::unordered_map<std::string, const FuncDecl *> &canon = canon_;
 		for (const auto &fn : tu.funcs)
 		{
 			auto it = canon.find(fn.name);
@@ -518,17 +959,37 @@ struct CodeGenImpl
 		// 预声明所有函数符号：使全局初始化器里的 &函数名 能折叠为函数地址
 		//   （module->getFunction 可见）。getOrInsertFunction 幂等，下方第一遍仍据
 		//   同一 Function 设 linkage/uwtable。修复 00089：s={&zero} 早于函数声明发射。
-		for (const auto &fn : tu.funcs)
+		// 路 B 阶段2-c：分桶下预声明过滤改用「桶内 body 优先」归并（跨模块同名在各自桶均成定义）；
+		//   符号名走 func_symbol（symbol_name 命中时用 dunder 合成名，消解链接期重复符号）。非分桶与旧逐字等价。
 		{
-			if (canon[fn.name] != &fn) continue;
-			if (module->getFunction(fn.name)) continue;
-			llvm::FunctionType *ft = to_func_type(fn);
-			module->getOrInsertFunction(fn.name, ft);
+			std::unordered_map<std::string, const FuncDecl *> bucket_canon;
+			for (const auto &fn : tu.funcs)
+			{
+				if (!in_cur_bucket(fn.source_module_key)) continue;
+				auto it = bucket_canon.find(fn.name);
+				if (it == bucket_canon.end() || (!it->second->body && fn.body))
+					bucket_canon[fn.name] = &fn;
+			}
+			for (const auto &kv : bucket_canon)
+			{
+				const FuncDecl &fn = *kv.second;
+				const std::string sym = func_symbol(fn);
+				if (module->getFunction(sym)) continue;
+				llvm::FunctionType *ft = to_func_type(fn);
+				module->getOrInsertFunction(sym, ft);
+			}
 		}
 		// P219：顶层非恒定初始化的运行期 store 承载（仅 .co 新面 has_bare 生效，纯 C 档逐字不变）
+		//   分桶模式下 top_level_body 仍整体含模块段（loader 双写未改），此标志判整体等价。
 		const bool co_has_bare = !tu.top_level_body.empty();
-		struct TlPendingInit { llvm::GlobalVariable *gvar; ExprPtr init; CTypePtr ctype; };
-		std::vector<TlPendingInit> tl_pending_inits;
+		// 路 B 阶段3：是否存在「顶层初始化载体」（合成 main/DllMain/WinMain 转发会消费
+		//   tl_pending_inits）。DLL 与 .co WinMain 即使无顶层裸句，其运行期初值全局也需捕获为
+		//   pending（否则纯 C 档式折叠会把初值蒸发）。exe/无载体路径下 synth_carrier==co_has_bare、逐字等价。
+		bool has_winmain_def = false;
+		for (const auto &f : tu.funcs)
+			if (f.body && f.name == "WinMain" && f.source_module_key.empty()) { has_winmain_def = true; break; }
+		// 载体仅对 `.co` 新面开启（DLL 产物 / WinMain 入口）；纯 C 档 .c 恒 co_has_bare、逐字等价。
+		const bool synth_carrier = co_has_bare || (is_co_ && (output_is_dll_ || has_winmain_def));
 		// P241：预登记全部全局变量的类型（名 → CType），使「文件作用域初始化器」折叠过程中
 		//   经 CodegenTypeEnv::var_type 解析「声明在当前全局之后」的全局时能命中类型，
 		//   sizeof/alignof 不再回退 int32(4)（P234 旁支② / P227 同族「按名查全局」）。
@@ -545,15 +1006,18 @@ struct CodeGenImpl
 			// void 型对象属不完整类型（parser 已报 error）：兜底跳过，避免以 void 建 GlobalVariable。
 			if (!gv.type || gv.type->kind == TypeKind::Void)
 				continue;
+			if (!in_cur_bucket(gv.source_module_key)) continue; // 分桶：仅本桶全局
 			// extern 纯声明（无定义）：创建 declaration（无 initializer）
 			if (gv.is_extern && !gv.init)
 			{
 				llvm::Type *ty = to_llvm_alloca_type(gv.type);
 				if (globals_.count(gv.name)) continue;
 				auto *gvar = new llvm::GlobalVariable(*module, ty, false,
-					llvm::GlobalValue::ExternalLinkage, nullptr, gv.name);
+					llvm::GlobalValue::ExternalLinkage, nullptr, global_symbol(gv));
 				// P211 B.3：public 仅叠加 DLL 导出 storage class，不改 linkage。
-				if (gv.is_public)
+				// ELF：DLL 存储类是 COFF 专属，非 Windows 目标下不打（否则产杂散属性）。
+				// 裁定⑥（导出面最小化）：分桶模式仅主桶 public 打 Export，模块侧 public 为宿主内部实现。
+				if (target_.is_windows && gv.is_public && (!per_module_ || cur_bucket_key_.empty()))
 					gvar->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
 				globals_[gv.name] = gvar;
 				global_types_[gv.name] = gv.type;
@@ -573,13 +1037,14 @@ struct CodeGenImpl
 			//   null，运行期解引用越界（CTS 0010/0011/0048 崩族）。折叠永不返回 nullptr，故
 			//   先建零初值再 setInitializer 与原「以 init_val 建」终态逐字一致（零回归）。
 			auto *gvar = new llvm::GlobalVariable(*module, ty, is_const,
-				linkage, llvm::Constant::getNullValue(ty), gv.name);
+				linkage, llvm::Constant::getNullValue(ty), global_symbol(gv));
 			if (auto a = obj_align(gv.type, ty, gv.align)) gvar->setAlignment(*a);
 			// P211 B.3：public 仅叠加 DLL 导出 storage class，不改 linkage。
 			// COFF 约束：内部链接（static/P212 strip）符号不得带 DLL 存储类
 			//   （"symbol with local linkage cannot have a DLL storage class"）；故仅当
 			//   最终 linkage 为 External 时才打 Export。static public 在 exe 场景本就无导出语义。
-			if (gv.is_public && linkage == llvm::GlobalValue::ExternalLinkage)
+			if (target_.is_windows && gv.is_public && linkage == llvm::GlobalValue::ExternalLinkage &&
+				(!per_module_ || cur_bucket_key_.empty())) // 裁定⑥：分桶仅主桶导出
 				gvar->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
 			globals_[gv.name] = gvar;
 			global_types_[gv.name] = gv.type;
@@ -591,7 +1056,7 @@ struct CodeGenImpl
 				// P219 A 方案：仅 .co 新面（有顶层裸指令）时，标量/指针初值不可折叠
 				//   不再静默折成 null，改占位 0 + 记待运行期 store（合成 main 头部按序写回）。
 				//   纯 C 档（无顶层裸句）沿用旧折叠行为，CTS/.c 零影响。
-				if (!folded && co_has_bare && ty->isSingleValueType())
+				if (!folded && synth_carrier && ty->isSingleValueType())
 					tl_need_runtime = true; // 保持零初值，运行期按序 store
 				else
 					gvar->setInitializer(c);
@@ -609,6 +1074,7 @@ struct CodeGenImpl
 				for (const auto &p : fn.params) ptypes.push_back(p.type);
 				func_cftypes_[fn.name] = make_func_type(fn.return_type, std::move(ptypes), fn.is_variadic);
 			}
+			if (!in_cur_bucket(fn.source_module_key)) continue; // 分桶：仅本桶实体建 LLVM 值
 			llvm::FunctionType *ft = to_func_type(fn);
 			llvm::FunctionCallee FC = module->getOrInsertFunction(fn.name, ft);
 			if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee()))
@@ -628,7 +1094,8 @@ struct CodeGenImpl
 				//   纯原型 (body == nullptr) 本就不局部定义、不存在可导出的对象；强制打 Export 会误导
 				//   lld 去当前 binary 中寻不存在的定义 → 静默默返 0 或 LNK4217。交给链接器默认处理。
 				// COFF 约束：内部链接符号（static）不得带 DLL 存储类；static public 仅内部可调用、不导出。
-				if (fn.is_public && fn.body && !f_internal)
+				if (target_.is_windows && fn.is_public && fn.body && !f_internal &&
+					(!per_module_ || cur_bucket_key_.empty())) // 裁定⑥：分桶仅主桶导出
 					F->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
 				// Win64 ABI 要求每个函数带 .pdata/.xdata 展开表；clang 从源码编译时默认
 				// 加 "uwtable"，但 colang 手工建 IR 不会自动带。缺它则基于 RtlUnwind 的栈
@@ -654,9 +1121,17 @@ struct CodeGenImpl
 					if (x == s) return;
 				libs.push_back(s);
 			};
-			for (const auto &fn : tu.funcs) add_lib(fn.lib_name);
-			for (const auto &gv : tu.globals) add_lib(gv.lib_name);
-			for (std::size_t i = 0; i < libs.size(); ++i)
+			// 路 B 阶段2-b/1c：单 obj 合回时 .drectve private 全局不随 linkInModule 存活，
+			//   改由主桶（cur_bucket_key_==""）统一采集全量 lib 并集；多 obj 分桶仍各自发本桶。
+			const bool emit_all_libs =
+				per_module_ && per_module_single_obj_ && cur_bucket_key_.empty();
+			auto owned = [&](const std::string &key)
+			{ return emit_all_libs || in_cur_bucket(key); };
+			for (const auto &fn : tu.funcs) if (owned(fn.source_module_key)) add_lib(fn.lib_name);
+			for (const auto &gv : tu.globals) if (owned(gv.source_module_key)) add_lib(gv.lib_name);
+			// ELF：.drectve /DEFAULTLIB 是 COFF 目录段指令，非 Windows 目标下不发射
+			//   （[[lib]]/public 的 ELF 映射列入长尾，本批 hello/00212 不触达）。
+			for (std::size_t i = 0; target_.is_windows && i < libs.size(); ++i)
 			{
 				// 末尾留一个空格作分隔（与 MSVC CRT 自带的 .drectve 条目一致），再加 '\0' 收尾
 				const std::string directive = "/DEFAULTLIB:\"" + libs[i] + ".lib\" ";
@@ -672,8 +1147,18 @@ struct CodeGenImpl
 		{
 			if (fn.body)
 			{
+				if (!in_cur_bucket(fn.source_module_key)) continue; // 分桶：仅本桶函数发定义
 				gen_function(fn);
 			}
+		}
+		// ============================================================
+		// P212：入口子系统标志——扫定义函数定 WinMain 入口 / [[subsystem("windows")]]。
+		// --per-module: 非主桶跳过入口合成，改为合成 __init__<dunder>__ 函数。
+		// ============================================================
+		if (per_module_ && !cur_bucket_key_.empty())
+		{
+			synthesize_bucket_init(tu, tl_pending_inits);
+			return;
 		}
 		// ============================================================
 		// P229：入口子系统标志——扫定义函数定 WinMain 入口 / [[subsystem("windows")]]。
@@ -705,7 +1190,20 @@ struct CodeGenImpl
 			for (const auto &f : tu.funcs)
 				if (f.body && f.name == "main" && f.source_module_key.empty()) { user_main = &f; break; } // P231：仅主模块
 			const bool pure_c = !has_bare && user_main != nullptr;
-			if (!pure_c && !use_winmain_) // P229：WinMain 入口下不合成 main（GUI 逻辑在 WinMain）
+			// 路 B 阶段3：入口载体三态分派——
+			//   ① `.co` 产 DLL → 合成 DllMain（PROCESS_ATTACH 跑顶层初始化、转发用户 DllMain）；
+			//   ② `.co` GUI exe（WinMain 入口）且有顶层初始化内容 → 包裹 WinMain 转发；
+			//   ③ 其余非纯 C 档 → 原 main 合成（逐字等价）。
+			if (output_is_dll_ && is_co_)
+			{
+				synthesize_dllmain(tu, tl_pending_inits);
+			}
+			else if (use_winmain_ && is_co_ &&
+				(has_bare || !tl_pending_inits.empty() || !imported_init_names_.empty()))
+			{
+				synthesize_winmain_wrapper(tu, tl_pending_inits);
+			}
+			else if (!pure_c && !use_winmain_) // P229：WinMain 入口下不合成 main（GUI 逻辑在 WinMain）
 			{
 				llvm::Function *old_main = nullptr;
 				if (user_main)
@@ -759,6 +1257,17 @@ struct CodeGenImpl
 						}
 					}
 					in_synthesized_main_body_ = true;
+					// --per-module: 先按拓序调各导入桶的 __init__<dunder>__（链接器归并定义）
+					if (per_module_ && !imported_init_names_.empty())
+					{
+						llvm::FunctionType *void_ft = llvm::FunctionType::get(
+							llvm::Type::getVoidTy(ctx), /*isVarArg=*/false);
+						for (const auto &iname : imported_init_names_)
+						{
+							llvm::FunctionCallee FC = module->getOrInsertFunction(iname, void_ft);
+							builder.CreateCall(FC);
+						}
+					}
 					// P219：顶层非恒定初始化 → 合成 main 头部按声明序 store 运行期值
 					//   （先于顶层裸句执行，贴近「顶层顺序执行」模型；此时 argc/argv/envp 已入作用域）
 					for (auto &pi : tl_pending_inits)
@@ -769,8 +1278,12 @@ struct CodeGenImpl
 							v = convert_value(v, vt, get_expr_ctype(pi.init));
 						if (v) builder.CreateStore(v, pi.gvar);
 					}
-					for (const auto &s : tu.top_level_body)
-						if (s) gen_stmt(s, m);
+					// --per-module: 主桶仅执行主源自身的顶层裸句（跳过导入前缀段，已由 __init__ 承载）
+					{
+						const std::size_t tl_start = per_module_ ? tu.imported_top_level_body_count : 0;
+						for (std::size_t i = tl_start; i < tu.top_level_body.size(); ++i)
+							if (tu.top_level_body[i]) gen_stmt(tu.top_level_body[i], m);
+					}
 					in_synthesized_main_body_ = false;
 					// 末尾未终止 → 转调 __co_main__ 或 ret 0（“return V;”已提前 ret 时跳过）
 					llvm::BasicBlock *tail = builder.GetInsertBlock();
@@ -807,6 +1320,63 @@ struct CodeGenImpl
 				}
 			}
 		}
+	}
+
+	// —— gen_tu 顶层编排（单桶／分桶两路径） ——
+	// OFF: 调用一次 pipeline（行为与旧 gen_tu 逐字等价）。
+	// ON: 填充 gdef_bucket_、依 loader DFS 拓序迭代导入桶、最后主桶。
+	void gen_tu(const TranslationUnit &tu)
+	{
+		if (!per_module_)
+		{
+			// 单桶模式（零回归）：全部实体入默认 module。in_cur_bucket 恒真。
+			std::vector<TlPendingInit> tl_pending_inits;
+			pipeline(tu, tl_pending_inits);
+			return;
+		}
+
+		// ---- 分桶模式 ----
+		// 1. 填充 gdef_bucket_（全局变量名 → 定义所在桶 key）
+		for (const auto &gv : tu.globals)
+		{
+			if (gv.is_extern && !gv.init) continue; // 纯 extern 声明无定义桶
+			if (gv.type && gv.type->kind == TypeKind::Void) continue;
+			if (!gdef_bucket_.count(gv.name))
+				gdef_bucket_[gv.name] = gv.source_module_key;
+		}
+
+		// 2. 收集桶 key 拓序（loader 已按 DFS postorder 前插，故 funcs/globals 首次出现序即拓序）
+		std::unordered_set<std::string> seen_keys;
+		std::vector<std::string> bucket_keys;
+		for (const auto &fn : tu.funcs)
+			if (!fn.source_module_key.empty() && seen_keys.insert(fn.source_module_key).second)
+				bucket_keys.push_back(fn.source_module_key);
+		for (const auto &gv : tu.globals)
+			if (!gv.source_module_key.empty() && seen_keys.insert(gv.source_module_key).second)
+				bucket_keys.push_back(gv.source_module_key);
+		for (const auto &seg : tu.top_level_segments)
+			if (seen_keys.insert(seg.first).second)
+				bucket_keys.push_back(seg.first);
+
+		// 3. 每个导入桶：begin_bucket → pipeline → (pipeline 内合成 __init__ 并 return) → push 到 done_buckets_
+		for (const auto &key : bucket_keys)
+		{
+			begin_bucket(make_module(dunderize(key)), key);
+			std::vector<TlPendingInit> bucket_pending;
+			pipeline(tu, bucket_pending);
+			// pipeline 内对非主桶调用 synthesize_bucket_init，检查是否实际产生了 __init__
+			const std::string iname = "__init__" + dunderize(key) + "__";
+			if (module->getFunction(iname))
+				imported_init_names_.push_back(iname);
+			done_buckets_.push_back(std::move(module));
+			module = nullptr; // moved out
+		}
+
+		// 4. 主桶（key==""）：begin_bucket → pipeline（含入口合成 + __init__ 调用）
+		begin_bucket(make_module("main_bucket"), "");
+		std::vector<TlPendingInit> main_pending;
+		pipeline(tu, main_pending);
+		// main_pending 己被入口合成消费（或纯 C 档无消耗——同今天行为）
 	}
 
 	// 推断间接调用的 FunctionType（从类型信息或回退到 i32(i32...)）
@@ -868,8 +1438,7 @@ struct CodeGenImpl
 		if (p->kind == ExprKind::VarRef)
 		{
 			out_off = 0;
-			auto git = globals_.find(p->name);
-			if (git != globals_.end()) return git->second;
+			if (llvm::GlobalVariable *gv = global_ref(p->name)) return gv;
 			auto vit = vars_.find(p->name);   // 函数内 static：已物化为 GlobalVariable
 			if (vit != vars_.end())
 				if (auto *gv = llvm::dyn_cast<llvm::GlobalVariable>(vit->second)) return gv;
@@ -937,8 +1506,8 @@ struct CodeGenImpl
 		}
 		if (!p || p->kind != ExprKind::VarRef) return nullptr;
 		const std::string nm = p->name;
-		auto git = globals_.find(nm);
-		if (git == globals_.end())
+		llvm::GlobalVariable *gvp = global_ref(nm);
+		if (!gvp)
 		{
 			// 函数内 static 局部：已物化为 GlobalVariable 并登记在 vars_（名带 __static_ 前缀），
 			// &x / 数组名退化同样应折叠为地址常量（旧代码只查 globals_ → 初始化器落 null，解引用崩）。
@@ -955,7 +1524,7 @@ struct CodeGenImpl
 				return llvm::cast<llvm::Constant>(vit->second);
 			}
 			// &函数名 → 函数地址常量（Function 继承自 Constant，可直接作初始化器）。
-			if (llvm::Function *F = module->getFunction(nm)) return F;
+			if (llvm::Function *F = func_ref(nm)) return F;
 			return nullptr;   // 前向引用尚未声明 → 不误折
 		}
 		// 无 & 的直接 VarRef 赋给指针：仅数组名退化合法（标量 rvalue 非地址常量）
@@ -966,7 +1535,7 @@ struct CodeGenImpl
 				tit->second->kind != TypeKind::Array)
 				return nullptr;
 		}
-		return git->second; // GlobalVariable* 即其地址（opaque ptr）
+		return gvp; // GlobalVariable* 即其地址（opaque ptr）
 	}
 
 	// 文件作用域复合字面量取址：按 C 语义具静态存储期，物化为内部链接全局对象
@@ -2223,7 +2792,7 @@ struct CodeGenImpl
 
 	void gen_function(const FuncDecl &fn)
 	{
-		llvm::Function *F = module->getFunction(fn.name);
+		llvm::Function *F = module->getFunction(func_symbol(fn)); // 路 B 阶段2-c：按符号名定位（默认恒裸名）
 		if (!F)
 		{
 			return;
@@ -2571,7 +3140,14 @@ struct CodeGenImpl
 					}
 				}
 				// 位置项（P239）：有物理游标则按 DFS 续位；无障碍时回落旧序号语义（行为逐字不变）
-				if (cur_on)
+				// 优先级：本项若为单级指定符 `[N] = v`（desig_index >= 0），必须交给下方
+				//   `if (elem->desig_index >= 0)` 分支严格按自带下标写入，不得被 P239 位置续位吞掉——
+				//   否则出现「位置项之后再出更高下标设符」时，后置设符被当位置项挤一位、
+				//   丢列尾部项的静默误编（CTS 0032_0004/0032_0005，2026-10-27 修）。
+				//   `fold_global_init` 数组分支里 desig_index 本身就在 cur_on 之前（L2430 → L2447）、无此缺陷；
+				//   本局部路径之前因引入 P239 时插在了 chain 之后、desig_index 之前→不对称。链式指定符已在上方
+				//   `desig_chain.size() >= 2` 分支处理、不落入本判。
+				if (cur_on && elem->desig_index < 0)
 				{
 					std::vector<PhysStep> tgt = ppath;
 					if (elem->kind != ExprKind::InitList) phys_descend_first(aty, tgt);
@@ -3096,16 +3672,16 @@ struct CodeGenImpl
 			// 块作用域 extern 声明：不分配存储，直接引用文件作用域对象（尚未声明则建外部声明）。
 			if (s->is_extern)
 			{
-				auto git = globals_.find(s->var_name);
-				if (git == globals_.end())
+				llvm::GlobalVariable *gv = global_ref(s->var_name);
+				if (!gv)
 				{
 					auto *gvar = new llvm::GlobalVariable(*module, ty, false,
 						llvm::GlobalValue::ExternalLinkage, nullptr, s->var_name);
 					globals_[s->var_name] = gvar;
 					global_types_[s->var_name] = s->var_type;
-					git = globals_.find(s->var_name);
+					gv = gvar;
 				}
-				vars_[s->var_name] = git->second;
+				vars_[s->var_name] = gv;
 				var_types_[s->var_name] = s->var_type;
 				break;
 			}
@@ -3727,13 +4303,12 @@ struct CodeGenImpl
 				return v;
 			}
 			// 全局变量
-			auto git = globals_.find(e->name);
-			if (git != globals_.end())
+			if (llvm::GlobalVariable *gv = global_ref(e->name))
 			{
-				llvm::Type *gty = git->second->getValueType();
+				llvm::Type *gty = gv->getValueType();
 				if (gty->isArrayTy() || gty->isStructTy())
-					return git->second;
-				llvm::Value *v = builder.CreateLoad(gty, git->second);
+					return gv;
+				llvm::Value *v = builder.CreateLoad(gty, gv);
 				// C 整型提升：所有 <i32 的整数类型扩展到 i32
 				if (gty->isIntegerTy() && gty->getIntegerBitWidth() < 32)
 				{
@@ -3747,7 +4322,7 @@ struct CodeGenImpl
 				return v;
 			}
 			// 回退：查找函数符号
-			llvm::Function *F = module->getFunction(e->name);
+			llvm::Function *F = func_ref(e->name);
 			if (F) return F;
 			return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
 		}
@@ -4261,6 +4836,14 @@ struct CodeGenImpl
 				arg_cts.push_back(get_expr_ctype(a));
 				args.push_back(gen_expr(a));
 			}
+			// 路 B 阶段1b-iii：限定直接调用 m.f() —— lhs 为已绑定 q_func 的 Member → 按符号直调（非间接）。
+			if (e->lhs && e->lhs->kind == ExprKind::Member && e->lhs->q_func)
+			{
+				llvm::Function *callee = qualified_func_ref(e->lhs->q_func);
+				llvm::FunctionType *ft = callee->getFunctionType();
+				coerce_call_args(ft, args, arg_cts);
+				return builder.CreateCall(callee, args);
+			}
 			// 纯间接调用：callee 是表达式（如 (*fp)(...) 或 funcs[i](...) ）
 			if (e->lhs)
 			{
@@ -4286,20 +4869,19 @@ struct CodeGenImpl
 					}
 				}
 				// 全局变量（函数指针）
-				auto git = globals_.find(e->name);
-				if (git != globals_.end())
+				if (llvm::GlobalVariable *gv = global_ref(e->name))
 				{
 					CTypePtr gt = global_types_.count(e->name) ? global_types_[e->name] : nullptr;
 					if (gt && gt->kind == TypeKind::Pointer && gt->base && gt->base->kind == TypeKind::Function)
 					{
-						llvm::Value *fp = builder.CreateLoad(llvm::PointerType::getUnqual(ctx), git->second);
+						llvm::Value *fp = builder.CreateLoad(llvm::PointerType::getUnqual(ctx), gv);
 						llvm::FunctionType *ft = infer_call_ft(e);
 						coerce_call_args(ft, args, arg_cts);
 						return builder.CreateCall(ft, fp, args);
 					}
 				}
 				// 直接函数调用
-				llvm::Function *callee = module->getFunction(e->name);
+				llvm::Function *callee = func_ref(e->name);
 				if (callee)
 				{
 					// UCRT(x64) setjmp ABI：_setjmp 必须以调用者帧地址作隐藏第二参数
@@ -4383,6 +4965,16 @@ struct CodeGenImpl
 			return gen_cast_expr(e);
 		case ExprKind::Member:
 		{
+			// 路 B 阶段1b-iii：限定访问 m.x（全局）/ m.f（函数名作值）——不经结构体成员寻址。
+			if (e->q_global)
+			{
+				llvm::Value *gv = qualified_global_addr(e);
+				llvm::Type *vt = e->q_global->type ? to_llvm_alloca_type(e->q_global->type)
+				                                      : llvm::Type::getInt32Ty(ctx);
+				if (vt->isArrayTy() || vt->isStructTy()) return gv; // 数组/结构退化：返回地址
+				return builder.CreateLoad(vt, gv);
+			}
+			if (e->q_func) return qualified_func_ref(e->q_func); // 函数名作值：函数地址（指针）
 			// rvalue: 取成员地址
 			llvm::Value *addr = gen_member_addr(e);
 			// 确定成员类型（decl_tag/decl_idx 指向字段真正声明处，支持匿名 union 名提升）
@@ -4474,13 +5066,14 @@ struct CodeGenImpl
 		}
 	}
 
-	// 某 CType 是否为「无符号整数」（wchar_t 恒无符号；char/short/int/long/long long/_BitInt 看 is_unsigned）
-	static bool is_unsigned_int_type(const CTypePtr &t)
+	// 某 CType 是否为「无符号整数」（wchar_t 随目标：Windows 无符号 / Linux 有符号；char8/16/32 恒无符号；char/short/int/long/long long/_BitInt 看 is_unsigned）
+	bool is_unsigned_int_type(const CTypePtr &t)
 	{
 		if (!t) return false;
 		switch (t->kind)
 		{
-		case TypeKind::WChar: case TypeKind::Char8: case TypeKind::Char16: case TypeKind::Char32: return true;
+		case TypeKind::WChar: return !target_.wchar_signed; // 符号随目标：Win=unsigned(i16)、Linux=signed(i32)
+		case TypeKind::Char8: case TypeKind::Char16: case TypeKind::Char32: return true;
 		case TypeKind::BitInt: case TypeKind::Char: case TypeKind::Short: case TypeKind::Int:
 		case TypeKind::Long: case TypeKind::LongLong:
 			return t->is_unsigned;
@@ -4669,8 +5262,8 @@ struct CodeGenImpl
 			return l;
 		}
 		// 整数路径：按操作数 C 类型做整型提升 + 常用算术转换（§6.3.2.8），据符号选有/无符号指令
-		IntPromo lp = int_promo_of(get_expr_ctype(e->lhs));
-		IntPromo rp = int_promo_of(get_expr_ctype(e->rhs));
+		IntPromo lp = int_promo_of(get_expr_ctype(e->lhs), long_bits_());
+		IntPromo rp = int_promo_of(get_expr_ctype(e->rhs), long_bits_());
 		bool lext = is_unsigned_int_type(get_expr_ctype(e->lhs));
 		bool rext = is_unsigned_int_type(get_expr_ctype(e->rhs));
 		bool is_shift = (op == "<<" || op == ">>");
@@ -4813,7 +5406,7 @@ struct CodeGenImpl
 					builder.CreateStore(nvf, addr);
 					return e->postfix ? oldf : nvf;
 				}
-				IntPromo p = int_promo_of(ct);
+				IntPromo p = int_promo_of(ct, long_bits_());
 				unsigned tgt = p.bits < 32 ? 32u : p.bits;   // C 整型提升：<int→int，long long 保 64
 				bool uns = is_unsigned_int_type(ct);         // 扩展按**原类型**符号性（unsigned char 零扩展）
 				llvm::Value *raw = builder.CreateLoad(mem_ty, addr);
@@ -4821,8 +5414,17 @@ struct CodeGenImpl
 				llvm::Value *one = llvm::ConstantInt::get(old->getType(), 1);
 				llvm::Value *nvar = (e->op == "++") ? builder.CreateAdd(old, one)
 													: builder.CreateSub(old, one);
-				llvm::Value *to_store = (nvar->getType() == mem_ty) ? nvar
-																: builder.CreateTrunc(nvar, mem_ty);
+				llvm::Value *to_store = nvar;
+				if (nvar->getType() != mem_ty)
+				{
+					// 按宽度定方向（镜像 widen_int/convert_value 既有正确写法）：仅当 nvar 严格宽于
+					//   mem_ty 才 Trunc，否则 SExt/ZExt——杜绝 LP64 下 mem_ty=i64、nvar=i32 时误发
+					//   `trunc i32 to i64`（非法、IR verifier 崩溃，CTS 00215）。
+					unsigned nw = llvm::cast<llvm::IntegerType>(nvar->getType())->getBitWidth();
+					unsigned mw = llvm::cast<llvm::IntegerType>(mem_ty)->getBitWidth();
+					to_store = (nw > mw) ? builder.CreateTrunc(nvar, mem_ty)
+						: (uns ? builder.CreateZExt(nvar, mem_ty) : builder.CreateSExt(nvar, mem_ty));
+				}
 				builder.CreateStore(to_store, addr);
 				// 前缀返回=存回值再提升（反映溢出回绕，如 signed char 127→-128）
 				llvm::Value *nvp = (to_store->getType()->getIntegerBitWidth() == tgt)
@@ -4841,7 +5443,7 @@ struct CodeGenImpl
 			if (raw->getType()->isFloatingPointTy())
 				return (e->op == "-") ? builder.CreateFNeg(raw) : raw;
 			CTypePtr ot = get_expr_ctype(e->lhs);
-			IntPromo p = int_promo_of(ot);
+			IntPromo p = int_promo_of(ot, long_bits_());
 			unsigned tgt = p.bits < 32 ? 32u : p.bits;
 			llvm::Value *iv = widen_int(raw, tgt, is_unsigned_int_type(ot));
 			if (e->op == "-") return builder.CreateSub(llvm::ConstantInt::get(iv->getType(), 0), iv);
@@ -4860,7 +5462,7 @@ struct CodeGenImpl
 			// （应 0x7fffffffffffffff，CTS 0132）。
 			llvm::Value *raw = gen_expr(e->lhs);
 			CTypePtr ot = get_expr_ctype(e->lhs);
-			IntPromo p = int_promo_of(ot);
+			IntPromo p = int_promo_of(ot, long_bits_());
 			unsigned tgt = p.bits < 32 ? 32u : p.bits;
 			llvm::Value *iv = widen_int(raw, tgt, is_unsigned_int_type(ot));
 			return builder.CreateXor(iv, llvm::ConstantInt::get(iv->getType(), static_cast<uint64_t>(-1), true));
@@ -5017,8 +5619,8 @@ struct CodeGenImpl
 				else
 				{
 					// 整数复合赋值：按左/右 C 类型做常用算术转换，据符号选指令
-					IntPromo lp = int_promo_of(lhs_ct);
-					IntPromo rp = int_promo_of(get_expr_ctype(e->rhs));
+					IntPromo lp = int_promo_of(lhs_ct, long_bits_());
+					IntPromo rp = int_promo_of(get_expr_ctype(e->rhs), long_bits_());
 					bool lext = is_unsigned_int_type(lhs_ct);
 					bool rext = is_unsigned_int_type(get_expr_ctype(e->rhs));
 					bool is_shift = (base_op == "<<" || base_op == ">>");
@@ -5100,9 +5702,8 @@ struct CodeGenImpl
 			auto it = vars_.find(e->name);
 			if (it != vars_.end())
 				return it->second;
-			auto git = globals_.find(e->name);
-			if (git != globals_.end())
-				return git->second;
+			if (llvm::GlobalVariable *gv = global_ref(e->name))
+				return gv;
 		}
 		// 解引用: *ptr -> 地址就是 ptr
 		if (e->kind == ExprKind::Unary && e->op == "*")
@@ -5350,7 +5951,12 @@ struct CodeGenImpl
 			if (fit != self->func_types_.end()) return fit->second;
 			return nullptr;
 		}
+		// 目标数据模型的 long 位宽（供共享解析器整型提升取正确宽度）。
+		unsigned long_bits() const { return static_cast<unsigned>(self->target_.sizeof_long) * 8u; }
 	};
+	// 目标数据模型的 long 位宽：CodeGenImpl 内直接整型提升调用点共用（Windows→32、Linux→64）。
+	unsigned long_bits_() const { return static_cast<unsigned>(target_.sizeof_long) * 8u; }
+
 	CTypePtr get_expr_ctype(const ExprPtr &e)
 	{
 		// _Generic 结果类型：取命中关联项表达式的类型（经 lvalue 转换 + 衰减），使 _Generic(...)() 的间接 Call 能取到函数指针。
@@ -5545,6 +6151,9 @@ struct CodeGenImpl
 	// 时其非首字段偏移被丢弃（LARGE_INTEGER.HighPart 读到 LowPart），故按链逐级走。
 	llvm::Value *gen_member_addr(const ExprPtr &e)
 	{
+		// 路 B 阶段1b-iii：限定访问左值形（m.x = / &m.x / m.f 取函数地址）——直接返回目标符号地址。
+		if (e->q_global) return qualified_global_addr(e);
+		if (e->q_func) return qualified_func_ref(e->q_func);
 		MemberInfo mi = resolve_member_info(e);
 		llvm::Value *addr = (e->op == ".") ? gen_lvalue_addr(e->lhs) : gen_expr(e->lhs);
 		if (mi.chain.empty())
@@ -5964,12 +6573,109 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 		module_name = "a";
 	}
 
-	CodeGenImpl cg(module_name, errors);
+	CodeGenImpl cg(module_name, opts.target, errors);
+	cg.per_module_ = opts.per_module;
+	cg.per_module_single_obj_ = opts.per_module && opts.per_module_single_obj;
+	// 路 B 阶段3：产出形态——仅链接模式且 -o 以 .dll 结尾时为 DLL（大小写无关）。
+	{
+		const std::string &op = opts.output;
+		auto ci_ends = [&op](const char *s)
+		{
+			const std::size_t n = std::string(s).size();
+			if (op.size() < n) return false;
+			for (std::size_t k = 0; k < n; ++k)
+			{
+				const char a = (char)std::tolower((unsigned char)op[op.size() - n + k]);
+				const char b = (char)std::tolower((unsigned char)s[k]);
+				if (a != b) return false;
+			}
+			return true;
+		};
+		cg.output_is_dll_ = opts.link_output && ci_ends(".dll");
+	}
+	// 路 B 阶段3：`.co` 新面标志（driver 同口径的后缀判定）。
+	{
+		const std::string &sp = opts.source_path;
+		cg.is_co_ = sp.size() >= 3 &&
+			(sp.compare(sp.size() - 3, 3, ".co") == 0 || sp.compare(sp.size() - 3, 3, ".CO") == 0);
+	}
 	cg.gen_tu(*state.ast);
 
 	// P229：回传入口子系统标志（供链接层依 -subsystem/-entry 分岔）。
 	state.windows_subsystem = cg.windows_subsystem_;
 	state.use_winmain = cg.use_winmain_;
+
+	// 路 B 阶段2：分桶隔离 + 单 obj 合回——各导入桶按逆拓序 linkInModule 并入主 Module，
+	//   发一个 .obj，链接层与现状完全同路径（Linux/多 obj 配方零改动）。合并后继续下行走单 obj 发射。
+	if (opts.per_module && opts.per_module_single_obj)
+	{
+		for (auto rit = cg.done_buckets_.rbegin(); rit != cg.done_buckets_.rend(); ++rit)
+		{
+			llvm::Linker L(*cg.module);
+			std::unique_ptr<llvm::Module> src = std::move(*rit);
+			if (L.linkInModule(std::move(src), llvm::Linker::Flags::None))
+			{
+				errors.push_back(Error{opts.source_path, Pos{1, 1}, "linkInModule failed merging imported module bucket"});
+				return false;
+			}
+		}
+		cg.done_buckets_.clear();
+	}
+	// --per-module 探针：多 obj 发射路径
+	else if (opts.per_module)
+	{
+		// DEBUG: emit_llvm 模式仅 dump 主桶（探针阶段）
+		if (opts.emit_llvm)
+		{
+			std::string out_path = opts.output.empty() ? (module_name + ".ll") : opts.output;
+			std::error_code ec;
+			llvm::raw_fd_ostream os(out_path, ec);
+			if (ec) { errors.push_back(Error{opts.source_path, Pos{1,1}, "cannot write .ll: " + ec.message()}); return false; }
+			cg.module->print(os, nullptr);
+			return true;
+		}
+		// 验证各桶 module
+		for (auto &bm : cg.done_buckets_)
+		{
+			std::string verr;
+			llvm::raw_string_ostream vs(verr);
+			if (llvm::verifyModule(*bm, &vs))
+			{ errors.push_back(Error{opts.source_path, Pos{1,1}, "module verification: " + verr}); return false; }
+		}
+		std::string verr;
+		llvm::raw_string_ostream vs(verr);
+		if (llvm::verifyModule(*cg.module, &vs))
+		{ errors.push_back(Error{opts.source_path, Pos{1,1}, "module verification: " + verr}); return false; }
+
+		// 发射多 obj
+		std::error_code ec;
+		std::filesystem::path tmp = std::filesystem::temp_directory_path(ec);
+		if (ec) tmp = std::filesystem::current_path(ec);
+
+		state.obj_paths.clear();
+		bool all_ok = true;
+		for (std::size_t bi = 0; bi < cg.done_buckets_.size(); ++bi)
+		{
+			const std::string obj_out = (tmp / (module_name + "_b" + std::to_string(bi) + ".obj")).string();
+			if (!emit_object_file(cg.done_buckets_[bi].get(), obj_out, opts.source_path, errors))
+				{ all_ok = false; break; }
+			state.obj_paths.push_back(obj_out);
+		}
+		if (all_ok)
+		{
+			const std::string main_obj = (tmp / (module_name + "_main.obj")).string();
+			if (!emit_object_file(cg.module.get(), main_obj, opts.source_path, errors))
+				all_ok = false;
+			else
+				state.obj_paths.push_back(main_obj);
+		}
+		// -c 模式：保留 obj 不删除（由调用者管理）
+		if (opts.compile_only)
+			state.obj_path = state.obj_paths.empty() ? "" : state.obj_paths.back();
+		return all_ok;
+	}
+
+	// 以下为现状单 obj 路径（per_module_==false 时到达）
 
 	// DEBUG: 先写 .ll 再验证
 	if (opts.emit_llvm)

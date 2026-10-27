@@ -81,6 +81,9 @@ private:
 	// 供 colib 标准头做平台/架构分派；当前唯一支持目标 = Windows/x64(MSVC ABI)，
 	// 值对齐本机 clang/MSVC ground-truth。Linux 移植时在此按目标切换。
 	void seed_predefined_macros();
+	// 自动加载：把 colang.h 压入源栈栈顶，先于主源展开；找不到静默跳过。仅主翻译单元调用
+	// （import 子模块经 CompileOptions::preload_colang_h=false 排除，避免重复注入）。
+	void push_builtin_include(const std::string &name);
 	LineResult read_logical_line(std::vector<Token> &line); // 读一个逻辑行
 	bool is_active() const;                   // 当前是否处于活跃分支
 

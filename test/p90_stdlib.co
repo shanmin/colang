@@ -1,0 +1,40 @@
+// p90_stdlib.co — P9.0 自制最小 colib 标准头验证
+// 通过真 #include <> 拉入 stdio/stdlib/string/stdint/stddef/stdbool，
+// 依赖 colang 前端默认 stdlib 头搜索目录（见 main.cpp find_stdlib_dir）。
+// 断言以退出码返回；printf 仅旁证，正确性以 exit code 为准。
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+int main(void)
+{
+	int32_t a = 12;
+	uint64_t b = 34;
+	size_t n = sizeof(int32_t);
+	bool ok = true;
+
+	// stdlib: atoi
+	int v = atoi("77");
+	if (v != 77) return 2;
+
+	// stdlib: malloc / free
+	void *p = malloc(8);
+	if (p == 0) return 3;
+	free(p);
+
+	// string: strlen
+	size_t L = strlen("hello");
+	if (L != 5) return 4;
+
+	// stdint / stddef / stdbool 类型与取值
+	if (a != 12 || b != 34) return 5;
+	if (!ok) return 6;
+	if (n != 4) return 7;
+	if (INT32_MAX != 2147483647) return 8;
+
+	printf("a=%d b=%lld n=%u L=%u\n", a, (long long)b, (unsigned)n, (unsigned)L);
+	return 0;
+}

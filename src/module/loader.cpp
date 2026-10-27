@@ -184,6 +184,12 @@ struct Loader
 		sub_opts.source_path = abs_path.generic_string();
 		sub_opts.source_text = std::move(text);
 		sub_opts.include_dirs = main_opts.include_dirs;
+		// 传递目标/数据模型：使导入模块与主源取同一真值源（Windows 默认两侧均=LLP64、行为恒等；
+		//   Linux/--target 下才体现差异）。不得遗漏，否则 .co 子模块会退回默认 Windows 定型。
+		sub_opts.target_triple = main_opts.target_triple;
+		sub_opts.target = main_opts.target;
+		// 默认设置头 colang.h 只注入主翻译单元：导入子模块一律关闭，避免源合并时重复展开其声明/宏。
+		sub_opts.preload_colang_h = false;
 		// 其它 flag（dump_*/preprocess_only/emit_llvm/...）全 false、走完整 preprocess+parse 路径
 
 		CompileState sub_state;
@@ -203,10 +209,13 @@ struct Loader
 		// 递归处理子模块自身的 imports
 		std::string sub_dir = abs_path.parent_path().generic_string();
 		bool ok = true;
-		for (const auto &imp : sub_tu->imports)
+		// 路 B 阶段1a：为各子模块**自身** imports 回填 resolved_module_key（现仅主源回填）。
+		//   子 TU 的 imports 列表不被 merge_bundle 搬运、随 cache 保留到 sema，供限定访问按模块解析。
+		for (auto &imp : sub_tu->imports)
 		{
 			auto child_abs = resolve_module_path(main_opts, sub_dir, imp.filename);
 			std::string child_key = normalize_key(child_abs);
+			imp.resolved_module_key = child_key;
 			if (!load_recursive(child_abs, child_key, imp.loc))
 			{
 				ok = false;
@@ -262,6 +271,9 @@ void merge_bundle(TranslationUnit &main_tu,
 			std::make_move_iterator(sub.enums.begin()),
 			std::make_move_iterator(sub.enums.end()));
 		// 顶层裸代码：拓序前插 → 子模块 body 排在主源 body 之前（B 方案「main 前置统一 emit」）
+		// --per-module 探针：move 前另记逐模块分段视图（拓序＝本遍历序：最深依赖在前）。
+		if (!sub.top_level_body.empty())
+			main_tu.top_level_segments.emplace_back(*rit, sub.top_level_body); // 拷贝 shared_ptr，轻
 		main_tu.top_level_body.insert(main_tu.top_level_body.begin(),
 			std::make_move_iterator(sub.top_level_body.begin()),
 			std::make_move_iterator(sub.top_level_body.end()));

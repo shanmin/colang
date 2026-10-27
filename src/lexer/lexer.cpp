@@ -228,6 +228,46 @@ void Lexer::scan_number(Token &t)
 
 bool Lexer::scan_literal(Token &t, char quote, const std::string &prefix)
 {
+	// RC 方言双引号串：按 rc.exe 规则切分——原文拼写保真（含 "" 双写、反斜杠），
+	// 语义解码交给 rc_decode_string。单 " 终止、"" 嵌入不终止、\ 不遮蔽后继字符。
+	// 续行(\+换行)仍由 at_line_splice 先删（phase2），与 C 路径一致。
+	if (rc_str_ && quote == '"')
+	{
+		t.kind = TokKind::String;
+		t.text = prefix;
+		t.text += take(); // 起始引号
+		bool rc_terminated = false;
+		while (!eof())
+		{
+			if (at_line_splice())
+			{
+				skip_line_splice(); // 串内续行：删除，不断行
+				continue;
+			}
+			const char c = peek();
+			if (c == '\n' || c == '\r')
+			{
+				break; // 串不得跨真实换行
+			}
+			take();
+			t.text += c;
+			if (c == '"')
+			{
+				if (peek() == '"')
+				{
+					take();
+					t.text += '"'; // ""：双写原样保留，不终止（解码层折为单个引号）
+				}
+				else
+				{
+					rc_terminated = true;
+					break; // 单引号终止
+				}
+			}
+			// 反斜杠不在词法层特殊处理：rc.exe 中 \ 不遮蔽后继字符（如 \" 仍终止）
+		}
+		return rc_terminated;
+	}
 	t.kind = (quote == '\'') ? TokKind::Char : TokKind::String;
 	t.text = prefix;
 	t.text += take(); // 起始引号

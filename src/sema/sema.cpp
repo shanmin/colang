@@ -20,6 +20,7 @@
 #include "colang/type_spell.h"
 
 #include <cstddef>
+#include <cctype>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -39,6 +40,14 @@ public:
 	void run(const TUPtr &tu)
 	{
 		main_tu_ = tu.get(); // P212：可见性走查需访问 imports / imported_top_level_body_count
+		// 路 B 阶段0：`__init__*__` 为模块初始化调度协议保留前缀，禁止用户代码自定义。
+		//   无条件扫描（不随 --per-module 开关分岔）；`__co_main__` 等其它 dunder 不受影响。
+		for (const auto &f : tu->funcs)
+			if (f.name.rfind("__init__", 0) == 0)
+				report(f.loc, "reserved protocol name '__init__*' cannot be defined by user code");
+		// 路 B 阶段1b：per-module 转正路径先建 ModuleCatalog（逐模块 public 视图 + 跨模块归属），
+		//   供后续符号表归并的「跨模块同名共存」守卫与 host 裸名歧义裁定使用。
+		if (per_module_) build_catalog(tu);
 		// 建全局符号表（指针指向 ast 内部，parse 后 vector 不再变动，稳定）
 		for (const auto &f : tu->funcs)
 		{
@@ -48,6 +57,10 @@ public:
 				funcs_[f.name] = &f;
 				continue;
 			}
+			// 路 B 阶段1b：跨模块同名（source_module_key 不同）在 per-module 闭包下合法共存，
+			//   redefinition/conflicting 仅同模块内判；裸名归属与歧义交 host 视图裁定（h4b 根因）。
+			if (per_module_ && it->second->source_module_key != f.source_module_key)
+				continue;
 			// 同一 TU 内重复函数定义（无论参数是否相同）：C 约束违例
 			if (it->second->body && f.body)
 				report(f.loc, "redefinition of '" + f.name + "'");
@@ -58,7 +71,7 @@ public:
 			if (f.body && !it->second->body)
 				funcs_[f.name] = &f;
 		}
-		for (const auto &g : tu->globals) globals_[g.name] = g.type;
+		for (const auto &g : tu->globals) { globals_[g.name] = g.type; global_keys_[g.name] = g.source_module_key; if (!g.is_extern || !global_ident_locs_.count(g.name)) global_ident_locs_[g.name] = g.ident_loc; }
 		// P214：[[deprecated]] 登记表（name → 消息）。与 funcs_/globals_ 的「规范条目」归并不依赖顺序：
 		//   原型与定义分属两条 AST 记录，任一处标注即对整个实体生效。
 		for (const auto &f : tu->funcs)
@@ -76,11 +89,30 @@ public:
 		// P217：enum 类型标签登记表（供跨模块类型可见性门禁查 is_public/source_module_key）
 		for (const auto &e : tu->enums)
 			if (!e.tag.empty()) enums_[e.tag] = &e;
+		// 路 B 阶段1（ambient 切断）：登记「主源自身声明」的名字集（source_module_key 空，
+		//   含主源自带 #include 带入的原型）。宿主自身可见的名字优先于被导入模块的同名项，跨模块可见性
+		//   门禁据此豁免——根除「cannot import non-public symbol 'printf'」类 ambient 误报（宿主与子模块
+		//   各自 #include 同名标准库符号被误判为跨模块未导入）。真正未导入的模块私有助手仍报错（宿主不自声明）。
+		for (const auto &f : tu->funcs)   if (f.source_module_key.empty()) host_own_names_.insert(f.name);
+		for (const auto &g : tu->globals) if (g.source_module_key.empty()) host_own_names_.insert(g.name);
+		for (const auto &s : tu->structs) if (s.source_module_key.empty() && !s.tag.empty()) host_own_names_.insert(s.tag);
+		for (const auto &e : tu->enums)
+			if (e.source_module_key.empty())
+			{
+				if (!e.tag.empty()) host_own_names_.insert(e.tag);
+				for (const auto &c : e.constants) host_own_names_.insert(c.name);
+			}
 		// 函数名与文件作用域对象同名：不同种类符号的重定义（局部同名遮蔽合法，不查）
 		std::unordered_set<std::string> clash_reported;
 		for (const auto &f : tu->funcs)
-			if (globals_.count(f.name) && clash_reported.insert(f.name).second)
+		{
+			auto git = global_keys_.find(f.name);
+			if (git == global_keys_.end()) continue;
+			// 路 B 阶段1b：跨模块函数名与他模块全局名同名共存合法（仅同模块内才判不同种类重定义）。
+			if (per_module_ && git->second != f.source_module_key) continue;
+			if (clash_reported.insert(f.name).second)
 				report(f.loc, "redefinition of '" + f.name + "' as different kind of symbol");
+		}
 
 		// P214：[[lib("X")]] 语义校验（可挂对象/须纯原型/与 public 互斥/同名不同库冲突）
 		check_attributes(tu);
@@ -131,6 +163,76 @@ public:
 		check_top_level(tu);
 	}
 
+	// 路 B 阶段1b：从合并后主 TU 按 source_module_key 分组，构建逐模块 public 视图 + 限定名映射。
+	//   ambient 切断（导出侧）：只收模块「自有」声明（source_module_key 非空）且 is_public；
+	//   主源自身项（key 空）与经 #include 带入的原型均不入导出面。
+	void build_catalog(const TUPtr &tu)
+	{
+		// 模块 key → 文件名 stem（去扩展名）：默认限定名。
+		auto stem_of = [](const std::string &key) -> std::string
+		{
+			std::string base = key;
+			auto slash = base.find_last_of("/\\");
+			if (slash != std::string::npos) base = base.substr(slash + 1);
+			auto dot = base.find_last_of('.');
+			if (dot != std::string::npos) base = base.substr(0, dot);
+			return base;
+		};
+		for (const auto &f : tu->funcs)
+		{
+			if (f.source_module_key.empty() || !f.is_public) continue;
+			catalog_.by_module[f.source_module_key].funcs[f.name] = &f;
+			xmod_public_owners[f.name].insert(f.source_module_key);
+		}
+		for (const auto &g : tu->globals)
+		{
+			if (g.source_module_key.empty() || !g.is_public) continue;
+			catalog_.by_module[g.source_module_key].globals[g.name] = &g;
+			xmod_public_owners[g.name].insert(g.source_module_key);
+		}
+		for (const auto &s : tu->structs)
+		{
+			if (s.source_module_key.empty() || !s.is_public || !s.is_definition || s.tag.empty()) continue;
+			catalog_.by_module[s.source_module_key].structs[s.tag] = &s;
+		}
+		for (const auto &e : tu->enums)
+		{
+			if (e.source_module_key.empty() || !e.is_public || e.tag.empty()) continue;
+			catalog_.by_module[e.source_module_key].enums[e.tag] = &e;
+		}
+		// 限定名映射：主源本层 imports 的 `as ModAlias`（无别名取文件 stem）→ resolved_module_key。
+		//   consts 表暂空（public const int 的跨模块导出面留待限定访问实现步补齐）。
+		for (const auto &d : tu->imports)
+		{
+			if (d.resolved_module_key.empty()) continue;
+			const std::string alias = d.module_alias.empty() ? stem_of(d.resolved_module_key) : d.module_alias;
+			catalog_.qualified[alias] = d.resolved_module_key;
+			// 确保被 import 但无 public 导出的模块也有条目（限定名可解析到空视图）。
+			catalog_.by_module.emplace(d.resolved_module_key, View{});
+		}
+		// 路 B 阶段2-c：跨模块同名（host vs import、import vs import）共存 → 给「导入项」挂 dunder 合成符号名
+		//   `__<stem>__<name>`；host 自身项保留裸名（ambient 胜出、host 定义全局唯一）。
+		//   同模块内 prototype+definition（distinct key 唯一）不触发。消解 LLVM 链接期重复 external 符号误并（h4b b=2 根因）。
+		std::unordered_map<std::string, std::unordered_set<std::string>> fn_keys, g_keys;
+		for (const auto &f : tu->funcs) fn_keys[f.name].insert(f.source_module_key);
+		for (const auto &g : tu->globals) g_keys[g.name].insert(g.source_module_key);
+		for (auto &f : tu->funcs)
+			if (!f.source_module_key.empty() && fn_keys[f.name].size() > 1)
+				f.symbol_name = "__" + sanitize_ident(stem_of(f.source_module_key)) + "__" + f.name;
+		for (auto &g : tu->globals)
+			if (!g.source_module_key.empty() && g_keys[g.name].size() > 1)
+				g.symbol_name = "__" + sanitize_ident(stem_of(g.source_module_key)) + "__" + g.name;
+	}
+
+	// 路 B 阶段2-c：将任意字符串洗为合法 C 标识符（非 [A-Za-z0-9_] 一律换 '_'）。
+	static std::string sanitize_ident(const std::string &s)
+	{
+		std::string o;
+		for (char c : s)
+			o += (std::isalnum(static_cast<unsigned char>(c)) || c == '_') ? c : '_';
+		return o;
+	}
+
 	// P211：顶层语句序列检查 + 无入口警告（仅对 .co 后缀、且 link_output 时发警告）
 	void check_top_level(const TUPtr &tu)
 	{
@@ -172,8 +274,8 @@ public:
 			}
 			if (winmain_fn)
 			{
-				if (!tu->top_level_body.empty())
-					report(winmain_fn->loc, "'WinMain' entry is incompatible with top-level bare commands; put GUI logic in WinMain");
+				// 路 B 阶段3：WinMain 入口与顶层裸指令不再互斥——codegen 合成 WinMain 载体
+				//   （改名转发 __co_WinMain__ + 头部跑顶层初始化/裸句）承载，原「静默丢弃」根除。
 				if (winmain_fn->params.size() != 4)
 					report(winmain_fn->loc, "'WinMain' must have 4 parameters (hInstance, hPrevInstance, lpCmdLine, nCmdShow)");
 			}
@@ -187,6 +289,24 @@ public:
 		}();
 		if (!is_co) return;
 		if (opts_.compile_only || opts_.emit_llvm || !opts_.link_output) return;
+		// 路 B 阶段3：产 DLL（-o *.dll）时入口为合成 DllMain（顶层初始化载体），非 exe main 语义——
+		//   「无入口点」告警不适用（大小写无关判后缀）。
+		{
+			const std::string &op = opts_.output;
+			auto ci_ends = [&op](const char *s)
+			{
+				const std::size_t n = std::string(s).size();
+				if (op.size() < n) return false;
+				for (std::size_t k = 0; k < n; ++k)
+				{
+					const char a = (char)std::tolower((unsigned char)op[op.size() - n + k]);
+					const char b = (char)std::tolower((unsigned char)s[k]);
+					if (a != b) return false;
+				}
+				return true;
+			};
+			if (ci_ends(".dll")) return;
+		}
 		bool has_bare = !tu->top_level_body.empty();
 		bool has_user_main = false;
 		for (const auto &f : tu->funcs)
@@ -196,6 +316,11 @@ public:
 	}
 
 	bool ok() const { return !has_error_; }
+
+	// 路 B 阶段1b：per-module 转正开关（须在 run() 前设置）。
+	void set_per_module(bool v) { per_module_ = v; }
+	// 路 B 阶段1b：取走已构建的 ModuleCatalog（run() 后有效）。
+	ModuleCatalog take_catalog() { return std::move(catalog_); }
 
 private:
 	// —— P214 [[lib("X")]] 校验 ——
@@ -371,6 +496,58 @@ private:
 		e.message = msg;
 		e.is_warning = true;
 		errors_.push_back(std::move(e));
+	}
+
+	// 带 note 附注的错误诊断（clang 同形：“file:line:col: note: ...”）
+	void report_with_note(const SourceLoc &loc, const std::string &msg,
+	                      const SourceLoc &note_loc, const std::string &note_msg)
+	{
+		Error e;
+		e.file = loc.file.empty() ? opts_.source_path : loc.file;
+		e.pos.line = loc.line;
+		e.pos.column = loc.column;
+		e.message = msg;
+		e.is_warning = false;
+		Error n;
+		n.file = note_loc.file.empty() ? opts_.source_path : note_loc.file;
+		n.pos.line = note_loc.line;
+		n.pos.column = note_loc.column;
+		n.message = note_msg;
+		e.notes.push_back(std::move(n));
+		errors_.push_back(std::move(e));
+		has_error_ = true;
+	}
+
+	// 带 note 附注的告警
+	void warn_with_note(const SourceLoc &loc, const std::string &msg,
+	                    const SourceLoc &note_loc, const std::string &note_msg)
+	{
+		Error e;
+		e.file = loc.file.empty() ? opts_.source_path : loc.file;
+		e.pos.line = loc.line;
+		e.pos.column = loc.column;
+		e.message = msg;
+		e.is_warning = true;
+		Error n;
+		n.file = note_loc.file.empty() ? opts_.source_path : note_loc.file;
+		n.pos.line = note_loc.line;
+		n.pos.column = note_loc.column;
+		n.message = note_msg;
+		e.notes.push_back(std::move(n));
+		errors_.push_back(std::move(e));
+	}
+
+	// 查找变量声明位置（内层→外层→全局）
+	SourceLoc find_decl_loc(const std::string &name)
+	{
+		for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it)
+		{
+			auto f = it->find(name);
+			if (f != it->end()) return f->second.loc;
+		}
+		auto g = global_ident_locs_.find(name);
+		if (g != global_ident_locs_.end()) return g->second;
+		return {};
 	}
 
 	// —— 类型谓词 ——
@@ -681,6 +858,8 @@ private:
 	{
 		// 只在主源代码（cur_source_module_key_ 空）中才需跨模块可见性检查。
 		if (!cur_source_module_key_.empty()) return;
+		// 路 B 阶段1 ambient 切断：宿主自身（含其 #include）声明的名字优先，不作跨模块可见性检查。
+		if (host_own_names_.count(name)) return;
 		const std::string src = symbol_source_module(name);
 		if (src.empty()) return; // 主源自身符号、不跨模块
 		// 取目标 is_public 标记（funcs_/globals_ 两路）
@@ -698,6 +877,18 @@ private:
 			}
 		}
 		ensure_visible_from_main(name, src, target_pub, loc);
+	}
+
+	// 路 B 阶段1b：host 裸名歧义裁定③——同名由两个以上模块同时导出且宿主不自有 → 裸名歧义禁用（限定名仍可访问）。
+	//   仅主源上下文（cur_source_module_key_ 空）、仅 per-module 转正路径触发。宿主自有一名胜出（裁定②遮蔽）、跳过。
+	void check_ambiguous_bare(const std::string &name, const SourceLoc &loc)
+	{
+		if (!per_module_) return;
+		if (!cur_source_module_key_.empty()) return;
+		if (host_own_names_.count(name)) return;
+		auto it = xmod_public_owners.find(name);
+		if (it == xmod_public_owners.end() || it->second.size() < 2) return;
+		report(loc, "reference to '" + name + "' is ambiguous (imported from multiple modules)");
 	}
 
 	// P217：主源将导入的非 public struct/enum 当类型用 → 拒收。仅主源（cur_source_module_key_ 空）触发。
@@ -794,7 +985,7 @@ private:
 		for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it)
 		{
 			auto f = it->find(n);
-			if (f != it->end()) return f->second;
+			if (f != it->end()) return f->second.type;
 		}
 		auto g = globals_.find(n);
 		if (g != globals_.end()) return g->second;
@@ -843,6 +1034,8 @@ private:
 			if (it != self->funcs_.end()) return it->second->return_type;
 			return nullptr;
 		}
+		// 目标数据模型的 long 位宽（供共享解析器整型提升取正确宽度）。
+		unsigned long_bits() const { return static_cast<unsigned>(self->opts_.target.sizeof_long) * 8u; }
 	};
 
 	CTypePtr resolve_type(const ExprPtr &e)
@@ -859,7 +1052,7 @@ private:
 	//   D `cannot assign to variable 'X' with const-qualified data member 'm'`
 	// 自增/自减与赋值同文（clang 不说 "cannot increment"）；类型拼写走 P252/P253 的
 	//   `describe_type`（typedef 别名双轨 `CI' (aka 'const int')`、数组整维 `const int[3][2]` 自然成立）。
-	// clang 另附 `note: … declared const here`：colang 的 Error 无 note 通道 → 不发（已知差异）。
+	// clang 另附 `note: … declared const here`：A/C 形已落地（P256）；B/D 形 clang 亦不附。
 	// 判据：把左值沿「根变量 → 目标」展开为**逐层对象类型**，只看「最后一次指针间接」之下的
 	//   对象链（该链之上的 const 属于别的对象，本次写入并不落到那里）：
 	//   全程未经间接 → const 由根变量传播至被写子对象 → 可指名 → A 形；
@@ -916,6 +1109,34 @@ private:
 		if (!obj || field.empty()) return nullptr;
 		SemaTypeEnv env{this};
 		return env.struct_member(obj->tag, field);
+	}
+
+	// 查找结构体成员的声明位置（C 形 note 用）
+	SourceLoc find_member_loc(const CTypePtr &obj, const std::string &field)
+	{
+		if (!obj || obj->tag.empty() || field.empty()) return {};
+		auto sit = structs_.find(obj->tag);
+		if (sit == structs_.end() || !sit->second) return {};
+		for (const auto &m : sit->second->members)
+			if (m.name == field) return m.loc;
+		return {};
+	}
+
+	// 递归查找聚合类型（含嵌套 struct/union）中 const 成员的声明位置（field-unsafe note 用）
+	SourceLoc find_const_member_rec_loc(const CTypePtr &t, int depth)
+	{
+		if (!t || depth > 4) return {};
+		if (t->kind != TypeKind::Struct && t->kind != TypeKind::Union) return {};
+		auto it = structs_.find(t->tag);
+		if (it == structs_.end()) return {};
+		for (const auto &m : it->second->members)
+		{
+			if (!m.type) continue;
+			if (m.type->is_const) return m.loc;
+			SourceLoc r = find_const_member_rec_loc(m.type, depth + 1);
+			if (r.line) return r;
+		}
+		return {};
 	}
 
 	// 聚合类型是否含 const 成员（D 形判据；递归进入嵌套聚合，深度上限防环）
@@ -1026,8 +1247,14 @@ private:
 			{
 				if (is_const_obj_type(levels[i], 0))
 				{
-					report(loc, "cannot assign to non-static data member '" + owner[i] +
-						"' with const-qualified type " + describe_type(levels[i]));
+					SourceLoc mloc = (i >= 1) ? find_member_loc(levels[i - 1], owner[i]) : SourceLoc{};
+					if (mloc.line)
+						report_with_note(loc, "cannot assign to non-static data member '" + owner[i] +
+							"' with const-qualified type " + describe_type(levels[i]),
+							mloc, "non-static data member '" + owner[i] + "' declared const here");
+					else
+						report(loc, "cannot assign to non-static data member '" + owner[i] +
+							"' with const-qualified type " + describe_type(levels[i]));
 					return;
 				}
 				continue; // 本成员非 const → 继续往外找
@@ -1044,8 +1271,16 @@ private:
 			// A 形：全程未跨间接（const 由根变量传播到被写子对象），或 `->` 直接作用于根变量
 			//   本身（clang 把诊断锚回该指针变量，42/59 例）；B 形：经指针间接取得、无从指名。
 			if (lo == 0 || (last_ind_arrow && lo == 1))
-				report(loc, "cannot assign to variable '" + root +
-					"' with const-qualified type " + describe_type(rt));
+			{
+				SourceLoc dloc = find_decl_loc(root);
+				if (dloc.line)
+					report_with_note(loc, "cannot assign to variable '" + root +
+						"' with const-qualified type " + describe_type(rt),
+						dloc, "variable '" + root + "' declared const here");
+				else
+					report(loc, "cannot assign to variable '" + root +
+						"' with const-qualified type " + describe_type(rt));
+			}
 			else
 				report(loc, ro);
 			return;
@@ -1069,6 +1304,52 @@ private:
 		}
 	}
 
+	// 路 B 阶段1b-iii：限定访问 m.x / m.f() 解析与绑定（仅 per-module 转正路径）。
+	//   形如 Member{op=".", lhs=VarRef(alias), name=member}：若 alias 是模块限定名（命中
+	//   catalog_.qualified）且本地未声明同名变量（裁定②遮蔽：本地胜则不接管），则按 catalog
+	//   解析目标并在 Member 上挂 q_func/q_global 指针绑定，同时标记基 VarRef 为限定符以抑制
+	//   undeclared 诊断。命中返回 true（已处理）；否则返回 false（交常规成员访问路径）。
+	bool try_bind_qualified_member(const ExprPtr &e)
+	{
+		if (!per_module_) return false;
+		if (e->op != ".") return false;               // 仅 `.` 形（`->` 恒为指针成员）
+		const ExprPtr &base = e->lhs;
+		if (!base || base->kind != ExprKind::VarRef) return false;
+		const std::string &alias = base->name;
+		if (alias.empty()) return false;
+		if (is_declared(alias)) return false;          // 本地同名变量胜出（遮蔽），走常规成员
+		auto qit = catalog_.qualified.find(alias);
+		if (qit == catalog_.qualified.end()) return false; // 非模块限定名
+		auto vit = catalog_.by_module.find(qit->second);
+		if (vit == catalog_.by_module.end())
+		{
+			report(e->loc, "reference to module '" + alias + "' before import");
+			base->module_qualifier = true;
+			return true; // 已报，不再叠加 undeclared / 非结构体基类误报
+		}
+		const ModuleCatalog::View &view = vit->second;
+		const std::string &mname = e->name;
+		auto fit = view.funcs.find(mname);
+		if (fit != view.funcs.end())
+		{
+			e->q_func = fit->second;
+			base->module_qualifier = true;
+			return true;
+		}
+		auto git = view.globals.find(mname);
+		if (git != view.globals.end())
+		{
+			e->q_global = git->second;
+			if (!e->type) e->type = git->second->type; // 供裁定Ⅷ const 只读检查/类型查询
+			base->module_qualifier = true;
+			return true;
+		}
+		// 裁定⑥：非 public 不入导出面 → 限定访问不可命中（与按名 import 非 public 同口径）。
+		report(e->loc, "no public symbol '" + mname + "' in module '" + alias + "'");
+		base->module_qualifier = true;
+		return true;
+	}
+
 	// —— 表达式检查 ——
 	void check_expr(const ExprPtr &e)
 	{
@@ -1076,10 +1357,12 @@ private:
 		switch (e->kind)
 		{
 		case ExprKind::VarRef:
+			if (e->module_qualifier) break; // 路 B 阶段1b-iii：限定访问基（模块名）不作变量检查
 			if (!is_declared(e->name))
 				report(e->loc, "use of undeclared identifier '" + e->name + "'");
 			else
 			{
+				check_ambiguous_bare(e->name, e->loc); // P路 B 阶段1b：裁定③ host 裸名歧义
 				enforce_import_visibility(e->name, e->loc); // P212
 				// P214：[[deprecated]] 引用点告警（对象名；函数名作为值使用时同路径）
 				if (!is_declared_local(e->name))
@@ -1101,6 +1384,16 @@ private:
 			const ExprPtr &L = e->lhs;
 			if (L)
 			{
+				// 路 B 阶段1b-iii：限定访问写目标 m.x = ... —— 先绑定；const 全局报只读（裁定Ⅷ）、
+				//   非 const 与本地同权（不设跨模块只读门）；命中绑定则不走常规成员 assignability。
+				if (L->kind == ExprKind::Member) try_bind_qualified_member(L);
+				if (L->q_global)
+				{
+					if (L->q_global->type && L->q_global->type->is_const)
+						report(e->loc, "read-only variable is not assignable");
+				}
+				else
+				{
 				bool bad = L->kind == ExprKind::IntLiteral || L->kind == ExprKind::FloatLiteral ||
 				           L->kind == ExprKind::CharLiteral || L->kind == ExprKind::StringLiteral ||
 				           L->kind == ExprKind::Call || L->kind == ExprKind::Comma ||
@@ -1118,7 +1411,8 @@ private:
 				if (cast_lvalue) { /* 已报，不叠加「不可赋值」*/ }
 				else if (bad) report(e->loc, "expression is not assignable");
 				// P254：可写位置的 const 只读检查（已判「不可赋值」的不重复报）
-				else check_write_target(L, e->loc);
+					else check_write_target(L, e->loc);
+				}
 			}
 			// C23 模型 B：nullptr（nullptr_t）只能赋给指针类型；赋给类型已知的非指针左值是约束违例。
 			if (L && is_nullptr(e->rhs))
@@ -1135,6 +1429,8 @@ private:
 			break;
 		case ExprKind::Member:
 		{
+			// 路 B 阶段1b-iii：限定访问 m.x / m.f() —— 命中则已绑定，不走常规成员类型检查。
+			if (try_bind_qualified_member(e)) break;
 			CTypePtr base = resolve_type(e->lhs);
 			if (base)
 			{
@@ -1161,6 +1457,7 @@ private:
 			if (!e->lhs && !e->name.empty())
 			{
 				// P212：函数调用跨模块可见性检查（与 VarRef 同机制）。
+				check_ambiguous_bare(e->name, e->loc); // 路 B 阶段1b：裁定③ host 裸名歧义
 				enforce_import_visibility(e->name, e->loc);
 				auto it = funcs_.find(e->name);
 				if (it != funcs_.end())
@@ -1244,9 +1541,32 @@ private:
 			if (is_nullptr(s->var_init) && s->var_type && s->var_type->kind != TypeKind::Pointer)
 				report(s->var_init->loc, "initializing incompatible type (not a pointer) with 'nullptr'");
 			if (!scopes_.empty() && !s->var_name.empty())
-				scopes_.back()[s->var_name] = s->var_type;
+				scopes_.back()[s->var_name] = {s->var_type, s->loc};
 			enforce_type_visible(s->var_type, s->loc); // P217：局部声明类型跨模块可见性
 			enforce_complete_type(s->var_type, s->loc, IctxVar); // P255：不完整类型按值分配前置诊断
+			// P256：-Wdefault-const-init-var-unsafe / -Wdefault-const-init-field-unsafe
+			//   仅限局部非 static 无初始化器（全局/static 有零初始化保证，clang 不发）。
+			if (!s->var_init && !s->is_static && !s->is_extern && s->var_type && cur_func_)
+			{
+				if (is_const_obj_type(s->var_type, 0))
+					warn(s->loc, "default initialization of an object of type " +
+						describe_type(s->var_type) + " leaves the object uninitialized");
+				else
+				{
+					std::string cm;
+					if (find_const_member(s->var_type, cm, 0) && !cm.empty())
+					{
+						SourceLoc mloc = find_const_member_rec_loc(s->var_type, 0);
+						if (mloc.line)
+							warn_with_note(s->loc, "default initialization of an object of type " +
+								describe_type(s->var_type) + " with const member leaves the object uninitialized",
+								mloc, "member '" + cm + "' declared 'const' here");
+						else
+							warn(s->loc, "default initialization of an object of type " +
+								describe_type(s->var_type) + " with const member leaves the object uninitialized");
+					}
+				}
+			}
 			break;
 		}
 		case StmtKind::ExprStmt:
@@ -1340,7 +1660,7 @@ private:
 		scopes_.clear();
 		scopes_.emplace_back(); // 形参作用域
 		for (const auto &p : f.params)
-			if (!p.name.empty()) scopes_.back()[p.name] = p.type;
+			if (!p.name.empty()) scopes_.back()[p.name] = {p.type, p.loc};
 		labels_.clear();
 		collect_labels(f.body);
 		// 非 void 函数可能执行到末尾而无 return（C 为 UB，clang 默认 -Wreturn-type 告警）。
@@ -1362,6 +1682,8 @@ private:
 
 	std::unordered_map<std::string, const FuncDecl *> funcs_;
 	std::unordered_map<std::string, CTypePtr> globals_;
+	// 路 B 阶段1b：全局名 → 归属模块 key（供跨模块「函数 vs 全局」不同种类重定义同模块守卫）。
+	std::unordered_map<std::string, std::string> global_keys_;
 	// P214：[[deprecated]] 登记表（name → 消息，空串 = 无附带理由）
 	std::unordered_map<std::string, std::string> dep_funcs_;
 	std::unordered_map<std::string, std::string> dep_globals_;
@@ -1372,7 +1694,9 @@ private:
 	std::unordered_map<std::string, const StructDef *> structs_;
 	// P217：enum 类型标签→定义（供跨模块类型可见性门禁）
 	std::unordered_map<std::string, const EnumDef *> enums_;
-	std::vector<std::unordered_map<std::string, CTypePtr>> scopes_; // 末位为最内层
+	struct ScopeEntry { CTypePtr type; SourceLoc loc; };
+	std::vector<std::unordered_map<std::string, ScopeEntry>> scopes_; // 末位为最内层
+	std::unordered_map<std::string, SourceLoc> global_ident_locs_; // 全局变量名→声明位置
 	std::unordered_set<std::string> labels_;
 	std::unordered_set<std::string> dead_ends_; // 永不返回调用者的函数
 	const FuncDecl *cur_func_ = nullptr;
@@ -1380,6 +1704,15 @@ private:
 	std::string cur_source_module_key_;
 	// P212：主源 TU 指针（仅 run() 内使用），供可见性检查访问 imports/globals/enums。
 	const TranslationUnit *main_tu_ = nullptr;
+	// 路 B 阶段1（ambient 切断）：主源自身声明（含其 #include）的裸名集；命中则跨模块可见性门禁豁免。
+	std::unordered_set<std::string> host_own_names_;
+	// 路 B 阶段1b：per-module 转正开关（true 时 run() 末建 catalog；旧单遍路径恒 false、零改动）。
+	bool per_module_ = false;
+	// 路 B 阶段1b：逐模块 public 视图目录（per_module_ 为 true 时填充）。
+	ModuleCatalog catalog_;
+	using View = ModuleCatalog::View;
+	// 路 B 阶段1b：裸名 → 导出该名的不同模块 key 集（host 裸名歧义裁定③：size>1 且非 host 自有→歧义）。
+	std::unordered_map<std::string, std::unordered_set<std::string>> xmod_public_owners;
 };
 
 }  // namespace
@@ -1389,6 +1722,19 @@ bool analyze(const CompileOptions &opts, CompileState &state, std::vector<Error>
 	if (!state.ast) return false;
 	Sema sema(opts, errors);
 	sema.run(state.ast);
+	return sema.ok();
+}
+
+// 路 B 阶段1b：per-module 转正入口。当前增量仅置 per_module_ 建 catalog、宿主检查逻辑沿用现有 run()
+//   （行为与旧单遍恒等、三门槛不变）；run_host/run_module 闭包逻辑在后续子步接入。
+bool analyze_per_module(const CompileOptions &opts, CompileState &state, std::vector<Error> &errors,
+                        ModuleCatalog *out_catalog)
+{
+	if (!state.ast) return false;
+	Sema sema(opts, errors);
+	sema.set_per_module(true);
+	sema.run(state.ast);
+	if (out_catalog) *out_catalog = sema.take_catalog();
 	return sema.ok();
 }
 
