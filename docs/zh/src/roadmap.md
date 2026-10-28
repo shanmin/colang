@@ -21,8 +21,8 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 | 0.2.0 | Co 入口模型 + `public`           | 已发布  |
 | 0.3.0 | 实现链接                        | 已发布  |
 | 0.3.1 | Windows GUI 与 `winapi.co`      | 已发布  |
-| 0.3.2 | Linux 原生 ELF 工具链            | 开发中  |
-| 0.4.0 | 实现 `class`                   | 计划中  |
+| 0.3.2 | Linux 原生 ELF 工具链            | 已发布  |
+| 0.4.0 | 实现 `class`                   | 已发布  |
 
 后续 1.\* / 2.\* / 3.\* 具体条目将在 0.\* 收官前由维护方主动细化。
 
@@ -60,22 +60,24 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 ### 0.3.1 — Windows GUI 与 winapi.co
 
 - Windows GUI 子系统与 `WinMain` 入口：`[[subsystem("windows")]]` 或源里定义 `WinMain` 即切无控制台产物；`WinMain` 与顶层裸指令互斥。
-- `winapi.co` 标准库模块取代 `windows.h`：215 原型 / 13 结构 / 266 常量（经 SDK 核验），库归属由 `[[lib(...)]]` 声明；程序化 GUI 常用 API 子集（窗口、消息循环、内存 DC 绘制、裁剪、文本度量、系统颜色）。
+- `winapi.co` 标准库模块取代 `windows.h`：起步子集、随版本滚动扩容，至 0.4.0 累计 323 原型 / 39 结构·联合体 / 396 常量（经 SDK 核验），库归属由 `[[lib(...)]]` 声明；程序化 GUI 常用 API 子集（窗口、消息循环、内存 DC 绘制、裁剪、文本度量、系统颜色）。
 - `const` 一致性：只读强制落地（诊断与 clang 对齐）；`public const int` 跨模块穿透数组维度与 `switch` 的 `case` 标签，非常量标签从静默折 0 改为报错。
 - 属性首批语义：`[[nodiscard]]` / `[[noreturn]]` 生效，`[[deprecated]]` 同位重复标注 first-wins。
 - C 符合性批次：指定初始化器全链（链式设计符、匿名聚合提升、`union` 宿主、位域初始化掩码写入、DFS 续位）、`sizeof`/`_Alignof` 常量语境扩展、标识符与字面量通用字符名（`\uXXXX`/`\UXXXXXXXX`）、带前缀字符常量定型、`_Alignas` 语境约束与跨声明一致性、`static_assert` 多作用域。
 - 诊断质量：拼写还原 `typedef` 别名、列号拉齐 clang、不完整类型按值分配的前置诊断。
 - 发布包扁平单层：`colang.exe + include/`（标准头随编译器就地定位，无需 `-I`）。
 - Linux（WSL）构建打通：colang 本体已可在 WSL2/Debian 原生构建并跑通回归（此阶段链接仍借助外部工具链）。
+- Co 层裸标签（C++ 风格）：`.co` 里 `struct`/`union`/`enum` 可省略关键字作类型（`Point p;`），被 import 的 `public` 标签同样可裸用。
+- 发布包版本号扩为四段 `MAJOR.MINOR.PATCH.Build`（第四段为构建计数，`-v` 与产物 PE 版本信息同步）。
 
-## 计划中
-
-### 0.3.2 — Linux 原生 ELF 工具链（开发中）
+### 0.3.2 — Linux 原生 ELF 工具链
 
 - 单一 target/data-model 抽象（`__LP64__`/`__LLP64__`）贯穿预处理宏、类型宽度、代码生成与链接，消除前端与后端的数据模型分裂。
 - Linux 上由进程内 `lld::elf` **静态**链本机 glibc/libgcc 产出原生 ELF 可执行文件（不依赖外部链接器）；`crt1.o`/`libc.a`/`libm.a`/`libgcc` 自动定位。
 - `--target <triple>` 支持交叉产出 ELF 目标文件与 IR。
 - Linux 原生构建 colang（对源码自建 LLVM 23.1，X86+lld）；门槛矩阵（plct）向 Windows 基线对齐。
+- 内置 `.rc` 资源编译器与 `--resource` 嵌入通道（与 rc.exe 逐字节对齐）；per-module 编译模型转正（独立闭包 + 撞名分流 + 限定访问）；`wchar_t`/`wint_t` 全链路 target-aware；DLL 侧合成 `DllMain` 载体；const 诊断与 clang 对齐。
+- 新增默认设置头 `include/colang.h` 自动预加载。
 - 后续（长尾）：`.so` 动态共享对象、动态 PIE、x86-64 SysV ABI 边角、`winapi.co` 的 ELF 映射、全 stdlib 头 glibc 审计。
 
 ### 0.4.0 — 实现 class
@@ -85,6 +87,12 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - 自动引用计数与堆对象回收；出域自动释放。
 - `public` 修饰扩展到 class 成员。
 - 类静态成员经类名双冒号访问（`C::m()`）。
+- 已交付增量（超出原计划）：成员与形参类型放开（`class` 句柄、`struct`/`union`/数组值语义内嵌；形参借用、成员宿主拥有）；`delete` 语句强制销毁与断环；`goto`/`break`/`continue` 路径终结的正确释放。
+- 后续（长尾）：继承与虚函数；被 `import` 模块的 `public class` 跨模块消费；多 obj（`--per-module`）下的 class 形态；环形引用自动断环（现靠 `delete` 强破）。
+
+## 计划中
+
+后续 1.\* / 2.\* / 3.\* 里程碑的具体条目将在 0.\* 收官前由维护方主动细化。
 
 ## 用语约定
 

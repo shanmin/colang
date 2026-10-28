@@ -56,6 +56,7 @@ const Punct punct_table[] = {
 	{"<::", 3, "[["},
 	// 2 字节
 	{"->", 2, nullptr},
+	{"::", 2, nullptr}, // Co class 静态成员访问（0.4.0）
 	{"++", 2, nullptr},
 	{"--", 2, nullptr},
 	{"<<", 2, nullptr},
@@ -143,6 +144,10 @@ bool is_keyword(const std::string &word)
 		//   `module` 作为本文件模块名声明头，本版保留关键字位、不强制使用
 		//   （模块名默认取文件名去扩展名，见 plan N4）。
 		"import", "module",
+		// P300 Co class 层（0.4.0）：引用类型关键字。
+		//   `class` 定义类，`new` 堆实例化，`this` 当前对象引用。
+		//   `delete` 为上下文物（仅 parse_stmt 语句首位前瞻识别），故意不入关键字表，保纯 C 面 `delete` 作标识符兼容。
+		"class", "new", "this",
 	};
 	return keywords.count(word) != 0;
 }

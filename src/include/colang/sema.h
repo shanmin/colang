@@ -28,13 +28,14 @@ namespace colang
 // ============================================================
 struct ModuleCatalog
 {
-	// 单模块 public 视图（五表；缺项类型不出现在对应表）
+	// 单模块 public 视图（六表；缺项类型不出现在对应表）
 	struct View
 	{
 		std::unordered_map<std::string, const FuncDecl *> funcs;   // 裸名 → public 函数
 		std::unordered_map<std::string, const GlobalVar *> globals; // 裸名 → public 全局变量
 		std::unordered_map<std::string, const StructDef *> structs;  // tag → public struct/union 定义
 		std::unordered_map<std::string, const EnumDef *> enums;      // tag → public enum 定义
+		std::unordered_map<std::string, const ClassDef *> classes;   // tag → public class 定义（P300 Co class 跨模块）
 		std::unordered_map<std::string, std::int64_t> consts;        // 名 → public const int
 	};
 	// module key（规范化绝对路径）→ 本模块 public 视图

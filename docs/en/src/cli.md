@@ -13,7 +13,7 @@ One invocation handles **one** source file. When no action option is given, the 
 | Option | Description |
 | --- | --- |
 | `-h`, `--help` | Show usage and the option list |
-| `-v`, `--version` | Show the compiler version, the LLVM version used, and the target platform |
+| `-v`, `--version` | Show the compiler version (four segments), the LLVM version used, and the target platform |
 | `-E` | Preprocess only; send the expanded token listing to standard output |
 | `-c` | Compile only; produce an object file (COFF `.obj` for a Windows target, ELF `.o` for a Linux target) without linking |
 | `-o <file>` | Write the output to `<file>` |
@@ -30,6 +30,23 @@ One invocation handles **one** source file. When no action option is given, the 
 | `-E` | Standard output | Always goes to standard output; `-o` has no effect |
 
 When linking, the intermediate `.obj` is written to the system temporary directory and removed automatically after the link.
+
+## The four-segment version
+
+`-v` prints something like:
+
+```
+colang 0.4.0.29
+LLVM   23.1.0
+target x86_64-pc-windows-msvc
+model  LLP64 (windows) (long=4, void*=8, wchar_t=2)
+```
+
+The first three segments `MAJOR.MINOR.PATCH` are the **release version**; the fourth is a **build counter**, increased whenever the compiler is really rebuilt (and reset to zero when the three-segment version changes). It only tells development builds apart and does not signal a functional change. The PE version info (`FILEVERSION`/`PRODUCTVERSION`) of the produced exe/dll uses the same four segments.
+
+## Default settings header
+
+Every compilation automatically expands `include/colang.h` from the standard library directory ahead of the main source (silently skipped when it is not found), so you can put your own global macro definitions there. The injection applies to **the main source only**, not to `import`ed modules, and works the same in plain-C and `.co` mode.
 
 ## What `-E` actually prints
 

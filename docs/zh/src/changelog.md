@@ -3,6 +3,19 @@
 本记录按发布版本列出 Co（colang）语言/编译器的主要变化。
 版本策略：0.* 为开发测试版，1.* 为正式版，2.* 为自举版。
 
+## 0.4.0
+- `class` 引用类型（heap-only + 自动引用计数）：`new` 实例化、`this` 成员访问、实例方法与静态成员 `C::m()` 访问；出作用域按帧逆序自动释放，`break`/`continue`/`goto` 路径终结同样正确回收。
+- 成员与形参类型放开：基元、`class`、`struct`/`union`/数组均可——`struct`/`union`/数组作成员为值语义内嵌（不计引用数、随宿主分配与释放）；class 句柄作形参取**借用**语义（不转移所有权），作成员取**宿主拥有**语义（赋值即持有，析构时级联释放）。
+- `delete` 语句：强制销毁（绕过计数，执行析构 + 级联释放 + 回收），槽位置空防二次释放；可用于手工断开环形引用。
+- `public class`：单模块及 `-o *.dll` 导出生命周期协议、实例/静态方法与成员。
+- 当前边界：无继承与虚函数；被 `import` 模块里的 `public class` 暂不可跨模块消费；环形引用不做自动断环（用 `delete` 强破）。
+- `winapi.co` 大幅扩容：经 Windows SDK 10.0.26100.0 逐条核验，现累计 323 个 Win32 API 原型、39 个结构/联合体布局、396 个常量；在窗口、消息循环、绘制等基础上新增 对话框、菜单、通用控件、系统托盘图标、DWM、PDH、输入法（imm32）、文件时间/目录枚举 等 API 与类型。
+- Co 层裸标签（C++ 风格）：`.co` 里 `struct`/`union`/`enum` 变量定义、形参与 `sizeof` 可省略关键字（`Point p;`），被 import 的 `public` 标签同样可裸用；`.c` 档不启用，与 ISO C 逐字一致。
+- 版本号扩为四段 `MAJOR.MINOR.PATCH.Build`：第四段为构建计数，MSVC 真实重编时自增（改三段版本时自动归零）；`-v` 输出与产物 PE 版本信息同步显示。
+- 新增默认设置头 `include/colang.h`：编译时先于主源展开（只作用主源、不作用于被 import 的模块），供放置全局宏定义。
+
+> 以上三条（裸标签、四段版本号、默认设置头）属先前已发布但漏记的改动（前两条在 0.3.1 周期内落地、第三条在 0.3.2 周期内落地），现一并补入。
+
 ## 0.3.2
 - 内置资源编译器：解析 `.rc` 语法，支持 ICON / BITMAP / RCDATA / STRINGTABLE / VERSIONINFO / ACCELERATORS / DIALOGEX / MENU 等资源类型，产物直接嵌入 PE 可执行文件（与 rc.exe 逐字节对齐）。
 - Linux 交叉编译与原生链接：`--target=x86_64-unknown-linux-gnu` 产出 ELF 目标文件，进程内 lld ELF 链接器端到端可执行；LP64 数据模型（long=8, void*=8, wchar_t=4）如实分派。
@@ -13,7 +26,7 @@
 - 整型字面量类型选取、位域掩码、动态链接 CRT 等多项修复与覆盖面强化。
 
 ## 0.3.1
-- `winapi.co` 模块：以 `import … from "winapi.co"` 取代 `windows.h`，经 SDK 核验提供 215 个 Win32 API 原型、13 个结构/联合体布局、266 个常量；覆盖窗口创建、消息循环、绘制、文本度量等常用 GUI API（暂不含对话框、菜单、通用控件）。
+- `winapi.co` 模块：以 `import … from "winapi.co"` 取代 `windows.h`，经 SDK 核验提供 Win32 API 原型 / 结构·联合体布局 / 常量；模块随版本滚动扩容，至 0.4.0 累计 323 原型 / 39 结构·联合体 / 396 常量。首发覆盖窗口创建、消息循环、绘制、文本度量等常用 GUI API。
 - Windows GUI 程序：`[[subsystem("windows")]]` 属性（或定义 `WinMain`）产出无控制台窗口程序。
 - Co 层增强：被 import 模块的 `public const int` / `public struct` 等可直接跨模块使用；指定初始化器支持链式设计符与 `union` 匿名成员。
 - C 兼容性扩充：标识符通用字符名（`\uXXXX`）、`u8`/`u`/`U`/`L` 前缀字符常量、`sizeof(字符串字面量)`、`static_assert` 多作用域、`[[nodiscard]]`/`[[noreturn]]`/`[[deprecated]]` 属性。

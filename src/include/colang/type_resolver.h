@@ -100,6 +100,7 @@ inline bool types_compatible(const CTypePtr &a, const CTypePtr &b)
 	case TypeKind::Struct:
 	case TypeKind::Union:
 	case TypeKind::Enum:
+	case TypeKind::Class:
 		return a->tag == b->tag;
 	case TypeKind::BitInt:
 		return a->bit_width == b->bit_width && a->is_unsigned == b->is_unsigned;
@@ -187,14 +188,24 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 	{
 		return e->type;
 	}
+	// P300 Co class：New 表达式类型为 parser 已填的 Class
+	if (e->kind == ExprKind::New)
+		return e->type;
+	// P300 Co class：this 类型为当前类（由 sema/codegen 环境提供）
+	if (e->kind == ExprKind::ThisRef)
+		return e->type;
 	if (e->kind == ExprKind::Member)
 	{
 		// 获取基础表达式类型 → 查找成员名对应类型
 		CTypePtr base_t = resolve_expr_type(e->lhs, env);
 		if (!base_t) return nullptr;
+		// P300 Co class：:: 静态成员访问，lhs 是类名 VarRef，直接查类成员表
+		if (e->op == "::" && base_t->kind == TypeKind::Class)
+			return env.struct_member(base_t->tag, e->name);
 		// 如果 base 是指针（对于 -> 操作）取 pointed-to；数组经 -> 亦按衰减为元素指针处理（P173：sizeof(cases->c)）
 		if (e->op == "->" && (base_t->kind == TypeKind::Pointer || base_t->kind == TypeKind::Array))
 			base_t = base_t->base;
+		// P300 Co class：class 句柄的成员访问（同 struct，按 tag 查）
 		// 按 tag 查找成员类型
 		return env.struct_member(base_t->tag, e->name);
 	}

@@ -89,6 +89,23 @@ public:
 		// P217：enum 类型标签登记表（供跨模块类型可见性门禁查 is_public/source_module_key）
 		for (const auto &e : tu->enums)
 			if (!e.tag.empty()) enums_[e.tag] = &e;
+		// P300 Co class（0.4.0）：注册类定义 + 检查保留协议名
+		for (const auto &c : tu->classes)
+		{
+			if (!c.tag.empty()) classes_[c.tag] = &c;
+			// 方法名不得为编译器保留协议名
+			for (const auto &m : c.methods)
+				if (m.name == "__new__" || m.name == "__retain__" ||
+					m.name == "__release__" || m.name == "__delete__")
+					report(m.loc, "reserved protocol name '" + m.name + "' cannot be used as method name");
+			// P300 形参/成员所有权（0.4.0 收尾）：class 句柄作成员——宿主拥有（赋值 store-own、
+			//   __new__ 置 null、__delete__ 级联 release）。
+			// P300 struct/union 作 class 成员（值语义内嵌）：无引用计数/无所有权转移，随宿主堆块分配/释放；
+			//   布局/访问/赋值复用既有聚合机器件（to_llvm_alloca_type 内联 + gen_assign memcpy + struct-in-struct GEP），
+			//   本批放开。成员类型可见性仍由 enforce_type_visible 守、未定义 tag 沿用既有报错。
+			// P300 形参借用（0.4.0 收尾）：class 句柄作方法形参（不 retain、出域不 release、
+			//   重绑定不转移所有权，由 codegen borrowed_slots_ 承载）；普通函数 class 形参本无门禁、口径一致。
+		}
 		// 路 B 阶段1（ambient 切断）：登记「主源自身声明」的名字集（source_module_key 空，
 		//   含主源自带 #include 带入的原型）。宿主自身可见的名字优先于被导入模块的同名项，跨模块可见性
 		//   门禁据此豁免——根除「cannot import non-public symbol 'printf'」类 ambient 误报（宿主与子模块
@@ -102,6 +119,8 @@ public:
 				if (!e.tag.empty()) host_own_names_.insert(e.tag);
 				for (const auto &c : e.constants) host_own_names_.insert(c.name);
 			}
+		// P300 Co class：主源自身定义的类名加入 host_own_names_
+		for (const auto &c : tu->classes) if (c.source_module_key.empty() && !c.tag.empty()) host_own_names_.insert(c.tag);
 		// 函数名与文件作用域对象同名：不同种类符号的重定义（局部同名遮蔽合法，不查）
 		std::unordered_set<std::string> clash_reported;
 		for (const auto &f : tu->funcs)
@@ -134,12 +153,15 @@ public:
 			{
 				enforce_type_visible(g.type, g.loc);
 				if (!g.is_extern) enforce_complete_type(g.type, g.loc, IctxGlobal); // P255：纯声明不分配、clang 允许 extern struct I e;
+				reject_class_pointer(g.type, g.loc); // P300：禁全局 `C* g;`
 			}
 		for (const auto &f : tu->funcs)
 			if (f.source_module_key.empty())
 			{
 				enforce_type_visible(f.return_type, f.loc);
 				for (const auto &p : f.params) enforce_type_visible(p.type, f.loc);
+				reject_class_pointer(f.return_type, f.loc); // P300：禁返回/参数含 `C*`
+				for (const auto &p : f.params) reject_class_pointer(p.type, f.loc);
 			}
 		for (const auto &s : tu->structs)
 			if (s.source_module_key.empty() && s.is_definition)
@@ -199,6 +221,12 @@ public:
 		{
 			if (e.source_module_key.empty() || !e.is_public || e.tag.empty()) continue;
 			catalog_.by_module[e.source_module_key].enums[e.tag] = &e;
+		}
+		// P300 Co class（跨模块 import）：逐模块 public class 视图（class 恒为定义、无 is_definition 位）。
+		for (const auto &c : tu->classes)
+		{
+			if (c.source_module_key.empty() || !c.is_public || c.tag.empty()) continue;
+			catalog_.by_module[c.source_module_key].classes[c.tag] = &c;
 		}
 		// 限定名映射：主源本层 imports 的 `as ModAlias`（无别名取文件 stem）→ resolved_module_key。
 		//   consts 表暂空（public const int 的跨模块导出面留待限定访问实现步补齐）。
@@ -553,7 +581,7 @@ private:
 	// —— 类型谓词 ——
 	static bool is_struct_like(const CTypePtr &t)
 	{
-		return t && (t->kind == TypeKind::Struct || t->kind == TypeKind::Union);
+		return t && (t->kind == TypeKind::Struct || t->kind == TypeKind::Union || t->kind == TypeKind::Class);
 	}
 	static bool is_ptr_or_array(const CTypePtr &t)
 	{
@@ -765,7 +793,7 @@ private:
 		if (n == "__func__") return true;
 		for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it)
 			if (it->count(n)) return true;
-		return globals_.count(n) > 0 || funcs_.count(n) > 0;
+		return globals_.count(n) > 0 || funcs_.count(n) > 0 || classes_.count(n) > 0;
 	}
 
 	// 名字是否由局部作用域（块作域/形参）声明：P214 deprecated 查表需先排阴蔽
@@ -931,9 +959,66 @@ private:
 			ensure_visible_from_main(t->tag, key, it->second->is_public, loc);
 			return;
 		}
+		case TypeKind::Class: // P300 Co class
+		{
+			if (t->tag.empty()) return;
+			auto it = classes_.find(t->tag);
+			if (it == classes_.end() || !it->second) return;
+			const std::string &key = it->second->source_module_key;
+			if (key.empty()) return;
+			ensure_visible_from_main(t->tag, key, it->second->is_public, loc);
+			return;
+		}
 		default:
 			return;
 		}
+	}
+
+	// P300 Co class（§4.4）：class 具引用语义，禁声明/使用「指向类的指针」（`C*`）。
+	//   剥 Pointer/Array 层、遍历 Function 返回/参数，遇 `Pointer -> Class` 即报。
+	//   区别于 enforce_type_visible（仅主源跨模块门禁），本检查无条件执行（语言性质、非可见性）。
+	void reject_class_pointer(const CTypePtr &t, const SourceLoc &loc)
+	{
+		if (!t) return;
+		if (t->kind == TypeKind::Pointer && t->base && t->base->kind == TypeKind::Class)
+		{
+			report(loc, "class has reference semantics, pointer to class is not allowed");
+			return;
+		}
+		if (t->kind == TypeKind::Pointer || t->kind == TypeKind::Array)
+			reject_class_pointer(t->base, loc);
+		else if (t->kind == TypeKind::Function)
+		{
+			reject_class_pointer(t->base, loc);
+			for (const auto &p : t->params) reject_class_pointer(p, loc);
+		}
+	}
+
+	// P300 Co class（§4.4/§4.5）：类句柄的类型相容性——声明初始化与赋值均要求源与目标同类，
+	//   拒绝跨类（`Box b = counter;`）、非句柄右值（`Box c = 5;`）与不匹配的 new（`Box b = new Counter();`）。
+	//   否则 codegen 会按「声明类」发 retain/release，对异类对象执行错误 dtor、或对非指针值解引用。
+	//   保守原则：源类型推断不出（resolve_type 返回 null）即跳过，绝不误伤合法方言（如链式赋值中间态）。
+	void check_class_handle_compat(const CTypePtr &dst, const ExprPtr &src, const SourceLoc &loc)
+	{
+		if (!dst || dst->kind != TypeKind::Class || !src) return;
+		const std::string want = dst->tag;
+		if (src->kind == ExprKind::New) // new：类名须与目标同类
+		{
+			if (!src->name.empty() && !want.empty() && src->name != want)
+				report(loc, "class handle of type '" + want + "' cannot be bound to incompatible 'new " + src->name + "'");
+			return;
+		}
+		if (src->kind == ExprKind::Comma && !src->args.empty()) // 逗号取末元素
+		{
+			check_class_handle_compat(dst, src->args.back(), loc);
+			return;
+		}
+		CTypePtr st = resolve_type(src);
+		if (!st) return; // 推断不出，保守跳过
+		if (st->kind != TypeKind::Class)
+			report(loc, "class handle requires a handle value, got incompatible type '" + describe_type(st) + "'");
+		else if (!want.empty() && !st->tag.empty() && st->tag != want)
+			report(loc, "cannot bind handle of class '" + st->tag + "' to class handle '" + want + "'");
 	}
 
 	// P255：对「仅有前向声明、无 {} 定义」的 struct/union 作按值分配（局部/全局/字段/数组元素）
@@ -1002,7 +1087,17 @@ private:
 		Sema *self;
 		CTypePtr var_type(const std::string &n)
 		{
-			return self->lookup_var_type(n);
+			CTypePtr t = self->lookup_var_type(n);
+			if (t) return t;
+			// P300 Co class：类名作 VarRef（用于 :: 静态访问前缀）时返回 Class 类型
+			auto cit = self->classes_.find(n);
+			if (cit != self->classes_.end())
+			{
+				auto ct = make_type(TypeKind::Class);
+				ct->tag = n;
+				return ct;
+			}
+			return nullptr;
 		}
 		CTypePtr struct_member(const std::string &tag, const std::string &field)
 		{
@@ -1012,6 +1107,17 @@ private:
 		CTypePtr struct_member_impl(const std::string &tag, const std::string &field, int depth)
 		{
 			if (depth > 16) return nullptr;
+			// P300 Co class：先查 classes_ 成员（类名与 struct 名共享命名空间，不会同时命中）
+			auto cit = self->classes_.find(tag);
+			if (cit != self->classes_.end())
+			{
+				for (const auto &m : cit->second->members)
+					if (!m.name.empty() && m.name == field) return m.type;
+				// 静态成员也通过此路径返回类型
+				for (const auto &m : cit->second->methods)
+					if (m.name == field) return m.ret_type;
+				return nullptr;
+			}
 			auto it = self->structs_.find(tag);
 			if (it == self->structs_.end()) return nullptr;
 			for (const auto &m : it->second->members)
@@ -1414,6 +1520,8 @@ private:
 					else check_write_target(L, e->loc);
 				}
 			}
+			// P300 Co class（§4.5）：类句柄赋值须源/目标同类，拒绝跨类/非句柄右值。
+			if (L) check_class_handle_compat(resolve_type(L), e->rhs, e->loc);
 			// C23 模型 B：nullptr（nullptr_t）只能赋给指针类型；赋给类型已知的非指针左值是约束违例。
 			if (L && is_nullptr(e->rhs))
 			{
@@ -1431,6 +1539,14 @@ private:
 		{
 			// 路 B 阶段1b-iii：限定访问 m.x / m.f() —— 命中则已绑定，不走常规成员类型检查。
 			if (try_bind_qualified_member(e)) break;
+			// P300 Co class：:: 静态成员/方法访问，基类名已由 var_type 解析为 Class
+			if (e->op == "::")
+			{
+				CTypePtr base = resolve_type(e->lhs);
+				if (!base || base->kind != TypeKind::Class)
+					report(e->loc, "'::' requires a class name on the left side");
+				break;
+			}
 			CTypePtr base = resolve_type(e->lhs);
 			if (base)
 			{
@@ -1492,6 +1608,26 @@ private:
 		case ExprKind::Cast:
 			enforce_type_visible(e->type, e->loc); // P217：转换/复合字面量目标类型跨模块可见性
 			break;
+		// P300 Co class（0.4.0）
+		case ExprKind::New:
+		{
+			auto cit = classes_.find(e->name);
+			if (cit == classes_.end())
+			{
+				report(e->loc, "unknown class name '" + e->name + "'");
+				break;
+			}
+			// P300 Co class（跨模块 import）：宿主 `new C()` 引用他模块 class → 复用类型可见性门禁
+			//   （public 且已 import 放行，否则「cannot import non-public symbol」/「is not imported」）。
+			//   仅主源上下文触发（同 enforce_type_visible），子模块内部 new 自有 class 直接放行。
+			if (cur_source_module_key_.empty() && cit->second && !cit->second->source_module_key.empty())
+				ensure_visible_from_main(e->name, cit->second->source_module_key, cit->second->is_public, e->loc);
+			break;
+		}
+		case ExprKind::ThisRef:
+			if (!cur_class_)
+				report(e->loc, "'this' is only available inside a class method");
+			break;
 		default:
 			break;
 		}
@@ -1544,6 +1680,8 @@ private:
 				scopes_.back()[s->var_name] = {s->var_type, s->loc};
 			enforce_type_visible(s->var_type, s->loc); // P217：局部声明类型跨模块可见性
 			enforce_complete_type(s->var_type, s->loc, IctxVar); // P255：不完整类型按值分配前置诊断
+			reject_class_pointer(s->var_type, s->loc); // P300：禁 `C* p;` 指向类指针
+			if (s->var_init) check_class_handle_compat(s->var_type, s->var_init, s->var_init->loc); // P300：类句柄初始化同类约束
 			// P256：-Wdefault-const-init-var-unsafe / -Wdefault-const-init-field-unsafe
 			//   仅限局部非 static 无初始化器（全局/static 有零初始化保证，clang 不发）。
 			if (!s->var_init && !s->is_static && !s->is_extern && s->var_type && cur_func_)
@@ -1573,6 +1711,25 @@ private:
 			if (s->expr) check_expr(s->expr);
 			note_discarded_nodiscard(s->expr); // P249：[[nodiscard]] 返回值被丢弃
 			break;
+		case StmtKind::Delete:
+		{
+			// P300 Co class（0.4.0）：delete 仅接具名 class 句柄变量（A21）；拒 delete this / rvalue / 成员 / 非句柄。
+			if (!s->expr) { report(s->loc, "expected class handle after 'delete'"); break; }
+			check_expr(s->expr); // 复用名字/可见性解析（未声明等已由 check_expr 报）
+			if (s->expr->kind == ExprKind::ThisRef)
+				report(s->loc, "delete this is not allowed");
+			else if (s->expr->kind != ExprKind::VarRef)
+				report(s->loc, "delete requires a named class handle variable");
+			else
+			{
+				// VarRef 的 Expr::type 未必回填，走共享类型解析器取声明类型。
+				CTypePtr t = resolve_type(s->expr);
+				if (t && t->kind != TypeKind::Class)
+					report(s->loc, "delete operand must be a class handle");
+				// t==null（未声明）已由 check_expr 报，不重复。
+			}
+			break;
+		}
 		case StmtKind::Return:
 		{
 			// P249：[[noreturn]] 函数体内出现 return（与 clang 同文的函数名形）
@@ -1592,6 +1749,16 @@ private:
 			else if (cur_func_ && !is_void)
 			{
 				report(s->loc, "non-void function should return a value");
+			}
+			// P300 Co class（§4.4）：返类函数须返无主值（new / 返句柄的调用），禁 `return c;`
+			//   返局部拥有句柄（否则 callee 计数与 caller release 会双重释放）。
+			if (s->expr && cur_func_ && cur_func_->return_type &&
+				cur_func_->return_type->kind == TypeKind::Class)
+			{
+				bool fresh = s->expr->kind == ExprKind::New || s->expr->kind == ExprKind::Call;
+				CTypePtr rt = resolve_type(s->expr);
+				if (!fresh && rt && rt->kind == TypeKind::Class)
+					report(s->loc, "cannot return owned class handle; return a 'new' expression instead");
 			}
 			if (s->expr) check_expr(s->expr);
 			break;
@@ -1650,6 +1817,74 @@ private:
 		}
 	}
 
+	// P300 Co class（§风险项#4）：按前序线性序收集 goto/label/class 句柄声明，供 check_goto_class_crossing 判跨越。
+	void collect_goto_cross(const StmtPtr &s, int &seq,
+		std::unordered_map<std::string, int> &label_seq,
+		std::vector<int> &decl_seqs, std::vector<std::string> &decl_names,
+		std::vector<std::string> &goto_labels, std::vector<int> &goto_seqs, std::vector<SourceLoc> &goto_locs)
+	{
+		if (!s) return;
+		const int my = seq++;
+		switch (s->kind)
+		{
+		case StmtKind::Label:
+			label_seq.emplace(s->label_name, my); // 首次出现为准（重复已由 collect_labels 报错）
+			break;
+		case StmtKind::Goto:
+			goto_labels.push_back(s->label_name); goto_seqs.push_back(my); goto_locs.push_back(s->loc);
+			break;
+		case StmtKind::Decl:
+			if (s->var_type && s->var_type->kind == TypeKind::Class) { decl_seqs.push_back(my); decl_names.push_back(s->var_name); }
+			break;
+		default:
+			break;
+		}
+		collect_goto_cross(s->init_stmt, seq, label_seq, decl_seqs, decl_names, goto_labels, goto_seqs, goto_locs);
+		collect_goto_cross(s->for_init, seq, label_seq, decl_seqs, decl_names, goto_labels, goto_seqs, goto_locs);
+		if (s->kind == StmtKind::Compound)
+			for (const auto &b : s->body)
+				collect_goto_cross(b, seq, label_seq, decl_seqs, decl_names, goto_labels, goto_seqs, goto_locs);
+		else
+		{
+			collect_goto_cross(s->then_branch, seq, label_seq, decl_seqs, decl_names, goto_labels, goto_seqs, goto_locs);
+			collect_goto_cross(s->else_branch, seq, label_seq, decl_seqs, decl_names, goto_labels, goto_seqs, goto_locs);
+		}
+	}
+
+	// P300 Co class（§风险项#4）：禁止 goto 跨越「需自动清理（RC release）的 class 句柄声明」。
+	//   heap-only 句柄出域按 RC 帧 release，等价于 C++「带非平凡析构的对象」：goto 前跳越过其初始化、
+	//   或后跳回到其声明之前，均使目标路径上该句柄槽未初始化/重复注册，出域 release 打在栈垃圾上崩溃
+	//   （本批 codegen 对前跳仅保守不释放、无法自证安全，故在 sema 层拒非法写法）。
+	//   判据保守（循 clang「jump to label crosses initialization」口径）：goto 与其目标标签之间（前序序）
+	//   夹有类句柄声明即拒；无类句柄/无 goto 早退。C 路径无句柄→零影响（plct 恒）。
+	void check_goto_class_crossing(const StmtPtr &body)
+	{
+		if (!body) return;
+		std::unordered_map<std::string, int> label_seq;
+		std::vector<int> decl_seqs;
+		std::vector<std::string> decl_names;
+		std::vector<std::string> goto_labels;
+		std::vector<int> goto_seqs;
+		std::vector<SourceLoc> goto_locs;
+		int seq = 0;
+		collect_goto_cross(body, seq, label_seq, decl_seqs, decl_names, goto_labels, goto_seqs, goto_locs);
+		if (decl_seqs.empty() || goto_labels.empty()) return; // 无类句柄或无 goto → 必安全
+		for (std::size_t i = 0; i < goto_labels.size(); ++i)
+		{
+			auto lit = label_seq.find(goto_labels[i]);
+			if (lit == label_seq.end()) continue; // 未声明标签（已由其它检查报错）
+			const int lo = goto_seqs[i] < lit->second ? goto_seqs[i] : lit->second;
+			const int hi = goto_seqs[i] < lit->second ? lit->second : goto_seqs[i];
+			for (std::size_t j = 0; j < decl_seqs.size(); ++j)
+				if (decl_seqs[j] > lo && decl_seqs[j] < hi)
+				{
+					report(goto_locs[i], "jump to label '" + goto_labels[i] +
+						"' crosses initialization of class handle '" + decl_names[j] + "'");
+					break;
+				}
+		}
+	}
+
 	void check_func(const FuncDecl &f)
 	{
 		cur_func_ = &f;
@@ -1663,6 +1898,7 @@ private:
 			if (!p.name.empty()) scopes_.back()[p.name] = {p.type, p.loc};
 		labels_.clear();
 		collect_labels(f.body);
+		check_goto_class_crossing(f.body); // P300 §风险项#4：禁 goto 跨越需 RC 清理的类句柄声明
 		// 非 void 函数可能执行到末尾而无 return（C 为 UB，clang 默认 -Wreturn-type 告警）。
 		// main 例外：C11 §5.1.2.2.3 规定 main 落到 } 等价于 return 0，clang 亦不告警。
 		if (f.return_type && f.return_type->kind != TypeKind::Void &&
@@ -1694,6 +1930,10 @@ private:
 	std::unordered_map<std::string, const StructDef *> structs_;
 	// P217：enum 类型标签→定义（供跨模块类型可见性门禁）
 	std::unordered_map<std::string, const EnumDef *> enums_;
+	// P300 Co class（0.4.0）：类名→定义
+	std::unordered_map<std::string, const ClassDef *> classes_;
+	// P300：当前正在检查的类（非空表示在类方法体内，允许 this/裸成员名访问）
+	const ClassDef *cur_class_ = nullptr;
 	struct ScopeEntry { CTypePtr type; SourceLoc loc; };
 	std::vector<std::unordered_map<std::string, ScopeEntry>> scopes_; // 末位为最内层
 	std::unordered_map<std::string, SourceLoc> global_ident_locs_; // 全局变量名→声明位置

@@ -32,8 +32,9 @@ struct CompileOptions;
 struct ImportTagSeed
 {
 	std::string name;      // 用户可见标签名（源码写的 tag）
-	bool is_union = false; // struct vs union（is_enum=false 时有义）
+	bool is_union = false; // struct vs union（is_enum=false 且 is_class=false 时有义）
 	bool is_enum = false;  // 是否为 enum 标签
+	bool is_class = false; // P300 Co class：是否为 public class 标签（宿主裸类名作类型的 parse 种子）
 };
 
 // P256：加载阶段采集的 public const int 值种子。供 parser 在「parse 主源时」把

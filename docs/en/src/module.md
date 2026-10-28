@@ -14,7 +14,7 @@ Modules exist to support organizing large projects and to avoid the duplicate-de
 
 - `public` is Co's **only visibility keyword** — there is no `private`, and no separate `export`. It serves two roles at once: marking the **module interface** (importable by other modules) and **dynamic-library export** (written to the DLL export table).
 - A definition without `public` is visible only inside its module; only a `public` definition is externally visible and importable.
-- `public` may modify top-level functions, global variables, and `struct` / `union` / `enum` types (cross-module type visibility has been available since 0.3.0/0.3.1); `public` on `class` and its members is deferred to 0.4.0.
+- `public` may modify top-level functions, global variables, and `struct` / `union` / `enum` types (cross-module type visibility has been available since 0.3.0/0.3.1); `public` on `class` and its members has been available since 0.4.0 (cross-module `import` consumption of a `public class` is still not opened).
 - Non-`public` imported symbols are forced to `InternalLinkage` during codegen — references within the same module resolve, but no externally-visible LLVM value is emitted.
 
 ## Forms of a module
@@ -50,7 +50,7 @@ So a `.co` dynamic library still initializes when it is loaded, even if it has o
 Since 0.3.0:
 - **`public`** controls cross-module visibility — omitting it means "module-internal", adding it makes a symbol importable;
 - **`static`** keeps its C meaning — internal linkage within its own translation unit, orthogonal to `public` (`static public` / `public static` in either order are legal; the symbol is still internal to the TU despite the export mark);
-- In the target specification, `static` will only be a class static-member modifier (to be handled alongside 0.4.0 `class`).
+- In the target specification, `static` is only a class static-member modifier (landed since 0.4.0 `class`).
 
 ## Not yet finalized
 

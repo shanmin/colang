@@ -40,6 +40,8 @@ struct Parser
 	std::unordered_map<std::string, CTypePtr> typedefs_;
 	// struct/union 定义存储（tag -> index in TU）
 	std::unordered_map<std::string, std::size_t> struct_tags_;
+	// P300 Co class（0.4.0）：class 定义存储（tag -> index in TU.classes）
+	std::unordered_map<std::string, std::size_t> class_tags_;
 	// enum 常量名 -> 值
 	std::unordered_map<std::string, std::int64_t> enum_constants_;
 	// P232 Co 层：enum 标签名集合（供「省去 enum 关键字」按名作类型）。仅 .co（co_mode_）启用。
@@ -249,6 +251,14 @@ struct Parser
 					enum_tag_names_.insert(s.name);
 				continue;
 			}
+			// P300 Co class（跨模块 import）：public class 标签仅登 class_tags_（供裸类名作类型/is_type_start），
+			//   不向 cur_tu_->classes 造空壳——merge 前插的真定义才是 sema/codegen 消费的实体，避免同名覆盖。
+			if (s.is_class)
+			{
+				if (!s.name.empty() && !class_tags_.count(s.name))
+					class_tags_[s.name] = 0;
+				continue;
+			}
 			if (s.name.empty() || struct_tags_.count(s.name)) continue;
 			StructDef sd;
 			sd.tag = s.name;
@@ -283,8 +293,30 @@ struct Parser
 				skip_to_semi();
 				continue;
 			}
+			// P300 Co class（0.4.0）：[public] class 短路识别（同 import 模式）。
+			if (check_keyword("class") ||
+				(peek().kind == TokKind::Keyword && peek().text == "public" &&
+				 pos + 1 < toks.size() && toks[pos + 1].text == "class" && toks[pos + 1].kind == TokKind::Keyword))
+			{
+				bool cls_pub = match_keyword("public");
+				if (parse_class_def(*tu, cls_pub))
+					continue;
+				skip_to_semi();
+				continue;
+			}
 			// P211 Co 层入口模型：顶层先试声明/函数定义，失败则回滚后按裸语句入 top_level_body。
 			//   回滚需同时恢复 errs（防 expect_punct("(") 等推测性报错污染）。
+			// P300 Co class：顶层 `ClassName::member(...)` 静态访问以标识符 + `::` 起头，恒为裸表达式语句
+			//   （非声明——声明不会以 `标识符 ::` 起头），直接走 parse_stmt 入 top_level_body。
+			if (peek().kind == TokKind::Identifier && peek(1).kind == TokKind::Punct && peek(1).text == "::")
+			{
+				StmtPtr s = parse_stmt();
+				if (s)
+				{
+					tu->top_level_body.push_back(std::move(s));
+					continue;
+				}
+			}
 			const std::size_t save_pos = pos;
 			const std::size_t save_errs = errs.size();
 			if (parse_global_decl_or_func(*tu))
@@ -400,6 +432,183 @@ struct Parser
 		return true;
 	}
 
+	// P300 Co class 定义解析（0.4.0）：
+	//   [public] class NAME { ctor/dtor/methods/members };
+	bool parse_class_def(TranslationUnit &tu, bool is_public)
+	{
+		ClassDef cd;
+		cd.is_public = is_public;
+		if (!match_keyword("class"))
+		{
+			error(peek().loc, "expected 'class'");
+			return false;
+		}
+		if (peek().kind != TokKind::Identifier)
+		{
+			error(peek().loc, "expected class name");
+			return false;
+		}
+		cd.tag = advance().text;
+		cd.loc = peek().loc;
+		expect_punct("{");
+
+		// 类体循环：解析到 }
+		while (!at_end() && !check_punct("}"))
+		{
+			// 成员/方法前置修饰符
+			bool m_pub = match_keyword("public");
+			bool m_static = match_keyword("static");
+			if (m_pub && match_keyword("static")) m_static = true; // public static 顺序
+			if (m_static && match_keyword("public")) m_pub = true; // static public 顺序
+
+			// 析构函数：~ClassName()
+			if (check_punct("~"))
+			{
+				SourceLoc dloc = peek().loc;
+				advance(); // ~
+				if (peek().kind != TokKind::Identifier || peek().text != cd.tag)
+				{
+					error(dloc, "destructor name must match class name");
+					skip_to_semi();
+					continue;
+				}
+				std::string dname = advance().text;
+				expect_punct("(");
+				expect_punct(")");
+				ClassMethod cm;
+				cm.name = dname;
+				cm.is_dtor = true;
+				cm.is_public = m_pub;
+				cm.ret_type = make_type(TypeKind::Void);
+				cm.loc = dloc;
+				cm.body = parse_compound_stmt();
+				cd.methods.push_back(std::move(cm));
+				cd.has_dtor = true;
+				match_punct(";"); // 允许多余分号
+				continue;
+			}
+
+			// 构造函数或方法或成员变量：先peek看是否有 ( 或 ; 来区分
+			// 保存位置用于回滚（无法确定是方法还是成员时）
+			const std::size_t save = pos;
+			const std::size_t save_errs = errs.size();
+
+			// 尝试解析类型 + 名字 + ( = 方法，或类型 + 名字 + ; = 成员
+			CTypePtr mtype = parse_decl_specifiers(m_pub);
+			if (!mtype)
+			{
+				// 可能是构造函数（无返回类型，直接类同名 + (）
+				errs.resize(save_errs);
+				pos = save;
+				if (peek().kind == TokKind::Identifier && peek().text == cd.tag)
+				{
+					// 构造函数
+					SourceLoc cloc = peek().loc;
+					advance(); // ClassName
+					expect_punct("(");
+					ClassMethod cm;
+					cm.name = cd.tag;
+					cm.is_ctor = true;
+					cm.is_public = m_pub;
+					cm.ret_type = make_type(TypeKind::Void);
+					cm.loc = cloc;
+					// 构造形参（本批限基元）
+					if (!check_punct(")"))
+					{
+						for (;;)
+						{
+							CTypePtr pt = parse_decl_specifiers();
+							pt = parse_pointer_suffix(pt);
+							std::string pn;
+							if (peek().kind == TokKind::Identifier) pn = advance().text;
+							cm.params.push_back({pn, pt});
+							if (!match_punct(",")) break;
+						}
+					}
+					expect_punct(")");
+					cm.body = parse_compound_stmt();
+					cd.methods.push_back(std::move(cm));
+					cd.has_ctor = true;
+					match_punct(";");
+					continue;
+				}
+				error(peek().loc, "expected member or method in class body");
+				skip_to_semi();
+				continue;
+			}
+			mtype = parse_pointer_suffix(mtype);
+			// 取名字
+			if (peek().kind != TokKind::Identifier)
+			{
+				error(peek().loc, "expected member/method name");
+				skip_to_semi();
+				continue;
+			}
+			std::string mname = advance().text;
+
+			if (check_punct("("))
+			{
+				// 方法（带返回类型）
+				// 也检查是否为构造函数（名同类名且无返回类型——但这里已有 mtype，则视为方法）
+				advance(); // (
+				ClassMethod cm;
+				cm.name = mname;
+				cm.is_public = m_pub;
+				cm.is_static = m_static;
+				cm.ret_type = mtype;
+				cm.loc = peek().loc;
+				if (!check_punct(")"))
+				{
+					for (;;)
+					{
+						CTypePtr pt = parse_decl_specifiers();
+						pt = parse_pointer_suffix(pt);
+						std::string pn;
+						if (peek().kind == TokKind::Identifier) pn = advance().text;
+						cm.params.push_back({pn, pt});
+						if (!match_punct(",")) break;
+					}
+				}
+				expect_punct(")");
+				cm.body = parse_compound_stmt();
+				cd.methods.push_back(std::move(cm));
+				match_punct(";");
+			}
+			else
+			{
+				// 成员变量：TYPE name;
+				ClassMember m;
+				m.type = mtype;
+				m.name = mname;
+				m.is_public = m_pub;
+				m.is_static = m_static;
+				m.loc = peek().loc;
+				cd.members.push_back(std::move(m));
+				// 可能有逗号分隔的多个成员：int a, b, c;
+				while (match_punct(","))
+				{
+					if (peek().kind != TokKind::Identifier) break;
+					ClassMember m2;
+					m2.type = mtype;
+					m2.name = advance().text;
+					m2.is_public = m_pub;
+					m2.is_static = m_static;
+					m2.loc = peek().loc;
+					cd.members.push_back(std::move(m2));
+				}
+				expect_punct(";");
+			}
+		}
+		expect_punct("}");
+		match_punct(";"); // 允许 class X { }; 尾分号
+
+		// 登记到 TU
+		cd.source_module_key = tu.diagnostics_display_path;
+		tu.classes.push_back(std::move(cd));
+		class_tags_[tu.classes.back().tag] = tu.classes.size() - 1;
+		return true;
+	}
+
 	// P233：顶层 import 预扫。维护花括号深度，仅在 depth==0 处识别 `import`，复用
 	//   parse_import_decl 取回 ImportDecl；其余 token 按顶层边界推进（depth 0 的 `;`、`{`/`}` 计深）。
 	//   不做完整解析、不产生任何依赖完整 AST 的副作用；失败诊断写入构造时传入的独立 scratch、不外汅。
@@ -472,10 +681,11 @@ struct Parser
 					break;
 				}
 				// [[::]] 空属性列表（C23 §6.7.11p3 合法、无效果）
-				if (check_punct(":") && peek(1).text == ":")
+				//   0.4.0：`::` 现为单 Punct token（class 作用域解析），旧 ':' ':' 两连形态一并兼容。
+				if (check_punct("::") || (check_punct(":") && peek(1).text == ":"))
 				{
-					advance();
-					advance();
+					if (check_punct("::")) advance();
+					else { advance(); advance(); }
 					continue;
 				}
 				if (!parse_one_attribute(out, collect)) return;
@@ -506,13 +716,14 @@ struct Parser
 			name = advance().text;
 		else
 			attr_error(loc, "expected attribute name");
-		// 厂商/命名空间限定名 a::b：本方言一律拒收（词法无 '::' 单 token，故 ':' ':' 两连判）
+		// 厂商/命名空间限定名 a::b：本方言一律拒收（ADR-104 不做厂商扩展）。
+		//   0.4.0：`::` 现为单 Punct token（class 作用域解析），旧 ':' ':' 两连判一并兼容。
 		bool qualified = false;
 		std::string full = name;
-		while (check_punct(":") && peek(1).text == ":")
+		while (check_punct("::") || (check_punct(":") && peek(1).text == ":"))
 		{
-			advance();
-			advance();
+			if (check_punct("::")) advance();
+			else { advance(); advance(); }
 			qualified = true;
 			if (peek().kind == TokKind::Identifier || peek().kind == TokKind::Keyword)
 				full += "::" + advance().text;
@@ -2141,6 +2352,16 @@ struct Parser
 					et->is_const = cnst;
 					return et;
 				}
+				// P300 Co class：裸类名作类型（与 struct/enum 同模式）
+				if (class_tags_.count(nm))
+				{
+					advance();
+					auto ct = std::make_shared<CType>();
+					ct->kind = TypeKind::Class;
+					ct->tag = nm;
+					ct->is_const = cnst;
+					return ct;
+				}
 			}
 		}
 		error(peek().loc, "expected type specifier, got '" + peek().text + "'");
@@ -2291,6 +2512,23 @@ struct Parser
 	{
 		// C23: [[attribute]] 可出现在语句前
 		skip_attributes();
+		// P300 Co class（0.4.0）：delete 上下文物——`delete` 不入 lexer 关键字表（保持 Identifier）。
+		//   仅当语句首位为标识符 delete、且后紧跟名字/this 时才认领为强制销毁语句；其余形态
+		//   （`delete = 5;` / `delete(x);` / `delete;` / `delete[...]`）一律回落普通表达式语句，保纯 C 面兼容。
+		if (peek().kind == TokKind::Identifier && peek().text == "delete" &&
+			(peek(1).kind == TokKind::Identifier ||
+			 (peek(1).kind == TokKind::Keyword && peek(1).text == "this")))
+		{
+			auto s = std::make_shared<Stmt>();
+			s->kind = StmtKind::Delete;
+			s->loc = advance().loc;      // 吞 delete
+			const bool operand_is_this = check_keyword("this");
+			s->expr = parse_unary();     // 操作数（一元/后缀/primary，不吞 `=`）
+			expect_punct(";");
+			// A21：`delete this` 永不合法；且 class 方法体不经 sema 遍历，故在此语法级直接硬拦。
+			if (operand_is_this) error(s->loc, "delete this is not allowed");
+			return s;
+		}
 		if (check_keyword("if"))
 		{
 			auto s = std::make_shared<Stmt>();
@@ -2299,7 +2537,7 @@ struct Parser
 			expect_punct("(");
 			// C23 init-statement: if (init; cond)
 			skip_attributes();
-			if (is_type_start())
+			if (is_type_start() && !(peek(1).kind == TokKind::Punct && peek(1).text == "::")) // P300: `类型名::` 属限定访问条件表达式、非 init-decl
 			{
 				s->init_stmt = parse_local_decl_no_semi();
 				if (!s->init_stmt) { error(peek().loc, "expected init-declaration"); return s; }
@@ -2371,7 +2609,7 @@ struct Parser
 			// init
 			if (check_punct(";"))
 				advance();
-			else if (is_type_start())
+			else if (is_type_start() && !(peek(1).kind == TokKind::Punct && peek(1).text == "::")) // P300: `类型名::` 非 for-init 声明
 				s->for_init = parse_local_decl();
 			else
 			{
@@ -2417,7 +2655,7 @@ struct Parser
 			expect_punct("(");
 			// C23 init-statement: switch (init; cond)
 			skip_attributes();
-			if (is_type_start())
+			if (is_type_start() && !(peek(1).kind == TokKind::Punct && peek(1).text == "::")) // P300: `类型名::` 属限定访问条件表达式、非 init-decl
 			{
 				s->init_stmt = parse_local_decl_no_semi();
 				if (!s->init_stmt) { error(peek().loc, "expected init-declaration"); return s; }
@@ -2500,7 +2738,8 @@ struct Parser
 			return nop;
 		}
 		// 局部声明（类型关键字开头）
-		if (is_type_start())
+		//   P300 Co class：`Counter::bump();` 类名后紧跟 `::` 属静态成员访问表达式，非声明 → 让位 ExprStmt。
+		if (is_type_start() && !(peek(1).kind == TokKind::Punct && peek(1).text == "::"))
 			return parse_local_decl();
 		// 复合语句
 		if (check_punct("{"))
@@ -3193,13 +3432,14 @@ struct Parser
 			t.text == "_Static_assert" || t.text == "_Atomic" ||
 			t.text == "auto" || t.text == "bool" || t.text == "constexpr" ||
 			t.text == "typeof" || t.text == "typeof_unqual" || t.text == "_BitInt" ||
-			t.text == "thread_local" || t.text == "public")
+			t.text == "thread_local" || t.text == "public" || t.text == "class")
 			return true;
 		// typedef 名
 		if (typedefs_.count(t.text)) return true;
 		// P232 Co 层：省去 struct/union/enum 关键字——裸标签名作类型（仅 .co 生效、纯 C 档不进此分支）
 		if (co_mode_ && t.kind == TokKind::Identifier &&
-			(struct_tags_.count(t.text) > 0 || enum_tag_names_.count(t.text) > 0))
+			(struct_tags_.count(t.text) > 0 || enum_tag_names_.count(t.text) > 0 ||
+			 class_tags_.count(t.text) > 0))
 			return true;
 		return false;
 	}
@@ -3491,6 +3731,33 @@ struct Parser
 			expect_punct(")");
 			return apply_postfix(e); // _Generic 结果纳入 postfix：支持 _Generic(...)() 调用
 		}
+		// P300 Co class: new ClassName(args)  heap 实例化
+		if (check_keyword("new"))
+		{
+			auto e = std::make_shared<Expr>();
+			e->kind = ExprKind::New;
+			e->loc = advance().loc; // consume 'new'
+			if (peek().kind != TokKind::Identifier)
+			{
+				error(peek().loc, "expected class name after 'new'");
+				return e;
+			}
+			e->name = advance().text;
+			e->type = make_type(TypeKind::Class); // 占位，sema 填 tag
+			e->type->tag = e->name;
+			expect_punct("(");
+			if (!check_punct(")"))
+			{
+				for (;;)
+				{
+					auto arg = parse_assign();
+					if (arg) e->args.push_back(std::move(arg));
+					if (!match_punct(",")) break;
+				}
+			}
+			expect_punct(")");
+			return apply_postfix(std::move(e)); // new 结果参与 postfix（如 new C().method()）
+		}
 		return parse_postfix();
 	}
 
@@ -3685,6 +3952,19 @@ struct Parser
 				mem->name = expect_identifier().text;
 				// type 字段存结构体类型（codegen 用）
 				mem->type = nullptr; // 后续由 sema 或 codegen 推断
+				e = std::move(mem);
+				continue;
+			}
+			// P300 Co class: :: 静态成员/方法访问（ClassName::member）
+			if (check_punct("::"))
+			{
+				auto mem = std::make_shared<Expr>();
+				mem->kind = ExprKind::Member;
+				mem->loc = e->loc;
+				mem->op = advance().text; // "::"
+				mem->lhs = std::move(e);
+				mem->name = expect_identifier().text;
+				mem->type = nullptr; // sema 推断
 				e = std::move(mem);
 				continue;
 			}
@@ -3932,6 +4212,15 @@ struct Parser
 				e->kind = ExprKind::IntLiteral;
 				e->loc = t.loc;
 				e->int_val = 0;
+				return e;
+			}
+			// P300 Co class：this 当前对象引用
+			if (t.text == "this")
+			{
+				advance();
+				auto e = std::make_shared<Expr>();
+				e->kind = ExprKind::ThisRef;
+				e->loc = t.loc;
 				return e;
 			}
 		}

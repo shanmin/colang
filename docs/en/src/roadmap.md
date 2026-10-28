@@ -21,8 +21,8 @@ Within 0.\*, **MINOR** bumps denote milestones (a key Co-layer capability). **PA
 | 0.2.0   | Co entry model + `public`         | Released |
 | 0.3.0   | Linking                           | Released |
 | 0.3.1   | Windows GUI & `winapi.co`         | Released |
-| 0.3.2   | Linux native ELF toolchain        | In progress |
-| 0.4.0   | `class`                           | Planned  |
+| 0.3.2   | Linux native ELF toolchain        | Released |
+| 0.4.0   | `class`                           | Released |
 
 Details for 1.\* / 2.\* / 3.\* will be finalized by the maintainer before 0.\* wraps up.
 
@@ -60,22 +60,24 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 ### 0.3.1 — Windows GUI & winapi.co
 
 - Windows GUI subsystem and `WinMain` entry: `[[subsystem("windows")]]` or defining `WinMain` switches the artifact to a console-less GUI program; `WinMain` is mutually exclusive with top-level bare statements.
-- `winapi.co` replaces `windows.h`: 215 prototypes / 13 structs / 266 constants (SDK-verified), library attribution via `[[lib(...)]]`; a practical subset of programmatic GUI APIs (window, message loop, memory-DC drawing, clipping, text metrics, system colors).
+- `winapi.co` replaces `windows.h`: a starting subset, expanded through 0.4.0 to 323 prototypes / 39 struct-union layouts / 396 constants (SDK-verified), library attribution via `[[lib(...)]]`; a practical subset of programmatic GUI APIs (window, message loop, memory-DC drawing, clipping, text metrics, system colors).
 - `const` consistency: read-only enforcement (diagnostics matching clang); `public const int` values flow across modules into array dimensions and `switch` `case` labels, with non-constant labels now rejected instead of silently folded to 0.
 - First batch of attribute semantics: `[[nodiscard]]` / `[[noreturn]]` in effect; `[[deprecated]]` same-position duplicates accepted first-wins.
 - C-conformance batch: designated initializers across the chain (chained designators, promoted anonymous aggregates, `union` hosts, mask-merged bit-field initialization, DFS continuation), `sizeof`/`_Alignof` in constant contexts, universal character names (`\uXXXX`/`\UXXXXXXXX`) in identifiers and literals, prefixed character constant typing, `_Alignas` context constraints and cross-declaration consistency, `static_assert` in more scopes.
 - Diagnostics quality: `typedef` alias spelling restoration, column alignment with clang, up-front diagnostics for by-value allocation of incomplete types.
 - Flat single-level release package: `colang.exe + include/` (standard headers located next to the compiler, no `-I` needed).
 - Linux (WSL) build brought up: the colang compiler itself builds and runs its regression suite natively on WSL2/Debian (linking at this stage still relies on an external toolchain).
+- Bare tags in the Co layer (C++ style): in `.co` sources a `struct`/`union`/`enum` may be used as a type without its keyword (`Point p;`), including a `public` tag of an imported module.
+- Release version strings extended to four segments `MAJOR.MINOR.PATCH.Build` (the fourth is a build counter, shown by `-v` and in the PE version info of artifacts).
 
-## Planned
-
-### 0.3.2 — Linux native ELF toolchain (in progress)
+### 0.3.2 — Linux native ELF toolchain
 
 - A single target/data-model abstraction (`__LP64__`/`__LLP64__`) drives predefined macros, type widths, code generation and linking, eliminating the front-end/back-end data-model split.
 - On Linux an in-process `lld::elf` **statically** links the local glibc/libgcc into a native ELF executable (no external linker); `crt1.o`/`libc.a`/`libm.a`/`libgcc` are located automatically.
 - `--target <triple>` cross-emits ELF object files and IR.
-- Native colang build on Linux (LLVM 23.1 built from source, X86+lld); the plct matrix is being aligned to the Windows baseline.
+- Native colang build on Linux (LLVM 23.1 built from source, X86+lld); the plct matrix aligned to the Windows baseline.
+- Built-in `.rc` resource compiler and the `--resource` embedding channel (byte-for-byte alignment with rc.exe); the per-module compilation model promoted (independent closure + same-name routing + qualified access); `wchar_t`/`wint_t` made target-aware across the chain; the synthesised `DllMain` carrier for DLLs; const diagnostics aligned with clang.
+- New default settings header `include/colang.h` preloaded automatically.
 - Follow-ups (long tail): `.so` shared objects, dynamic PIE, x86-64 SysV ABI edge cases, ELF mapping of `winapi.co`, glibc audit of all stdlib headers.
 
 ### 0.4.0 — class
@@ -85,6 +87,12 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - Automatic reference counting and heap-object reclamation; out-of-scope auto-free.
 - `public` extended to class members.
 - Static class members accessed via the class name with double colon (`C::m()`).
+- Delivered beyond the original plan: member and parameter types opened up (`class` handles, `struct`/`union`/array embedded by value; parameters borrow, members are owned by the host); the `delete` statement for forced destruction and cycle breaking; correct release on `goto`/`break`/`continue` path terminations.
+- Follow-ups (long tail): inheritance and virtual functions; cross-module consumption of a `public class` from an `import`ed module; the class form under multi-obj (`--per-module`); automatic cycle breaking (currently done with `delete`).
+
+## Planned
+
+Details for 1.\* / 2.\* / 3.\* milestones will be finalized by the maintainer before 0.\* wraps up.
 
 ## Terminology
 

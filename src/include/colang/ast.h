@@ -45,6 +45,7 @@ enum class TypeKind
 	Struct,   // P3+
 	Union,    // P3+
 	Enum,     // P3+
+	Class,    // P300 Co class 引用类型（0.4.0）
 	BitInt,   // _BitInt(N) (C23)
 };
 
@@ -170,6 +171,8 @@ enum class ExprKind
 	Member,       // obj.member 或 ptr->member，lhs=对象 op="."/"->" name=成员名 type=结构体类型
 	InitList,     // {e1, e2, ...} 复合初始化器，args=子表达式列表
 	Generic,      // _Generic(sel, type:expr, ...)  C11 类型选择
+	New,          // P300 new ClassName(ctor_args)  heap 实例化
+	ThisRef,      // P300 this 当前对象引用
 };
 
 struct Expr;
@@ -249,6 +252,7 @@ enum class StmtKind
 	Switch,       // switch(expr) body
 	Case,         // case N: stmt
 	Default,      // default: stmt
+	Delete,       // P300 Co class（0.4.0）：delete <句柄变量>; 强制销毁（expr=操作数，上下文物、非 C 语句）
 };
 
 struct Stmt;
@@ -421,6 +425,43 @@ struct EnumDef
 };
 
 // ============================================================
+// class 定义（P300 Co 层，0.4.0）
+// ============================================================
+struct ClassMember
+{
+	CTypePtr type;          // 成员变量类型（本批限基元）
+	std::string name;
+	bool is_public = false;
+	bool is_static = false; // static 类变量（零初始化、模块级内链接全局）
+	SourceLoc loc;
+};
+
+struct ClassMethod
+{
+	std::string name;       // 方法名（构造=类名、析构="~"+类名）
+	CTypePtr ret_type;      // 返回类型（ctor/dtor 为 Void）
+	std::vector<std::pair<std::string, CTypePtr>> params; // 形参（本批限基元）
+	StmtPtr body;
+	bool is_public = false;
+	bool is_static = false;
+	bool is_ctor = false;
+	bool is_dtor = false;
+	SourceLoc loc;
+};
+
+struct ClassDef
+{
+	std::string tag;                    // 类名
+	std::vector<ClassMember> members;
+	std::vector<ClassMethod> methods;
+	bool has_ctor = false;
+	bool has_dtor = false;
+	SourceLoc loc;
+	bool is_public = false;
+	std::string source_module_key;
+};
+
+// ============================================================
 // import 声明（P212 Co 层）
 // ============================================================
 // 语法（沿用 .old3 D38、附录 B.4；filename 双形式）：
@@ -469,6 +510,7 @@ struct TranslationUnit
 	std::vector<std::pair<std::string, std::int64_t>> const_globals;
 	std::vector<StructDef> structs;
 	std::vector<EnumDef> enums;
+	std::vector<ClassDef> classes;  // P300 Co class（0.4.0）
 	// P3+: union decls (folded into structs with is_union flag)
 	// P211 Co 层入口模型：文件作用域的裸语句序列（printf/if/for/return/...）
 	//   按源码顺序保留，codegen 在合成 main 中依序发射。

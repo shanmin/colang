@@ -255,6 +255,8 @@ void merge_bundle(TranslationUnit &main_tu,
 		for (auto &g : sub.globals) g.source_module_key   = *rit;
 		for (auto &s : sub.structs) s.source_module_key   = *rit;
 		for (auto &e : sub.enums)   e.source_module_key   = *rit;
+		// P300 Co class（跨模块 import）：类项同样打归属标记（owner 模块键），供 codegen 分桶发射/宿主按需引用。
+		for (auto &c : sub.classes) c.source_module_key   = *rit;
 		// 前插声明/定义（顺序不影响 codegen 符号解析、但保留子模块内部相对顺序：
 		//   每次前插整段到头部、多子模块连续前插会让「后加载」的（更靠 postorder 尾部）
 		//   排在「先加载」的之前——正是「依赖方在后」的逆序展开)。
@@ -270,6 +272,10 @@ void merge_bundle(TranslationUnit &main_tu,
 		main_tu.enums.insert(main_tu.enums.begin(),
 			std::make_move_iterator(sub.enums.begin()),
 			std::make_move_iterator(sub.enums.end()));
+		// P300 Co class（跨模块 import）：子模块类定义前插到主 TU（宿主可见其完整定义、建布局/取 owner）。
+		main_tu.classes.insert(main_tu.classes.begin(),
+			std::make_move_iterator(sub.classes.begin()),
+			std::make_move_iterator(sub.classes.end()));
 		// 顶层裸代码：拓序前插 → 子模块 body 排在主源 body 之前（B 方案「main 前置统一 emit」）
 		// --per-module 探针：move 前另记逐模块分段视图（拓序＝本遍历序：最深依赖在前）。
 		if (!sub.top_level_body.empty())
@@ -307,6 +313,13 @@ void harvest_tag_seeds(const std::unordered_map<std::string, TUPtr> &cache,
 			if (!e.is_public || e.tag.empty()) continue;
 			if (!seen.insert(e.tag).second) continue;
 			out.push_back(ImportTagSeed{e.tag, false, true});
+		}
+		// P300 Co class（跨模块 import）：public class 标签出种子，使宿主 parse 期即可裸类名作类型。
+		for (const auto &c : tu->classes)
+		{
+			if (!c.is_public || c.tag.empty()) continue;
+			if (!seen.insert(c.tag).second) continue;
+			out.push_back(ImportTagSeed{c.tag, false, false, true});
 		}
 	}
 }

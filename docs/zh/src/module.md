@@ -14,7 +14,7 @@
 
 - `public` 是 Co **唯一的可见性关键字**——没有 `private`，也不另设 `export`。它同时承担两件事：标记**模块接口**（可被其他模块 `import`）与**动态库导出**（写入 DLL 导出表）。
 - 未标 `public` 的定义仅在模块内部可见；标了 `public` 才对外可见、才可被导入。
-- `public` 可修饰顶层函数、全局变量与 `struct` / `union` / `enum` 类型（跨模块类型可见性自 0.3.0/0.3.1 可用）；`class` 及其成员的 `public` 修饰归 0.4.0。
+- `public` 可修饰顶层函数、全局变量与 `struct` / `union` / `enum` 类型（跨模块类型可见性自 0.3.0/0.3.1 可用）；`class` 及其成员的 `public` 修饰自 0.4.0 起可用（`public class` 的跨模块 `import` 消费仍未开放）。
 - imported 的非 `public` 符号在 codegen 强制 `InternalLinkage`——同模块内部引用可解析，但不注入外部可见的 LLVM 值。
 
 ## 模块的形态
@@ -50,7 +50,7 @@
 自 0.3.0 起：
 - **`public`** 管跨模块可见性——省略即「模块内部」、加了才可被 `import`；
 - **`static`** 保留 C 语义——作本翻译单元内部链接位，与 `public` 互不冲突（`static public` / `public static` 混序均合法、语义为「对外导出、本 TU 内部链接」，实际产物中该符号仍属内部）；
-- 基准中 `static` 未来仅作为类的静态成员修饰符（归 0.4.0 class 批次处理）。
+- 基准中 `static` 仅作为类的静态成员修饰符（自 0.4.0 class 起落地）。
 
 ## 尚未定稿
 

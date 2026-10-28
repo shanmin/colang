@@ -93,11 +93,14 @@ struct CodeGenImpl
 	struct LoopContext {
 		llvm::BasicBlock *break_target;
 		llvm::BasicBlock *continue_target; // nullptr for switch
+		std::size_t rc_depth = 0;          // P300：入口 RC 帧深度，break/continue 释放至此（补 §5.5）
 	};
 	std::vector<LoopContext> loop_stack_;
 
 	// goto/label
 	std::unordered_map<std::string, llvm::BasicBlock*> label_blocks_;
+	// P300：标签处的 RC 帧深度，供 goto 向后跳越块作用域时按目标深度释放
+	std::unordered_map<std::string, std::size_t> label_rc_depth_;
 	// switch case/default 标签→BB（P172：case 视作 label，支持嵌在循环体内的 case，如 Tom Duff）
 	std::unordered_map<const Stmt *, llvm::BasicBlock *> case_label_bb_;
 	struct PendingGoto { std::string label; llvm::BasicBlock *from_bb; };
@@ -106,6 +109,19 @@ struct CodeGenImpl
 	// struct/union/enum
 	std::unordered_map<std::string, llvm::StructType*> struct_types_;
 	std::unordered_map<std::string, const StructDef*> struct_defs_;
+	// P300 Co class（0.4.0）：类布局 / 定义 / static 成员全局 / RC 帧栈
+	std::unordered_map<std::string, llvm::StructType*> class_types_;
+	std::unordered_map<std::string, const ClassDef*> class_defs_;
+	std::unordered_map<std::string, llvm::GlobalVariable*> class_static_globals_; // "tag.name" → 全局
+	std::unordered_map<std::string, CTypePtr> class_static_types_;                // "tag.name" → 成员类型
+	// 引用计数帧：与块作用域同层推进，出域按帧由内向外、声明逆序 release
+	struct RcSlot { llvm::Value *slot_addr; std::string class_name; };
+	std::vector<std::vector<RcSlot>> rc_frames_;
+	// P300 形参借用（0.4.0 收尾）：class 句柄形参的 alloca 槽集合——重绑定时不 retain 新值/不 release 原借用对象。
+	std::unordered_set<llvm::Value*> borrowed_slots_;
+	// 当前类方法上下文（this 绑定 / 裸成员名解析）
+	std::string cur_class_tag_;
+	llvm::Value *cur_this_ = nullptr;
 	// 位域访问信息：key = "tag.member_name"
 	struct BitfieldAccess {
 		unsigned storage_idx;   // LLVM struct 字段索引（存储单元）
@@ -368,6 +384,9 @@ struct CodeGenImpl
 		case TypeKind::Union:
 			// struct/union 在值上下文中按 pointer 处理（参数传递/返回）
 			return llvm::PointerType::getUnqual(ctx);
+		case TypeKind::Class:
+			// P300 Co class：heap-only 引用语义，变量持有句柄（指针）
+			return llvm::PointerType::getUnqual(ctx);
 		default:
 			return llvm::Type::getInt32Ty(ctx);
 		}
@@ -470,6 +489,8 @@ struct CodeGenImpl
 	// 获取/创建 LLVM StructType
 	llvm::StructType *get_struct_type(const std::string &tag)
 	{
+		// P300 Co class：类名走专属布局（{i64 refcount, members...}）
+		if (class_defs_.count(tag)) return get_class_struct_type(tag);
 		auto it = struct_types_.find(tag);
 		if (it != struct_types_.end()) return it->second;
 		// 路 B 阶段2：分桶模式下 LLVM 类型名携模块短名前缀（struct.<stem>.<tag>），使单 obj
@@ -720,6 +741,7 @@ struct CodeGenImpl
 			label_blocks_.clear();
 			case_label_bb_.clear();
 			pending_gotos_.clear();
+			label_rc_depth_.clear();
 			cur_func_name_ = fname;
 			in_synthesized_main_body_ = true; // 允许 return; 兜底为 ret void
 			for (auto &pi : tl_pending_inits)
@@ -814,6 +836,7 @@ struct CodeGenImpl
 			label_blocks_.clear();
 			case_label_bb_.clear();
 			pending_gotos_.clear();
+			label_rc_depth_.clear();
 			cur_func_name_ = "DllMain";
 			// entry：reason 分岔
 			auto *entry = llvm::BasicBlock::Create(ctx, "entry", F);
@@ -877,6 +900,7 @@ struct CodeGenImpl
 			label_blocks_.clear();
 			case_label_bb_.clear();
 			pending_gotos_.clear();
+			label_rc_depth_.clear();
 			cur_func_name_ = "WinMain";
 			auto *entry = llvm::BasicBlock::Create(ctx, "entry", F);
 			builder.SetInsertPoint(entry);
@@ -942,6 +966,9 @@ struct CodeGenImpl
 				if (!sd.tag.empty() && sd.is_definition)
 					struct_defs_[sd.tag] = &sd;
 		}
+		// P300 Co class：预登记类定义、建实例布局、声明方法/四件套签名、发射 static 全局。
+		//   必须先于函数体（用户函数可调类方法）与顶层裸代码（new/方法调用）。
+		declare_class_entities(tu);
 		// 同名函数的「规范声明」归并：无原型声明（`void out();`）与其带形参定义
 		//   （`void out(int*, ...)`）在 tu.funcs 中是两条记录，LLVM 的 Function 类型
 		//   由首次 getOrInsertFunction 固定、后续声明无法改写 → 定义体按错误签名绑定
@@ -1151,6 +1178,8 @@ struct CodeGenImpl
 				gen_function(fn);
 			}
 		}
+		// P300 Co class：方法体 + 四件套体（普通函数之后、入口合成之前）。
+		gen_class_definitions(tu);
 		// ============================================================
 		// P212：入口子系统标志——扫定义函数定 WinMain 入口 / [[subsystem("windows")]]。
 		// --per-module: 非主桶跳过入口合成，改为合成 __init__<dunder>__ 函数。
@@ -1233,7 +1262,12 @@ struct CodeGenImpl
 					label_blocks_.clear();
 					case_label_bb_.clear();
 					pending_gotos_.clear();
+					label_rc_depth_.clear();
 					cur_func_name_ = "main";
+					cur_class_tag_.clear();
+					cur_this_ = nullptr;
+					rc_frames_.clear();
+					rc_frames_.emplace_back(); // 顶层 RC 帧（与合成 main 同生命周期）
 					// 将 argc/argv/envp 入作域（argv 本批不向用户暴露，仅为下一批预留映射入口）。
 					{
 						auto ait = m->arg_begin();
@@ -1285,6 +1319,12 @@ struct CodeGenImpl
 							if (tu.top_level_body[i]) gen_stmt(tu.top_level_body[i], m);
 					}
 					in_synthesized_main_body_ = false;
+					// P300 Co class：顶层裸句柄作域结束→逆序 release（未提前 return 时）。
+					{
+						llvm::BasicBlock *cur_bb = builder.GetInsertBlock();
+						if (cur_bb && (cur_bb->empty() || !cur_bb->back().isTerminator()))
+							release_all_rc();
+					}
 					// 末尾未终止 → 转调 __co_main__ 或 ret 0（“return V;”已提前 ret 时跳过）
 					llvm::BasicBlock *tail = builder.GetInsertBlock();
 					if (!tail || tail->empty() || !tail->back().isTerminator())
@@ -1357,6 +1397,11 @@ struct CodeGenImpl
 		for (const auto &seg : tu.top_level_segments)
 			if (seen_keys.insert(seg.first).second)
 				bucket_keys.push_back(seg.first);
+		// P300 Co class（跨模块 import）：仅定义 class（无自由函数/全局/顶层裸句）的模块也需拥有自己的桶，
+		//   否则其 class 实体无处发射（in_cur_bucket 在其它桶恒假）。owner 桶唯一发射、宿主按需 External 引用。
+		for (const auto &cd : tu.classes)
+			if (!cd.source_module_key.empty() && seen_keys.insert(cd.source_module_key).second)
+				bucket_keys.push_back(cd.source_module_key);
 
 		// 3. 每个导入桶：begin_bucket → pipeline → (pipeline 内合成 __init__ 并 return) → push 到 done_buckets_
 		for (const auto &key : bucket_keys)
@@ -2804,6 +2849,12 @@ struct CodeGenImpl
 		label_blocks_.clear();
 		case_label_bb_.clear();
 		pending_gotos_.clear();
+		label_rc_depth_.clear();
+		cur_class_tag_.clear(); // 普通 C 函数无类上下文
+		cur_this_ = nullptr;
+		rc_frames_.clear();
+		rc_frames_.emplace_back(); // 函数级 RC 帧
+		borrowed_slots_.clear(); // P300 借用形参集合按函数重置
 		llvm::BasicBlock *entry = llvm::BasicBlock::Create(ctx, "entry", F);
 		builder.SetInsertPoint(entry);
 		// 为参数建 alloca + store（使地址可及，统一查找）
@@ -2838,9 +2889,14 @@ struct CodeGenImpl
 					vars_[fn.params[i].name] = al;
 					var_types_[fn.params[i].name] = pty;
 				}
+				// P300 借用形参：class 句柄形参槽登记 borrowed（重绑定不 retain/release，所有权在调用方）
+				if (pty->kind == TypeKind::Class) borrowed_slots_.insert(al);
 			}
 		}
 		gen_stmt(fn.body, F);
+		// P300 Co class：正常落点退出函数→释放本函数所有 RC 帧（Return 语句已就地释放）。
+		if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
+			release_all_rc();
 		// 当前插入点无终止则补 ret
 		// 注：用 getNullValue 而非 ConstantInt::get——返回类型为 ptr（struct 值建模）
 		// 或浮点时 ConstantInt::get 会造出非法常量（`ret i0 0`）触发 verifier 报错；
@@ -2869,6 +2925,509 @@ struct CodeGenImpl
 		{
 			errs.push_back(Error{fn.loc.file, Pos{fn.loc.line, fn.loc.column},
 				"IR verification: " + verify_err});
+		}
+	}
+
+	// ============================================================
+	// P300 Co class codegen（0.4.0）：布局 / 四件套 / 方法体 / RC 帧
+	// ============================================================
+
+	// 类实例布局：{ i64 refcount(idx0), member_types... }，成员 GEP 一律 pos+1。
+	llvm::StructType *get_class_struct_type(const std::string &tag)
+	{
+		auto it = class_types_.find(tag);
+		if (it != class_types_.end()) return it->second;
+		const std::string tname = "class." +
+			(per_module_ && !cur_bucket_key_.empty() ? dunderize(cur_bucket_key_) + "." : std::string()) + tag;
+		auto dit = class_defs_.find(tag);
+		if (dit == class_defs_.end())
+		{
+			auto *st = llvm::StructType::create(ctx, tname);
+			class_types_[tag] = st;
+			return st;
+		}
+		const ClassDef *cd = dit->second;
+		auto *st = llvm::StructType::create(ctx, tname);
+		class_types_[tag] = st;
+		std::vector<llvm::Type *> fields;
+		fields.push_back(llvm::Type::getInt64Ty(ctx)); // idx 0 = refcount
+		unsigned i = 1;
+		for (const auto &m : cd->members)
+		{
+			if (m.is_static) continue; // static 不入实例布局
+			fields.push_back(to_llvm_alloca_type(m.type));
+			if (!m.name.empty()) field_index_map_[tag + "." + m.name] = i;
+			++i;
+		}
+		if (fields.size() == 1)
+			fields.push_back(llvm::Type::getInt64Ty(ctx)); // 空类保持非零尺寸
+		st->setBody(fields, false);
+		return st;
+	}
+
+	// P300 Co class（跨模块 import）：class 名按 owner 模块 dunder 分流——主源类（source_module_key 空）
+	//   恒裸名（零改动）；imported 类取 "__<stem>__<tag>"，使两模块同名 class 的符号在单 obj linkInModule
+	//   合流时不撞车（继 struct 类型名分流，此处补函数/全局符号那半套）。定义/引用两端均由此纯函数派生、天然一致。
+	static std::string class_tag_symbol(const ClassDef &cd)
+	{
+		if (cd.source_module_key.empty()) return cd.tag;
+		return "__" + dunderize(cd.source_module_key) + "__" + cd.tag;
+	}
+	// 按裸 tag 取 owner ClassDef（引用点常只持 tag 字符串）；找不到回 nullptr。
+	const ClassDef *class_def_of(const std::string &tag)
+	{
+		auto it = class_defs_.find(tag);
+		return it == class_defs_.end() ? nullptr : it->second;
+	}
+	// 方法/协议符号：tag_symbol + "." + (ctor/dtor 协议名 | 方法名)。
+	static std::string class_method_symbol(const ClassDef &cd, const ClassMethod &cm)
+	{
+		const std::string base = class_tag_symbol(cd);
+		if (cm.is_ctor) return base + ".__ctor__";
+		if (cm.is_dtor) return base + ".__dtor__";
+		return base + "." + cm.name;
+	}
+	// 生命周期符号：tag_symbol + suffix（".__new__"/".__retain__"/".__release__"/".__delete__"）。
+	static std::string class_lifecycle_symbol(const ClassDef &cd, const std::string &suffix)
+	{
+		return class_tag_symbol(cd) + suffix;
+	}
+	// static 成员全局发射名：tag_symbol + "." + name（桶内 class_static_globals_ 仍按裸 "tag.name" 缓存）。
+	static std::string class_static_symbol(const ClassDef &cd, const std::string &name)
+	{
+		return class_tag_symbol(cd) + "." + name;
+	}
+
+	// 方法签名：实例方法（含 ctor/dtor）首参隐式 ptr this；static 无 this。
+	llvm::FunctionType *class_method_ft(const ClassMethod &cm)
+	{
+		llvm::Type *ret = to_llvm_type(cm.ret_type);
+		std::vector<llvm::Type *> pts;
+		if (!cm.is_static) pts.push_back(llvm::PointerType::getUnqual(ctx));
+		for (const auto &p : cm.params) pts.push_back(to_llvm_type(p.second));
+		return llvm::FunctionType::get(ret, pts, false);
+	}
+	// new/生命周期引用点的函数类型（引用点按需建 External 声明时用）。
+	llvm::FunctionType *class_new_ft(const ClassDef &cd)
+	{
+		llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx);
+		std::vector<llvm::Type *> pts;
+		for (const auto &cm : cd.methods)
+			if (cm.is_ctor) { for (const auto &p : cm.params) pts.push_back(to_llvm_type(p.second)); break; }
+		return llvm::FunctionType::get(ptr_ty, pts, false);
+	}
+	llvm::FunctionType *class_rc_ft()
+	{
+		return llvm::FunctionType::get(llvm::Type::getVoidTy(ctx),
+			{llvm::PointerType::getUnqual(ctx)}, false);
+	}
+	// 引用点：解析生命周期函数；本桶无则按需建 External 声明（他桶定义经 linkInModule 归并）。
+	//   非分桶/主桶自用时 declare_class_entities 已建定义/声明，getFunction 直接命中、零改动。
+	llvm::Function *class_lifecycle_ref(const ClassDef &cd, const std::string &suffix, llvm::FunctionType *ft)
+	{
+		const std::string sym = class_lifecycle_symbol(cd, suffix);
+		if (llvm::Function *F = module->getFunction(sym)) return F;
+		llvm::FunctionCallee FC = module->getOrInsertFunction(sym, ft);
+		if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee())) { F->addFnAttr("uwtable"); return F; }
+		return nullptr;
+	}
+	llvm::Function *class_method_ref(const ClassDef &cd, const ClassMethod &cm)
+	{
+		const std::string sym = class_method_symbol(cd, cm);
+		if (llvm::Function *F = module->getFunction(sym)) return F;
+		llvm::FunctionCallee FC = module->getOrInsertFunction(sym, class_method_ft(cm));
+		if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee())) { F->addFnAttr("uwtable"); return F; }
+		return nullptr;
+	}
+	// static 成员引用：本桶缓存命中→用；否则跨桶按需建 External 全局声明（owner 发射名为 dunder 符号）。
+	//   桶内缓存键恒裸 "tag.name"；out_ty 回带成员类型（供 load 宽度）。
+	llvm::GlobalVariable *class_static_ref(const std::string &tag, const std::string &mname, CTypePtr *out_ty)
+	{
+		const std::string key = tag + "." + mname;
+		auto git = class_static_globals_.find(key);
+		if (git != class_static_globals_.end())
+		{
+			if (out_ty) *out_ty = class_static_types_.count(key) ? class_static_types_[key] : nullptr;
+			return git->second;
+		}
+		const ClassDef *cd = class_def_of(tag);
+		if (!cd) return nullptr;
+		for (const auto &m : cd->members)
+		{
+			if (!m.is_static || m.name != mname) continue;
+			const std::string sym = class_static_symbol(*cd, mname);
+			llvm::GlobalVariable *gv = module->getGlobalVariable(sym);
+			if (!gv)
+			{
+				llvm::Type *mt = to_llvm_alloca_type(m.type);
+				gv = new llvm::GlobalVariable(*module, mt, false,
+					llvm::GlobalValue::ExternalLinkage, nullptr, sym);
+			}
+			class_static_globals_[key] = gv;
+			class_static_types_[key] = m.type;
+			if (out_ty) *out_ty = m.type;
+			return gv;
+		}
+		return nullptr;
+	}
+
+	// 生成单个类方法体（含 ctor/dtor/实例/static），镜像 gen_function 的 this/成员绑定与收尾。
+	void gen_class_method(const ClassDef &cd, const ClassMethod &cm)
+	{
+		if (!cm.body) return;
+		const std::string sym = class_method_symbol(cd, cm);
+		llvm::Function *F = module->getFunction(sym);
+		if (!F) return;
+		cur_class_tag_ = cd.tag;
+		cur_this_ = nullptr;
+		cur_func_name_ = sym;
+		vars_.clear();
+		var_types_.clear();
+		loop_stack_.clear();
+		label_blocks_.clear();
+		case_label_bb_.clear();
+		pending_gotos_.clear();
+		label_rc_depth_.clear();
+		rc_frames_.clear();
+		rc_frames_.emplace_back(); // 函数级帧
+		borrowed_slots_.clear(); // P300 借用形参集合按方法重置
+		llvm::BasicBlock *entry = llvm::BasicBlock::Create(ctx, "entry", F);
+		builder.SetInsertPoint(entry);
+		auto it = F->arg_begin();
+		if (!cm.is_static)
+		{
+			llvm::Value *thisarg = &*it; ++it;
+			cur_this_ = thisarg; // 形参 ptr 支配全函数，直接用作 this 基址
+			// 裸成员名绑定为 GEP(this, field_idx)（field_index_map_ 携 pos+1），使 `field` ≡ `this.field`
+			llvm::StructType *ct = get_class_struct_type(cd.tag);
+			for (const auto &m : cd.members)
+			{
+				if (m.is_static || m.name.empty()) continue;
+				auto fi = field_index_map_.find(cd.tag + "." + m.name);
+				if (fi == field_index_map_.end()) continue;
+				llvm::Value *g = builder.CreateStructGEP(ct, thisarg, fi->second, m.name.c_str());
+				vars_[m.name] = g;
+				var_types_[m.name] = m.type;
+			}
+		}
+		// static 成员 → 绑定到模块级全局（裸名 `counter` 在任意方法体内可读写，实例/static 均然）。
+		for (const auto &m : cd.members)
+		{
+			if (!m.is_static || m.name.empty()) continue;
+			auto g = class_static_globals_.find(cd.tag + "." + m.name);
+			if (g != class_static_globals_.end()) { vars_[m.name] = g->second; var_types_[m.name] = m.type; }
+		}
+		// 形参 alloca
+		for (std::size_t i = 0; i < cm.params.size() && it != F->arg_end(); ++i, ++it)
+		{
+			llvm::Value *argval = &*it;
+			const std::string &pn = cm.params[i].first;
+			CTypePtr pty = cm.params[i].second;
+			if (!pty || pty->kind == TypeKind::Void) continue;
+			llvm::Type *arg_ty = argval->getType();
+			llvm::AllocaInst *al = builder.CreateAlloca(arg_ty, nullptr, pn.empty() ? nullptr : pn.c_str());
+			builder.CreateStore(argval, al);
+			if (!pn.empty()) { vars_[pn] = al; var_types_[pn] = pty; }
+			// P300 借用形参：class 句柄形参槽登记 borrowed（重绑定不 retain/release）
+			if (pty->kind == TypeKind::Class) borrowed_slots_.insert(al);
+		}
+		gen_stmt(cm.body, F);
+		// 正常落点出函数：释放本函数所有 RC 帧（由内向外、逆序）
+		llvm::BasicBlock *cur = builder.GetInsertBlock();
+		if (cur && (cur->empty() || !cur->back().isTerminator()))
+			release_all_rc();
+		cur = builder.GetInsertBlock();
+		if (cur->empty() || !cur->back().isTerminator())
+		{
+			if (F->getReturnType()->isVoidTy())
+				builder.CreateRetVoid();
+			else
+				builder.CreateRet(llvm::Constant::getNullValue(F->getReturnType()));
+		}
+		for (llvm::BasicBlock &bb : *F)
+			if (bb.empty()) { builder.SetInsertPoint(&bb); builder.CreateUnreachable(); }
+		std::string verify_err;
+		llvm::raw_string_ostream vs(verify_err);
+		if (llvm::verifyFunction(*F, &vs))
+			errs.push_back(Error{cm.loc.file, Pos{cm.loc.line, cm.loc.column}, "IR verification: " + verify_err});
+		cur_class_tag_.clear();
+		cur_this_ = nullptr;
+	}
+
+	// RC：加载 slot 中的对象指针 → call C.__release__(ptr)。null 由 __release__ 内部跳过。
+	void rc_release_slot(const RcSlot &slot)
+	{
+		const ClassDef *rcd = class_def_of(slot.class_name);
+		if (!rcd) return;
+		llvm::Function *rf = class_lifecycle_ref(*rcd, ".__release__", class_rc_ft());
+		if (!rf) return;
+		llvm::Value *v = builder.CreateLoad(llvm::PointerType::getUnqual(ctx), slot.slot_addr);
+		builder.CreateCall(rf, {v});
+	}
+
+	// 释放指定深度以上所有帧（由内向外、帧内逆序），弹至 target_depth 帧。
+	void release_rc_frames(std::size_t target_depth)
+	{
+		while (rc_frames_.size() > target_depth)
+		{
+			auto &fr = rc_frames_.back();
+			for (auto rit = fr.rbegin(); rit != fr.rend(); ++rit) rc_release_slot(*rit);
+			rc_frames_.pop_back();
+		}
+	}
+
+	void release_all_rc() { release_rc_frames(0); }
+
+	// 仅发射 release 调用（不弹 C++ 帧栈）：供 return/break/continue 等「路径终结」使用。
+	//   这些语句只终结当前 IR 路径，直落的兄弟路径仍需见到那些槽存活；若在此弹栈会
+	//   使后续块出域逻辑误判帧已回收、漏发直落路径的 release（嵌套块句柄不析构）。
+	void release_rc_frames_emit(std::size_t target_depth)
+	{
+		for (std::size_t d = rc_frames_.size(); d-- > target_depth;)
+		{
+			auto &fr = rc_frames_[d];
+			for (auto rit = fr.rbegin(); rit != fr.rend(); ++rit) rc_release_slot(*rit);
+		}
+	}
+
+	// 生成一个类的四件套（须先已声明其签名）。
+	void gen_class_lifecycle(const ClassDef &cd)
+	{
+		const std::string &tag = cd.tag; // 裸 tag：仅用于布局/映射键
+		const std::string base = class_tag_symbol(cd); // 发射符号基名（跨模块 dunder）
+		llvm::StructType *ct = get_class_struct_type(tag);
+		const uint64_t sz = module->getDataLayout().getTypeAllocSize(ct);
+		llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx);
+		llvm::Type *i64 = llvm::Type::getInt64Ty(ctx);
+		llvm::FunctionCallee malloc_fn = module->getOrInsertFunction("malloc",
+			llvm::FunctionType::get(ptr_ty, {i64}, false));
+		llvm::FunctionCallee free_fn = module->getOrInsertFunction("free",
+			llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), {ptr_ty}, false));
+		const ClassMethod *ctor = nullptr, *dtor = nullptr;
+		for (const auto &m : cd.methods) { if (m.is_ctor) ctor = &m; else if (m.is_dtor) dtor = &m; }
+
+		// refcount 访问：GEP(ct, obj, 0) → i64 load/store
+		auto rc_gep = [&](llvm::Value *obj) {
+			return builder.CreateStructGEP(ct, obj, 0, "rc");
+		};
+
+		// ---- C.__new__(ctor_args) -> ptr ----
+		{
+			llvm::Function *F = module->getFunction(base + ".__new__");
+			if (F && F->isDeclaration())
+			{
+				builder.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", F));
+				llvm::Value *obj = builder.CreateCall(malloc_fn, {llvm::ConstantInt::get(i64, sz)});
+				builder.CreateStore(llvm::ConstantInt::get(i64, 1), rc_gep(obj)); // refcount=1
+				// P300 成员宿主拥有（0.4.0 收尾）：class 句柄成员槽预置 null——malloc 不清零，
+				//   否则成员首次 store-own 会 release 未初始化垃圾指针致崩。
+				for (const auto &m : cd.members)
+				{
+					if (m.is_static || m.name.empty() || !m.type || m.type->kind != TypeKind::Class) continue;
+					auto fi = field_index_map_.find(tag + "." + m.name);
+					if (fi == field_index_map_.end()) continue;
+					llvm::Value *f = builder.CreateStructGEP(ct, obj, fi->second, m.name.c_str());
+					builder.CreateStore(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr_ty)), f);
+				}
+				if (ctor && ctor->body)
+				{
+					llvm::Function *cf = module->getFunction(base + ".__ctor__");
+					std::vector<llvm::Value *> cargs;
+					cargs.push_back(obj); // ctor 首参 this
+					for (auto &a : F->args()) cargs.push_back(&a); // __new__ 形参即 ctor 实参（同序同基元型）
+					builder.CreateCall(cf, cargs);
+				}
+				builder.CreateRet(obj);
+			}
+		}
+		// ---- C.__retain__(ptr) ----
+		{
+			llvm::Function *F = module->getFunction(base + ".__retain__");
+			if (F && F->isDeclaration())
+			{
+				llvm::Value *obj = F->getArg(0);
+				builder.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", F));
+				llvm::BasicBlock *body_bb = llvm::BasicBlock::Create(ctx, "body", F);
+				llvm::BasicBlock *end_bb = llvm::BasicBlock::Create(ctx, "end", F);
+				builder.CreateCondBr(builder.CreateICmpNE(obj, llvm::ConstantPointerNull::get(
+					llvm::cast<llvm::PointerType>(ptr_ty))), body_bb, end_bb);
+				builder.SetInsertPoint(body_bb);
+				llvm::Value *rc = builder.CreateLoad(i64, rc_gep(obj));
+				builder.CreateStore(builder.CreateAdd(rc, llvm::ConstantInt::get(i64, 1)), rc_gep(obj));
+				builder.CreateBr(end_bb);
+				builder.SetInsertPoint(end_bb);
+				builder.CreateRetVoid();
+			}
+		}
+		// ---- C.__release__(ptr)：-1，归零转 __delete__ ----
+		{
+			llvm::Function *F = module->getFunction(base + ".__release__");
+			if (F && F->isDeclaration())
+			{
+				llvm::Value *obj = F->getArg(0);
+				builder.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", F));
+				llvm::BasicBlock *body_bb = llvm::BasicBlock::Create(ctx, "body", F);
+				llvm::BasicBlock *end_bb = llvm::BasicBlock::Create(ctx, "end", F);
+				builder.CreateCondBr(builder.CreateICmpNE(obj, llvm::ConstantPointerNull::get(
+					llvm::cast<llvm::PointerType>(ptr_ty))), body_bb, end_bb);
+				builder.SetInsertPoint(body_bb);
+				llvm::Value *rc = builder.CreateLoad(i64, rc_gep(obj));
+				llvm::Value *nrc = builder.CreateSub(rc, llvm::ConstantInt::get(i64, 1));
+				builder.CreateStore(nrc, rc_gep(obj));
+				llvm::Value *zero = builder.CreateICmpEQ(nrc, llvm::ConstantInt::get(i64, 0));
+				llvm::BasicBlock *del_bb = llvm::BasicBlock::Create(ctx, "del", F);
+				llvm::BasicBlock *ret_bb = llvm::BasicBlock::Create(ctx, "ret", F);
+				builder.CreateCondBr(zero, del_bb, ret_bb);
+				builder.SetInsertPoint(del_bb);
+				builder.CreateCall(module->getFunction(base + ".__delete__"), {obj});
+				builder.CreateBr(ret_bb);
+				builder.SetInsertPoint(ret_bb);
+				builder.CreateBr(end_bb);
+				builder.SetInsertPoint(end_bb);
+				builder.CreateRetVoid();
+			}
+		}
+		// ---- C.__delete__(ptr)：调析构 → free ----
+		{
+			llvm::Function *F = module->getFunction(base + ".__delete__");
+			if (F && F->isDeclaration())
+			{
+				llvm::Value *obj = F->getArg(0);
+				builder.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", F));
+				if (dtor && dtor->body)
+					builder.CreateCall(module->getFunction(base + ".__dtor__"), {obj});
+				// P300 成员宿主拥有（0.4.0 收尾）：级联 release 其 class 成员（dtor 之后、free 之前；
+				//   __release__ 对 null 跳过、未赋值成员安全；成员类符号走 dunder helper 跨模块正确）。
+				for (const auto &m : cd.members)
+				{
+					if (m.is_static || m.name.empty() || !m.type || m.type->kind != TypeKind::Class) continue;
+					auto fi = field_index_map_.find(tag + "." + m.name);
+					if (fi == field_index_map_.end()) continue;
+					const ClassDef *mcd = class_def_of(m.type->tag);
+					llvm::Function *rf = mcd ? class_lifecycle_ref(*mcd, ".__release__", class_rc_ft()) : nullptr;
+					if (!rf) continue;
+					llvm::Value *f = builder.CreateStructGEP(ct, obj, fi->second, m.name.c_str());
+					llvm::Value *v = builder.CreateLoad(ptr_ty, f);
+					builder.CreateCall(rf, {v});
+				}
+				builder.CreateCall(free_fn, {obj});
+				builder.CreateRetVoid();
+			}
+		}
+		// verifier：四件套
+		for (const char *sfx : {"__new__", "__retain__", "__release__", "__delete__"})
+		{
+			llvm::Function *F = module->getFunction(base + "." + sfx);
+			if (!F || F->isDeclaration()) continue;
+			for (llvm::BasicBlock &bb : *F)
+				if (bb.empty()) { builder.SetInsertPoint(&bb); builder.CreateUnreachable(); }
+			std::string ve; llvm::raw_string_ostream vs(ve);
+			if (llvm::verifyFunction(*F, &vs))
+				errs.push_back(Error{cd.loc.file, Pos{cd.loc.line, cd.loc.column}, "IR verification: " + ve});
+		}
+	}
+
+	// 预声明阶段（先于函数体）：登记类定义、建布局、声明方法/四件套签名、发射 static 全局。
+	void declare_class_entities(const TranslationUnit &tu)
+	{
+		// P300 Co class（跨模块 import · 阶段C）：仿 struct 的 per-bucket 隔离——分桶下清空重登记，
+		//   消灭跨桶同名 class 的类型/布局劫持（h4 类比）；登记序先「他桶 public 定义」（供宿主建
+		//   布局/取 owner），后「本桶自有定义」（同名覆盖，本模块自引用恒绑自身布局）。实体发射仅 owner
+		//   桶（见下方 in_cur_bucket 守卫），他桶 class 由引用点按需造 External 声明（阶段B helper），
+		//   linkInModule 合流消解重复定义。非分桶模式维持单次全量登记、行为逐字等价（零回归）。
+		if (per_module_)
+		{
+			class_defs_.clear();
+			class_types_.clear();
+			class_static_globals_.clear();
+			class_static_types_.clear();
+			field_index_map_.clear();
+			for (const auto &cd : tu.classes)
+				if (!cd.tag.empty() && cd.is_public && !in_cur_bucket(cd.source_module_key))
+					class_defs_[cd.tag] = &cd;
+			for (const auto &cd : tu.classes)
+				if (!cd.tag.empty() && in_cur_bucket(cd.source_module_key))
+					class_defs_[cd.tag] = &cd;
+		}
+		else
+		{
+			for (const auto &cd : tu.classes)
+				if (!cd.tag.empty())
+					class_defs_[cd.tag] = &cd;
+		}
+		for (const auto &cd : tu.classes)
+		{
+			if (cd.tag.empty()) continue;
+			if (!in_cur_bucket(cd.source_module_key)) continue; // 仅 owner 桶发射实体；他桶按需 External 声明
+			llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx);
+			get_class_struct_type(cd.tag);
+			// P300 Co class（③）：public class 的四件套/实例方法/static 成员随类自动公开（镜像
+			//   public fn（L1113/1122）与 public struct 派生 op 的 link+DLLExport 口径）：public → ExternalLinkage
+			//   且 windows 下叠 DLLExportStorage（使 --dll / 单模块下外部消费者可链接调用构造/析构/retain/release/方法）；
+			//   非 public 仍 InternalLinkage（零回归）。分桶下实体发射仅 owner 桶（见上方 in_cur_bucket
+			//   守卫），imported 桶 public class 打 ExternalLinkage 但不打 DLLExport（裁定⑥：cur_bucket_key_
+			//   守卫），单 obj linkInModule 合回后宿主直连其符号。
+			const bool cls_pub = cd.is_public;
+			const llvm::GlobalValue::LinkageTypes cls_link = cls_pub
+				? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
+			const bool cls_export = target_.is_windows && cls_pub &&
+				(!per_module_ || cur_bucket_key_.empty()); // 裁定⑥：分桶仅主桶导出
+			// static 成员 → global（零初始化）：内部 map 键恒裸 "tag.name"，LLVM 发射名走 class_static_symbol
+			//   （跨模块 dunder），使 owner 定义与宿主按需 External 引用同名、linkInModule 归并。
+			for (const auto &m : cd.members)
+			{
+				if (!m.is_static || m.name.empty()) continue;
+				const std::string key = cd.tag + "." + m.name;
+				if (class_static_globals_.count(key)) continue;
+				const std::string gname = class_static_symbol(cd, m.name);
+				llvm::Type *mt = to_llvm_alloca_type(m.type);
+				auto *gv = new llvm::GlobalVariable(*module, mt, false,
+					cls_link, llvm::Constant::getNullValue(mt), gname);
+				if (cls_export) gv->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+				class_static_globals_[key] = gv;
+				class_static_types_[key] = m.type;
+			}
+			// 方法签名
+			for (const auto &cm : cd.methods)
+			{
+				std::string sym = class_method_symbol(cd, cm);
+				if (module->getFunction(sym)) continue;
+				llvm::Function *F = llvm::Function::Create(class_method_ft(cm),
+					cls_link, sym, module.get());
+				F->addFnAttr("uwtable");
+				if (cls_export) F->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+			}
+			// 四件套签名
+			const ClassMethod *ctor = nullptr;
+			for (const auto &cm : cd.methods) if (cm.is_ctor) ctor = &cm;
+			std::vector<llvm::Type *> new_pts;
+			if (ctor) for (const auto &p : ctor->params) new_pts.push_back(to_llvm_type(p.second));
+			llvm::FunctionType *nft = llvm::FunctionType::get(ptr_ty, new_pts, false);
+			llvm::FunctionType *rcft = llvm::FunctionType::get(
+				llvm::Type::getVoidTy(ctx), {ptr_ty}, false);
+			auto mk = [&](const std::string &sym, llvm::FunctionType *ft){
+				if (module->getFunction(sym)) return;
+				llvm::Function *F = llvm::Function::Create(ft,
+					cls_link, sym, module.get());
+				F->addFnAttr("uwtable");
+				if (cls_export) F->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+			};
+			mk(class_lifecycle_symbol(cd, ".__new__"), nft);
+			mk(class_lifecycle_symbol(cd, ".__retain__"), rcft);
+			mk(class_lifecycle_symbol(cd, ".__release__"), rcft);
+			mk(class_lifecycle_symbol(cd, ".__delete__"), rcft);
+		}
+	}
+
+	// 定义阶段（后于普通函数体）：方法体 + 四件套体。
+	void gen_class_definitions(const TranslationUnit &tu)
+	{
+		for (const auto &cd : tu.classes)
+		{
+			if (cd.tag.empty()) continue;
+			if (!in_cur_bucket(cd.source_module_key)) continue; // 仅 owner 桶发射定义体（他桶只有声明）
+			for (const auto &cm : cd.methods) gen_class_method(cd, cm);
+			gen_class_lifecycle(cd);
 		}
 	}
 
@@ -3582,8 +4141,22 @@ struct CodeGenImpl
 			{
 				auto saved_vars = vars_;
 				auto saved_types = var_types_;
+				// P300 Co class：块作用域进一帧，出域按逆序 release（仅当本帧仍存活且当前块未终止）。
+				const std::size_t rc_depth0 = rc_frames_.size();
+				rc_frames_.emplace_back();
 				for (const auto &inner : s->body)
 					gen_stmt(inner, F);
+				if (rc_frames_.size() > rc_depth0)
+				{
+					llvm::BasicBlock *cur = builder.GetInsertBlock();
+					const bool live = cur && (cur->empty() || !cur->back().isTerminator());
+					if (live)
+					{
+						auto &fr = rc_frames_.back();
+						for (auto rit = fr.rbegin(); rit != fr.rend(); ++rit) rc_release_slot(*rit);
+					}
+					rc_frames_.pop_back();
+				}
 				vars_ = std::move(saved_vars);
 				var_types_ = std::move(saved_types);
 			}
@@ -3605,21 +4178,49 @@ struct CodeGenImpl
 				if (rv->getType() != rt && !rt->isVoidTy() &&
 					!rt->isStructTy() && !rt->isArrayTy())
 					rv = convert_value(rv, rt, get_expr_ctype(s->expr));
+				release_rc_frames_emit(0); // P300 Co class：返回路径仅发射释放、不弹 C++ 栈
 				builder.CreateRet(rv);
 			}
 			else if (in_synthesized_main_body_)
 			{
 				// P211：顶层裸 `return;` 无回返値 → 合成 main 以退出码 0 返回（i32 ret void 会 verifier 失败）
+				release_rc_frames_emit(0); // P300 Co class：顶层裸 return 路径仅发射释放
 				builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0));
 			}
 			else
+			{
+				release_rc_frames_emit(0); // P300 Co class：void 返回路径仅发射释放、不弹栈
 				builder.CreateRetVoid();
+			}
 			break;
 		}
 		case StmtKind::ExprStmt:
 			if (s->expr)
 				gen_expr(s->expr);
 			break;
+		case StmtKind::Delete:
+		{
+			// P300 Co class（0.4.0）：强制销毁——绕过引用计数。load 句柄 → call C.__delete__（dtor+级联 release 成员+free）
+			//   → 槽置 null（出域 release 见 null 跳过、不二次释放）。sema 已确保操作数为具名 class 句柄变量。
+			if (s->expr)
+			{
+				// VarRef 的 Expr::type 未必回填，走 codegen 类型环境解出句柄类型。
+				CTypePtr ct0 = get_expr_ctype(s->expr);
+				if (ct0 && ct0->kind == TypeKind::Class && !ct0->tag.empty())
+				{
+					const std::string ctag = ct0->tag;
+					const ClassDef *cd = class_def_of(ctag);
+					llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx);
+					llvm::Value *slot = gen_lvalue_addr(s->expr);
+					llvm::Value *h = builder.CreateLoad(ptr_ty, slot);
+					llvm::Function *df = cd ? class_lifecycle_ref(*cd, ".__delete__", class_rc_ft())
+					                           : module->getFunction(ctag + ".__delete__");
+					if (df) builder.CreateCall(df, {h});
+					builder.CreateStore(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr_ty)), slot);
+				}
+			}
+			break;
+		}
 		case StmtKind::Decl:
 		{
 			// 块作用域函数声明（如 `int f1(char *);`）：不占存储、不绑 vars_——否则调用
@@ -3790,6 +4391,33 @@ struct CodeGenImpl
 					builder.CreateStore(v, addr);
 				}
 			}
+			// P300 Co class：类句柄声明——无初值→置 null；非 static/extern →入当前 RC 帧（逆序 release）。
+			if (s->var_type && s->var_type->kind == TypeKind::Class && !s->is_static && !s->is_extern)
+			{
+				std::string ctag = s->var_type->tag;
+				if (ctag.empty()) { auto vt = var_types_.find(s->var_name); if (vt != var_types_.end() && vt->second) ctag = vt->second->tag; }
+				if (!s->var_init)
+					builder.CreateStore(llvm::ConstantPointerNull::get(
+						llvm::cast<llvm::PointerType>(llvm::PointerType::getUnqual(ctx))), addr);
+				// 拷贝初始化 `C c = <已持有句柄>;`（非新值）→ retain 共享计数。
+				//   黑名单口径（与 sema/assign 一致）：New/Call/InitList 均为无主新值（计数已为 1）不 retain，
+				//   其余形态（VarRef/Member/Index/Ternary…）均可能读现有拥有句柄 → 必须 retain，否则出域 release 过度释放。
+				else if (!ctag.empty() && s->var_init &&
+					s->var_init->kind != ExprKind::New &&
+					s->var_init->kind != ExprKind::Call &&
+					s->var_init->kind != ExprKind::InitList)
+				{
+					const ClassDef *kcd = class_def_of(ctag);
+					llvm::Function *rt = kcd ? class_lifecycle_ref(*kcd, ".__retain__", class_rc_ft()) : nullptr;
+					if (rt)
+					{
+						llvm::Value *pv = builder.CreateLoad(llvm::PointerType::getUnqual(ctx), addr);
+						builder.CreateCall(rt, {pv});
+					}
+				}
+				if (!ctag.empty() && !rc_frames_.empty())
+					rc_frames_.back().push_back({addr, ctag});
+			}
 			break;
 		}
 		case StmtKind::If:
@@ -3827,7 +4455,7 @@ struct CodeGenImpl
 			llvm::Value *cond = gen_cond(s->expr);
 			builder.CreateCondBr(cond, body_bb, end_bb);
 			builder.SetInsertPoint(body_bb);
-			loop_stack_.push_back({end_bb, cond_bb});
+			loop_stack_.push_back({end_bb, cond_bb, rc_frames_.size()});
 			gen_stmt(s->then_branch, F);
 			loop_stack_.pop_back();
 			if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
@@ -3842,7 +4470,7 @@ struct CodeGenImpl
 			llvm::BasicBlock *end_bb = llvm::BasicBlock::Create(ctx, "do.end", F);
 			builder.CreateBr(body_bb);
 			builder.SetInsertPoint(body_bb);
-			loop_stack_.push_back({end_bb, cond_bb});
+			loop_stack_.push_back({end_bb, cond_bb, rc_frames_.size()});
 			gen_stmt(s->then_branch, F);
 			loop_stack_.pop_back();
 			if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
@@ -3872,7 +4500,7 @@ struct CodeGenImpl
 			else
 				builder.CreateBr(body_bb); // 无 cond = 始终为真
 			builder.SetInsertPoint(body_bb);
-			loop_stack_.push_back({end_bb, incr_bb});
+			loop_stack_.push_back({end_bb, incr_bb, rc_frames_.size()});
 			gen_stmt(s->then_branch, F);
 			loop_stack_.pop_back();
 			if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
@@ -3888,6 +4516,9 @@ struct CodeGenImpl
 		{
 			if (!loop_stack_.empty())
 			{
+				// P300：break 仅终结当前 IR 路径，先按目标帧深度发射 release（不弹 C++ 栈，
+				//   块出域仍负责 pop），再 br 到出口，修循环体句柄泄漏（补 §5.5）。
+				release_rc_frames_emit(loop_stack_.back().rc_depth);
 				if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
 					builder.CreateBr(loop_stack_.back().break_target);
 			}
@@ -3900,6 +4531,8 @@ struct CodeGenImpl
 		{
 			if (!loop_stack_.empty() && loop_stack_.back().continue_target)
 			{
+				// P300：continue 进入下一迭代 = 退出本轮块作用域，发射释放循环体帧（不弹栈）。
+				release_rc_frames_emit(loop_stack_.back().rc_depth);
 				if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
 					builder.CreateBr(loop_stack_.back().continue_target);
 			}
@@ -3912,6 +4545,11 @@ struct CodeGenImpl
 			break;
 		case StmtKind::Goto:
 		{
+			// P300：goto 退出比目标标签更内层的块作用域时，须在转移前释放那些帧句柄（仅发射、不弹栈）。
+			//   目标深度已知（向后 goto，标签已发射）→ 释放到该深度；未知（向前 goto）则由块出域/函数尾
+			//   兜底——goto 跨入声明点的形态本批按方案风险项#4 不支持。
+			if (auto ld = label_rc_depth_.find(s->label_name); ld != label_rc_depth_.end())
+				release_rc_frames_emit(ld->second);
 			llvm::BasicBlock *&target = label_blocks_[s->label_name];
 			if (!target)
 				target = llvm::BasicBlock::Create(ctx, ("label." + s->label_name).c_str(), F);
@@ -3934,6 +4572,7 @@ struct CodeGenImpl
 			if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
 				builder.CreateBr(lbl_bb);
 			builder.SetInsertPoint(lbl_bb);
+			label_rc_depth_[s->label_name] = rc_frames_.size(); // P300：记录标签处 RC 帧深度，供 goto 释放
 			if (s->then_branch)
 				gen_stmt(s->then_branch, F);
 			break;
@@ -3998,7 +4637,7 @@ struct CodeGenImpl
 				break;
 			}
 		}
-		loop_stack_.push_back({switch_end, cont_target});
+		loop_stack_.push_back({switch_end, cont_target, rc_frames_.size()});
 		// 体内按源码顺序线性发射；Case/Default 经 gen_stmt 的 label 分支重定向到各自 BB。
 		// 前导非 case 语句落进此 entry（C 语义本就不可达，属合法不可达块，-O 后清除）。
 		llvm::BasicBlock *entry = llvm::BasicBlock::Create(ctx, "switch.body", F);
@@ -4836,6 +5475,53 @@ struct CodeGenImpl
 				arg_cts.push_back(get_expr_ctype(a));
 				args.push_back(gen_expr(a));
 			}
+			// P300 Co class：obj.method(args) 实例方法（prepended this）/ Class::method(args) 静态方法。
+			if (e->lhs && e->lhs->kind == ExprKind::Member &&
+				(e->lhs->op == "." || e->lhs->op == "::") && !e->lhs->q_func && !e->lhs->q_global)
+			{
+				const bool dc = (e->lhs->op == "::");
+				std::string ctag; llvm::Value *thisptr = nullptr;
+				if (dc)
+				{
+					if (e->lhs->lhs && e->lhs->lhs->kind == ExprKind::VarRef) ctag = e->lhs->lhs->name;
+				}
+				else
+				{
+					const ExprPtr &b = e->lhs->lhs;
+					if (b && b->kind == ExprKind::ThisRef) { ctag = cur_class_tag_; thisptr = cur_this_; }
+					else if (b)
+					{
+						CTypePtr bt = get_expr_ctype(b);
+						if (bt && bt->kind == TypeKind::Class) { ctag = bt->tag; thisptr = gen_expr(b); }
+					}
+				}
+				auto cdit = ctag.empty() ? class_defs_.end() : class_defs_.find(ctag);
+				if (cdit != class_defs_.end())
+				{
+					const ClassDef *cd = cdit->second;
+					const ClassMethod *mm = nullptr;
+					for (const auto &cm : cd->methods)
+						if (!cm.is_ctor && !cm.is_dtor && cm.name == e->lhs->name) { mm = &cm; break; }
+					if (mm)
+					{
+						const bool pass_this = !mm->is_static;
+						std::vector<llvm::Value *> cargs; std::vector<CTypePtr> ccts;
+						if (pass_this)
+						{
+							cargs.push_back(thisptr ? thisptr : llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx)));
+							ccts.push_back(nullptr);
+						}
+						for (std::size_t i = 0; i < args.size(); ++i) { cargs.push_back(args[i]); ccts.push_back(arg_cts[i]); }
+						llvm::Function *callee = class_method_ref(*cd, *mm);
+						if (callee)
+						{
+							coerce_call_args(callee->getFunctionType(), cargs, ccts);
+							llvm::Value *r = builder.CreateCall(callee, cargs);
+							return r;
+						}
+					}
+				}
+			}
 			// 路 B 阶段1b-iii：限定直接调用 m.f() —— lhs 为已绑定 q_func 的 Member → 按符号直调（非间接）。
 			if (e->lhs && e->lhs->kind == ExprKind::Member && e->lhs->q_func)
 			{
@@ -4975,6 +5661,19 @@ struct CodeGenImpl
 				return builder.CreateLoad(vt, gv);
 			}
 			if (e->q_func) return qualified_func_ref(e->q_func); // 函数名作值：函数地址（指针）
+			// P300 Co class：Class::static_member 读取（静态类变量）。
+			if (e->op == "::" && e->lhs && e->lhs->kind == ExprKind::VarRef &&
+				class_defs_.count(e->lhs->name))
+			{
+				CTypePtr mt = nullptr;
+				llvm::GlobalVariable *sgv = class_static_ref(e->lhs->name, e->name, &mt);
+				if (sgv)
+				{
+					llvm::Type *vt = mt ? to_llvm_alloca_type(mt) : llvm::Type::getInt32Ty(ctx);
+					if (vt->isArrayTy() || vt->isStructTy()) return sgv;
+					return builder.CreateLoad(vt, sgv);
+				}
+			}
 			// rvalue: 取成员地址
 			llvm::Value *addr = gen_member_addr(e);
 			// 确定成员类型（decl_tag/decl_idx 指向字段真正声明处，支持匿名 union 名提升）
@@ -5010,9 +5709,17 @@ struct CodeGenImpl
 			}
 			// 普通成员
 			llvm::Type *field_ty = llvm::Type::getInt32Ty(ctx);
-			auto sd = struct_defs_.find(tag);
-			if (sd != struct_defs_.end() && idx < sd->second->members.size())
-				field_ty = to_llvm_alloca_type(sd->second->members[idx].type);
+			auto cit = class_defs_.find(tag);
+			if (cit != class_defs_.end())
+			{
+				for (const auto &m : cit->second->members)
+					if (m.name == e->name && !m.is_static) { field_ty = to_llvm_alloca_type(m.type); break; }
+			}
+			else {
+				auto sd = struct_defs_.find(tag);
+				if (sd != struct_defs_.end() && idx < sd->second->members.size())
+					field_ty = to_llvm_alloca_type(sd->second->members[idx].type);
+			}
 			// 数组/struct 成员返回地址（decay），不 load
 			if (field_ty->isArrayTy() || field_ty->isStructTy())
 				return addr;
@@ -5060,6 +5767,26 @@ struct CodeGenImpl
 			if (assoc) return gen_expr((*assoc)->rhs);
 			errs.push_back(Error{e->loc.file, Pos{e->loc.line, e->loc.column}, "_Generic: no matching type and no default"});
 			return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+		}
+		case ExprKind::ThisRef:
+			// P300 Co class：this → 当前方法实例基址（类体外部为 null）
+			if (!cur_this_) return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx));
+			return cur_this_;
+		case ExprKind::New:
+		{
+			// P300 Co class：new C(args) → call C.__new__(args)，返回堆基址（refcount=1）
+			const std::string tag = e->type ? e->type->tag : e->name;
+			const ClassDef *ncd = class_def_of(tag);
+			llvm::Function *nf = ncd ? class_lifecycle_ref(*ncd, ".__new__", class_new_ft(*ncd)) : nullptr;
+			if (!nf)
+			{
+				errs.push_back(Error{e->loc.file, Pos{e->loc.line, e->loc.column}, "new of undefined class '" + tag + "'"});
+				return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(ctx));
+			}
+			std::vector<llvm::Value *> cargs; std::vector<CTypePtr> ccts;
+			for (const auto &a : e->args) { ccts.push_back(get_expr_ctype(a)); cargs.push_back(gen_expr(a)); }
+			coerce_call_args(nf->getFunctionType(), cargs, ccts);
+			return builder.CreateCall(nf, cargs);
 		}
 		default:
 			return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
@@ -5498,6 +6225,39 @@ struct CodeGenImpl
 			emit_memcpy(dst, src, sz);
 			return dst;
 		}
+		// P300 Co class：句柄赋值 c1 = c2 / c = new C()。
+		//   非新（共享句柄）：先 retain 新值再 release 旧值（自赋 c=c 先 +1 后 -1 安全）；
+		//   新值（rhs 为 New）：已 refcount=1 唯一归属 → 不 retain，仅 release 旧值。
+		if (lhs_t && lhs_t->kind == TypeKind::Class && e->op == "=")
+		{
+			const std::string &ctag = lhs_t->tag;
+			const ClassDef *acd = class_def_of(ctag);
+			llvm::Value *dst = gen_lvalue_addr(e->lhs);
+			llvm::Value *newv = gen_expr(e->rhs);
+			llvm::Type *pty = llvm::PointerType::getUnqual(ctx);
+			// P300 形参借用（0.4.0 收尾）：dst 为借用形参槽 → 重绑定按裸指针对待，纯 store：
+			//   不 retain 新值、不 release 原借用对象（所有权始终在调用方，callee 只借用）。
+			if (borrowed_slots_.count(dst))
+			{
+				builder.CreateStore(newv, dst);
+				return newv;
+			}
+			// P300：fresh 黑名单口径与拷贝初始化一致——New/Call/InitList 均为无主新值不 retain，
+			//   避免 `c = f()`（f 返无主句柄）被误 retain 至计数 2 而永不归零。
+			const bool fresh = e->rhs && (e->rhs->kind == ExprKind::New ||
+				e->rhs->kind == ExprKind::Call || e->rhs->kind == ExprKind::InitList);
+			if (!fresh)
+			{
+				if (llvm::Function *rt = acd ? class_lifecycle_ref(*acd, ".__retain__", class_rc_ft()) : nullptr)
+					builder.CreateCall(rt, {newv});
+			}
+			llvm::Value *oldv = builder.CreateLoad(pty, dst);
+			// P300：release 旧值改走 dunder helper（与 retain 对称；单模块 dunder==裸名零回归，跨模块 class 成员赋值取符号正确）。
+			if (llvm::Function *rf = acd ? class_lifecycle_ref(*acd, ".__release__", class_rc_ft()) : module->getFunction(ctag + ".__release__"))
+				builder.CreateCall(rf, {oldv});
+			builder.CreateStore(newv, dst);
+			return newv; // P300：class 值是句柄本身（非槽地址），修链式赋值 `c = (b = a)` 将栈地址当对象
+		}
 		// 位域写访问: read-modify-write
 		if (e->lhs->kind == ExprKind::Member)
 		{
@@ -5929,6 +6689,19 @@ struct CodeGenImpl
 		CTypePtr struct_member_impl(const std::string &tag, const std::string &field, int depth)
 		{
 			if (depth > 16) return nullptr;
+			// P300 Co class：先查 class_defs_ 成员（类名与 struct 名共享命名空间；含 static 供 `::` 类型解析）。
+			//   缺此分支则 class 句柄作成员时 get_expr_ctype 解不出成员类型→base_tag 空→成员访问退化按
+			//   字段地址当对象基址 GEP 到空 %struct.（unsized）。与 sema 侧 struct_member_impl 对称。
+			if (depth == 0)
+			{
+				auto cit = self->class_defs_.find(tag);
+				if (cit != self->class_defs_.end())
+				{
+					for (const auto &m : cit->second->members)
+						if (!m.name.empty() && m.name == field) return m.type;
+					return nullptr;
+				}
+			}
 			auto sd = self->struct_defs_.find(tag);
 			if (sd == self->struct_defs_.end()) return nullptr;
 			for (const auto &m : sd->second->members)
@@ -6001,6 +6774,22 @@ struct CodeGenImpl
 	                   std::vector<std::pair<std::string, unsigned>> &chain)
 	{
 		if (depth > 16) return false;
+		// P300 Co class：一级成员在类实例中按声明序定位（field_index_map_ 已携 pos+1 偏移）。
+		if (depth == 0)
+		{
+			auto cit = class_defs_.find(tag);
+			if (cit != class_defs_.end())
+			{
+				const auto &cm = cit->second->members;
+				for (unsigned i = 0; i < cm.size(); ++i)
+					if (!cm[i].name.empty() && cm[i].name == field && !cm[i].is_static) {
+						slot = i; decl_tag = tag; decl_idx = i;
+						chain.push_back({tag, i});
+						return true;
+					}
+				return false;
+			}
+		}
 		auto sd = struct_defs_.find(tag);
 		if (sd == struct_defs_.end()) return false;
 		const auto &mem = sd->second->members;
@@ -6036,10 +6825,19 @@ struct CodeGenImpl
 	{
 		std::string tag;
 		const ExprPtr &base = e->lhs;
+		// P300 Co class：:: 静态访问基名即类名。
+		if (e->op == "::")
+		{
+			if (base && base->kind == ExprKind::VarRef) tag = base->name;
+			MemberInfo mi_dc; mi_dc.base_tag = tag; mi_dc.decl_tag = tag; mi_dc.decl_idx = 0; mi_dc.slot = 0;
+			return mi_dc;
+		}
 		if (e->op == ".")
 		{
 			// obj.field: obj 是变量或另一个成员
-			if (base->kind == ExprKind::VarRef)
+			if (base->kind == ExprKind::ThisRef) // P300 Co class：this.field
+				tag = cur_class_tag_;
+			else if (base->kind == ExprKind::VarRef)
 			{
 				auto vt = var_types_.find(base->name);
 				if (vt != var_types_.end() && vt->second)
@@ -6154,8 +6952,16 @@ struct CodeGenImpl
 		// 路 B 阶段1b-iii：限定访问左值形（m.x = / &m.x / m.f 取函数地址）——直接返回目标符号地址。
 		if (e->q_global) return qualified_global_addr(e);
 		if (e->q_func) return qualified_func_ref(e->q_func);
+		// P300 Co class：Class::static_member 左值（写静态类变量）。
+		if (e->op == "::" && e->lhs && e->lhs->kind == ExprKind::VarRef &&
+			class_defs_.count(e->lhs->name))
+		{
+			if (llvm::GlobalVariable *sgv = class_static_ref(e->lhs->name, e->name, nullptr)) return sgv;
+		}
 		MemberInfo mi = resolve_member_info(e);
-		llvm::Value *addr = (e->op == ".") ? gen_lvalue_addr(e->lhs) : gen_expr(e->lhs);
+		// P300 Co class：类句柄 heap-only，成员访问按指针基址（等同 ->）。
+		const bool class_base = class_defs_.count(mi.base_tag);
+		llvm::Value *addr = (e->op == "." && !class_base) ? gen_lvalue_addr(e->lhs) : gen_expr(e->lhs);
 		if (mi.chain.empty())
 		{
 			// 未命中：维持旧默认（struct 按 0 号槽 GEP、union 直接基址）
