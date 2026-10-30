@@ -17,109 +17,70 @@
 //
 // 排列顺序：各库段内按函数名字母序（case-sensitive，A/W 变体自然相邻）；段序 kernel32→user32→gdi32。
 
-// —— Win32 结构布局（public · x64/LLP64 自然对齐；按依赖序 POINT→RECT→MSG→PAINTSTRUCT→WNDCLASS→SYSTEMTIME→LARGE_INTEGER→SIZE→LOGPEN→WNDCLASSEX→WNDCLASSEXW→MINMAXINFO→MONITORINFO→OPENFILENAMEW→BROWSEINFOW→STARTUPINFOW→PROCESS_INFORMATION→SECURITY_ATTRIBUTES→OVERLAPPED→FILE_NOTIFY_INFORMATION→SCROLLINFO→TOOLINFOW→CRITICAL_SECTION→INITCOMMONCONTROLSEX→GUID→LUID→MEMORYSTATUSEX→DWM_BLURBEHIND→CHOOSECOLORW→FILETIME→WIN32_FIND_DATAW→NMHDR→NMCUSTOMDRAW→FLASHWINFO→TRACKMOUSEEVENT→CREATESTRUCTW→DRAWITEMSTRUCT→MEASUREITEMSTRUCT→NOTIFYICONDATAW）——
-// LONG=long(4)·DWORD=unsigned long(4)·句柄/PTR=void*(8)·LPARAM=long long(8)。原型里句柄仍作 void*（不透明句柄、回调指针、多态输出缓冲、可选 SECURITY_ATTRIBUTES 按设计留 void*，非漏收紧）。已定义布局的 39 类型（38 struct：POINT/RECT/MSG/PAINTSTRUCT/WNDCLASS/SYSTEMTIME/SIZE/LOGPEN/WNDCLASSEX/WNDCLASSEXW/MINMAXINFO/MONITORINFO/OPENFILENAMEW/BROWSEINFOW/STARTUPINFOW/PROCESS_INFORMATION/SECURITY_ATTRIBUTES/OVERLAPPED/FILE_NOTIFY_INFORMATION/SCROLLINFO/TOOLINFOW/CRITICAL_SECTION/INITCOMMONCONTROLSEX/GUID/LUID/MEMORYSTATUSEX/DWM_BLURBEHIND/CHOOSECOLORW/FILETIME/WIN32_FIND_DATAW/NMHDR/NMCUSTOMDRAW/FLASHWINFO/TRACKMOUSEEVENT/CREATESTRUCTW/DRAWITEMSTRUCT/MEASUREITEMSTRUCT/NOTIFYICONDATAW + 1 union：LARGE_INTEGER）凡对应之新函数形参均用具体 struct*/union*（既有 RegCreateKeyExW 之可选 lpSecurityAttributes 依「不动既有原型」仍留 void*；注：MINMAXINFO 系 WM_GETMINMAXINFO 的 lParam 载荷、无函数原型引用）。仍留 void* 的结构类形参＝GetTextMetricsA/W 的 TEXTMETRIC*（字段多、手写布局易错且无运行期证伪、留待 win32metadata 自动生成）；其余尚无 public 布局的结构亦仍 void*。
+// —— Win32 基础类型别名（模块内，不导出）——
+//   目的：让本文件内部声明与 SDK 头文件逐字同形（写 `DWORD cbSize;` 而非 `unsigned int cbSize;`）。
+//   性质：colang 的 typedef 名不跨模块（导入方看不到，实测显式 `import DWORD` 亦报未声明），
+//   故这是纯模块内别名——消费方仍按 struct 名用成员，对外契约零变化。
+//   每个别名与其底层类型严格同一：结构体布局/ABI 与改前逐字节一致（改前/改后全 39 类型
+//   sizeof 与关键字段偏移 A/B 比对必须全等）。
+//   沿既有设计保留的例外：WPARAM 与句柄族作 void*；SDK 中为函数指针的回调成员（lpfnHook/lpfn）及不透明保留字段（pidlRoot/pvReserved/lpReserved）仍作 void*。
+//   拼写取型：本文件不再出现 long/unsigned long——32 位一律写 int/unsigned int（long 的定义后续会改，避开连带漂移）、64 位写 long long/unsigned long long。
+typedef unsigned int DWORD;               // DWORD = unsigned int (4)
+typedef unsigned int ULONG;               // ULONG = unsigned int (4)
+typedef unsigned int UINT;                // UINT  = unsigned int (4)
+typedef int LONG;                         // LONG  = int (4)
+typedef int INT;                          // INT   = int (4)
+typedef int BOOL;                         // BOOL  = int (4)
+typedef unsigned short WORD;              // WORD  = unsigned short (2)
+typedef unsigned char BYTE;               // BYTE  = unsigned char (1)
+typedef long long LONGLONG;               // LONGLONG = long long (8)
+typedef unsigned long long ULONGLONG;     // ULONGLONG = unsigned long long (8)
+typedef unsigned long long DWORDLONG;     // DWORDLONG = unsigned long long (8)
+typedef long long LONG_PTR;               // LONG_PTR = long long (8)
+typedef unsigned long long ULONG_PTR;     // ULONG_PTR = unsigned long long (8)
+typedef unsigned long long UINT_PTR;      // UINT_PTR = unsigned long long (8)
+typedef unsigned long long DWORD_PTR;     // DWORD_PTR = unsigned long long (8)
+typedef long long LPARAM;                 // LPARAM = long long (8)
+typedef long long LRESULT;                // LRESULT = long long (8)
+typedef unsigned int COLORREF;            // COLORREF = unsigned int (4)
+typedef wchar_t WCHAR;                    // WCHAR = wchar_t (2)
+typedef void *HANDLE;                     // 句柄族一律 void* (8)
+typedef void *HWND;
+typedef void *HDC;
+typedef void *HINSTANCE;
+typedef void *HMENU;
+typedef void *HICON;
+typedef void *HCURSOR;
+typedef void *HBRUSH;
+typedef void *HRGN;
+typedef void *LPVOID;
+typedef void *WPARAM;                     // 本文件既有映射：WPARAM 作 void*（SDK 为 UINT_PTR）
+typedef char *LPSTR;
+typedef const char *LPCSTR;
+typedef wchar_t *LPWSTR;
+typedef const wchar_t *LPCWSTR;
+typedef unsigned char *LPBYTE;
+typedef long long (*WNDPROC)(HWND, UINT, WPARAM, LPARAM);   // 即 LRESULT (CALLBACK*)(HWND,UINT,WPARAM,LPARAM)
+
+// —— Win32 结构布局（public · x64/LLP64 自然对齐；此处只留跨段共用或无函数原型引用的通用结构，按依赖序 POINT→RECT→LARGE_INTEGER→MINMAXINFO→FILE_NOTIFY_INFORMATION→TOOLINFOW→GUID→LUID→NMHDR→NMCUSTOMDRAW→CREATESTRUCTW→DRAWITEMSTRUCT→MEASUREITEMSTRUCT）——
+//   单库专用结构（仅被同一个库的函数引用）不留在本段，就近定义在对应库段的「<lib> 专用结构」小节、紧邻其使用者；判据＝原型区里该 struct 只出现在一个库段。
+// 字段拼写＝SDK 别名（见上方别名段），底层宽度不变：DWORD/ULONG/COLORREF/UINT=unsigned int(4)·LONG/INT/BOOL=int(4)·WORD=unsigned short(2)·BYTE=unsigned char(1)·句柄/PTR/WPARAM=void*(8)·LPARAM/LRESULT/LONG_PTR=long long(8)·ULONGLONG/DWORDLONG/ULONG_PTR/UINT_PTR/DWORD_PTR=unsigned long long(8)；全文件不写 long/unsigned long（long 的定义将来会改，免连带漂移）。函数原型段仍按底层类型书写（本批只对齐结构体字段）；原型里句柄仍作 void*（不透明句柄、回调指针、多态输出缓冲、可选 SECURITY_ATTRIBUTES 按设计留 void*，非漏收紧）。已定义布局的 39 类型（38 struct + 1 union：LARGE_INTEGER；其中 13 个跨段共用或无原型引用者留在本段，26 个单库专用者下沉到各自库段——kernel32 9、user32 9、gdi32 2、comdlg32 2、shell32 2、comctl32 1、dwmapi 1）凡对应之新函数形参均用具体 struct*/union*（既有 RegCreateKeyExW 之可选 lpSecurityAttributes 依「不动既有原型」仍留 void*；注：MINMAXINFO 系 WM_GETMINMAXINFO 的 lParam 载荷、无函数原型引用）。仍留 void* 的结构类形参＝GetTextMetricsA/W 的 TEXTMETRIC*（字段多、手写布局易错且无运行期证伪、留待 win32metadata 自动生成）；其余尚无 public 布局的结构亦仍 void*。
 public struct POINT
 {
-	long x;
-	long y;
+	LONG x;
+	LONG y;
 };
 public struct RECT
 {
-	long left;
-	long top;
-	long right;
-	long bottom;
-};
-public struct MSG
-{
-	void *hwnd;
-	unsigned long message;
-	void *wParam;
-	long long lParam;
-	unsigned long time;
-	struct POINT pt;
-};
-public struct PAINTSTRUCT
-{
-	void *hdc;
-	int fErase;
-	struct RECT rcPaint;
-	int fRestore;
-	int fIncUpdate;
-	unsigned char rgbReserved[32];
-};
-public struct WNDCLASS
-{
-	unsigned long style;
-	long long (*lpfnWndProc)(void *, unsigned int, void *, long long);
-	int cbClsExtra;
-	int cbWndExtra;
-	void *hInstance;
-	void *hIcon;
-	void *hCursor;
-	void *hbrBackground;
-	const char *lpszMenuName;
-	const char *lpszClassName;
-};
-public struct SYSTEMTIME
-{
-	unsigned short wYear;
-	unsigned short wMonth;
-	unsigned short wDayOfWeek;
-	unsigned short wDay;
-	unsigned short wHour;
-	unsigned short wMinute;
-	unsigned short wSecond;
-	unsigned short wMilliseconds;
+	LONG left;
+	LONG top;
+	LONG right;
+	LONG bottom;
 };
 public union LARGE_INTEGER
 {
-	struct { unsigned long LowPart; long HighPart; };
-	long long QuadPart;
-};
-public struct SIZE
-{
-	long cx;
-	long cy;
-};
-public struct LOGPEN
-{
-	struct POINT poPenLocation;
-	int iPenWidth;
-	unsigned long oPenColor;
-};
-// WNDCLASSEX 按 A 系建模（lpszMenuName/lpszClassName 取 const char*，与既存 WNDCLASS 同风格），配 RegisterClassExA 使用；cbSize 须由调用方填 sizeof。
-public struct WNDCLASSEX
-{
-	unsigned long cbSize;
-	unsigned long style;
-	long long (*lpfnWndProc)(void *, unsigned int, void *, long long);
-	int cbClsExtra;
-	int cbWndExtra;
-	void *hInstance;
-	void *hIcon;
-	void *hCursor;
-	void *hbrBackground;
-	const char *lpszMenuName;
-	const char *lpszClassName;
-	void *hIconSm;
-};
-// WNDCLASSEXW = WNDCLASSEX 的宽字符版（lpszMenuName/lpszClassName 取 const wchar_t*），配 RegisterClassExW 使用；布局与 SDK tagWNDCLASSEXW 逐字段一致（cbSize/style 为 UINT、lpfnWndProc 为 WNDPROC、余为句柄 void*）；cbSize 须由调用方填 sizeof。
-public struct WNDCLASSEXW
-{
-	unsigned long cbSize;
-	unsigned long style;
-	long long (*lpfnWndProc)(void *, unsigned int, void *, long long);
-	int cbClsExtra;
-	int cbWndExtra;
-	void *hInstance;
-	void *hIcon;
-	void *hCursor;
-	void *hbrBackground;
-	const wchar_t *lpszMenuName;
-	const wchar_t *lpszClassName;
-	void *hIconSm;
+	struct { DWORD LowPart; LONG HighPart; };
+	LONGLONG QuadPart;
 };
 // MINMAXINFO：WM_GETMINMAXINFO 的 lParam 指向本结构（5 个 POINT）；布局对照 SDK tagMINMAXINFO。
 public struct MINMAXINFO
@@ -130,341 +91,375 @@ public struct MINMAXINFO
 	struct POINT ptMinTrackSize;
 	struct POINT ptMaxTrackSize;
 };
-// MONITORINFO：GetMonitorInfoW 的第二参数（cbSize 需先填 sizeof）；布局对照 SDK tagMONITORINFO（DWORD cbSize / RECT rcMonitor / RECT rcWork / DWORD dwFlags）。
-public struct MONITORINFO
-{
-	unsigned long cbSize;
-	struct RECT rcMonitor;
-	struct RECT rcWork;
-	unsigned long dwFlags;
-};
-// OPENFILENAMEW：GetOpenFileNameW/GetSaveFileNameW 参数（commdlg.h tagOFNW）。cbSize/各 DWORD 作 unsigned long，句柄(hwndOwner/hInstance)/回调(lpfnHook)/保留(pvReserved) 作 void*，lCustData=LPARAM 作 long long，WORD 索引起止作 unsigned short；lpstrFile/lpstrCustomFilter/lpstrFileTitle 为调用方分配的 wchar_t 缓冲区，只读入参用 const wchar_t*。cbSize 须由调用方填 sizeof。对照 SDK 10.0.26100.0 逐字段核对。
-public struct OPENFILENAMEW
-{
-	unsigned long lStructSize;
-	void *hwndOwner;
-	void *hInstance;
-	const wchar_t *lpstrFilter;
-	wchar_t *lpstrCustomFilter;
-	unsigned long nMaxCustFilter;
-	unsigned long nFilterIndex;
-	wchar_t *lpstrFile;
-	unsigned long nMaxFile;
-	wchar_t *lpstrFileTitle;
-	unsigned long nMaxFileTitle;
-	const wchar_t *lpstrInitialDir;
-	const wchar_t *lpstrTitle;
-	unsigned long Flags;
-	unsigned short nFileOffset;
-	unsigned short nFileExtension;
-	const wchar_t *lpstrDefExt;
-	long long lCustData;
-	void *lpfnHook;
-	const wchar_t *lpTemplateName;
-	void *pvReserved;
-	unsigned long dwReserved;
-	unsigned long FlagsEx;
-};
-// BROWSEINFOW：SHBrowseForFolderW 参数（shlobj.h _BROWSEINFOW）。hwndOwner/pidlRoot/lpfn(回调)/作 void*，pszDisplayName 为调用方缓冲区 wchar_t*，lpszTitle 只读 const wchar_t*，ulFlags=UINT 作 unsigned int，lParam=LPARAM 作 long long，iImage=int。对照 SDK 核对。
-public struct BROWSEINFOW
-{
-	void *hwndOwner;
-	void *pidlRoot;
-	wchar_t *pszDisplayName;
-	const wchar_t *lpszTitle;
-	unsigned int ulFlags;
-	void *lpfn;
-	long long lParam;
-	int iImage;
-};
-
-// STARTUPINFOW：CreateProcessW 启动信息（进程/管道重定向用）；对照 SDK x64 tagSTARTUPINFOW。lpReserved/lpDesktop/lpTitle 实为 LPWSTR、此处按只读 const wchar_t* 声明不影响布局；cb 须由调用方填 sizeof。
-public struct STARTUPINFOW
-{
-	unsigned long cb;
-	const wchar_t *lpReserved;
-	const wchar_t *lpDesktop;
-	const wchar_t *lpTitle;
-	unsigned long dwX;
-	unsigned long dwY;
-	unsigned long dwXSize;
-	unsigned long dwYSize;
-	unsigned long dwXCountChars;
-	unsigned long dwYCountChars;
-	unsigned long dwFillAttribute;
-	unsigned long dwFlags;
-	unsigned short wShowWindow;
-	unsigned short cbReserved2;
-	unsigned char *lpReserved2;
-	void *hStdInput;
-	void *hStdOutput;
-	void *hStdError;
-};
-// PROCESS_INFORMATION：CreateProcessW 输出进程/线程句柄与 id；对照 SDK。
-public struct PROCESS_INFORMATION
-{
-	void *hProcess;
-	void *hThread;
-	unsigned long dwProcessId;
-	unsigned long dwThreadId;
-};
-// SECURITY_ATTRIBUTES：句柄继承/安全描述符（CreateProcessW/CreateFileW/CreatePipe 用）；对照 SDK。
-public struct SECURITY_ATTRIBUTES
-{
-	unsigned long nLength;
-	void *lpSecurityDescriptor;
-	int bInheritHandle;
-};
-// OVERLAPPED：异步 IO 状态块；SDK 的 union{Offset/OffsetHigh;Pointer} 摊成两 DWORD、x64 布局等价（32B）。
-public struct OVERLAPPED
-{
-	unsigned long long Internal;
-	unsigned long long InternalHigh;
-	unsigned long Offset;
-	unsigned long OffsetHigh;
-	void *hEvent;
-};
 // FILE_NOTIFY_INFORMATION：ReadDirectoryChangesW 输出条目（柔性 FileName、宽字符）。
 public struct FILE_NOTIFY_INFORMATION
 {
-	unsigned long NextEntryOffset;
-	unsigned long Action;
-	unsigned long FileNameLength;
-	wchar_t FileName[1];
-};
-// SCROLLINFO：Get/SetScrollInfo 滚动条状态；对照 SDK tagSCROLLINFO。cbSize 须由调用方填 sizeof。
-public struct SCROLLINFO
-{
-	unsigned int cbSize;
-	unsigned int fMask;
-	int nMin;
-	int nMax;
-	unsigned int nPage;
-	int nPos;
-	int nTrackPos;
+	DWORD NextEntryOffset;
+	DWORD Action;
+	DWORD FileNameLength;
+	WCHAR FileName[1];
 };
 // TOOLINFOW：SendMessage(TTM_ADDTOOLW) 的 tooltip 项（内嵌 struct RECT）；对照 SDK tagTOOLINFOW。cbSize 填 sizeof、uId=UINT_PTR。
 public struct TOOLINFOW
 {
-	unsigned int cbSize;
-	unsigned int uFlags;
-	void *hwnd;
-	unsigned long long uId;
+	UINT cbSize;
+	UINT uFlags;
+	HWND hwnd;
+	UINT_PTR uId;
 	struct RECT rect;
-	void *hinst;
-	wchar_t *lpszText;
-	long long lParam;
+	HINSTANCE hinst;
+	LPWSTR lpszText;
+	LPARAM lParam;
 	void *lpReserved;
-};
-// CRITICAL_SECTION：即 RTL_CRITICAL_SECTION（Initialize/Enter/Leave/DeleteCriticalSection 用）；对照 SDK x64。
-public struct CRITICAL_SECTION
-{
-	unsigned long long DebugInfo;
-	long LockCount;
-	long RecursionCount;
-	void *OwningThread;
-	void *LockSemaphore;
-	unsigned long long SpinCount;
-};
-// INITCOMMONCONTROLSEX：InitCommonControlsEx 的初始化请求；对照 SDK。dwSize 填 sizeof。
-public struct INITCOMMONCONTROLSEX
-{
-	unsigned long dwSize;
-	unsigned long dwICC;
 };
 // GUID：COM/注册表通用唯一标识；对照 SDK guiddef.h（Data4 为 8 字节数组）。sysmon 早期以私有别名 GUIDX 兜底，现行改用真名 GUID。
 public struct GUID
 {
-	unsigned long Data1;
-	unsigned short Data2;
-	unsigned short Data3;
-	unsigned char Data4[8];
+	DWORD Data1;
+	WORD Data2;
+	WORD Data3;
+	BYTE Data4[8];
 };
 // LUID：本地唯一标识符（显卡适配器/访问令牌）；对照 SDK winnt.h。sysmon 早期以私有别名 LUIDX 兜底，现行改用真名 LUID。
 public struct LUID
 {
-	unsigned long LowPart;
-	long HighPart;
-};
-// MEMORYSTATUSEX：GlobalMemoryStatusEx 的内存状态载荷；对照 SDK sysinfoapi.h。dwLength 填 sizeof。
-public struct MEMORYSTATUSEX
-{
-	unsigned long dwLength;
-	unsigned long dwMemoryLoad;
-	unsigned long long ullTotalPhys;
-	unsigned long long ullAvailPhys;
-	unsigned long long ullTotalPageFile;
-	unsigned long long ullAvailPageFile;
-	unsigned long long ullTotalVirtual;
-	unsigned long long ullAvailVirtual;
-	unsigned long long ullAvailExtendedVirtual;
-};
-// DWM_BLURBEHIND：DwmEnableBlurBehindWindow 的模糊描述；对照 SDK dwmapi.h。HRGN 句柄作 void*。
-public struct DWM_BLURBEHIND
-{
-	unsigned long dwFlags;
-	int fEnable;
-	void *hRgnBlur;
-	int fTransitionOnMaximized;
-};
-// CHOOSECOLORW：ChooseColorW 的颜色对话框参数；对照 SDK tagCHOOSECOLORW。COLORREF=unsigned long、LPARAM=long long、lpfnHook 函数指针作 void*。lStructSize 填 sizeof。
-public struct CHOOSECOLORW
-{
-	unsigned long lStructSize;
-	void *hwndOwner;
-	void *hInstance;
-	unsigned long rgbResult;
-	unsigned long *lpCustColors;
-	unsigned long Flags;
-	long long lCustData;
-	void *lpfnHook;
-	const wchar_t *lpTemplateName;
-};
-// FILETIME：100ns 计数时间（文件时间/FindData 载荷）；对照 SDK minwinbase.h。两 DWORD 组合为 64 位。
-public struct FILETIME
-{
-	unsigned long dwLowDateTime;
-	unsigned long dwHighDateTime;
-};
-// WIN32_FIND_DATAW：FindFirstFileW/FindNextFileW 的文件项；对照 SDK minwinbase.h。MAX_PATH=260、cAlternateFileName 为 8.3 名(14)。
-public struct WIN32_FIND_DATAW
-{
-	unsigned long dwFileAttributes;
-	struct FILETIME ftCreationTime;
-	struct FILETIME ftLastAccessTime;
-	struct FILETIME ftLastWriteTime;
-	unsigned long nFileSizeHigh;
-	unsigned long nFileSizeLow;
-	unsigned long dwReserved0;
-	unsigned long dwReserved1;
-	wchar_t cFileName[260];
-	wchar_t cAlternateFileName[14];
+	DWORD LowPart;
+	LONG HighPart;
 };
 // NMHDR：通用控件 WM_NOTIFY 通知头；对照 SDK commctrl.h。idFrom=UINT_PTR、hwndFrom=HWND。
 public struct NMHDR
 {
-	void *hwndFrom;
-	unsigned long long idFrom;
-	unsigned int code;
+	HWND hwndFrom;
+	UINT_PTR idFrom;
+	UINT code;
 };
-// NMCUSTOMDRAW：CDDS_* 自绘通知载荷（内嵌 struct NMHDR/RECT）；对照 SDK commctrl.h。dwItemSpec=UINT_PTR、lItemlParam=LPARAM。
+// NMCUSTOMDRAW：CDDS_* 自绘通知载荷（内嵌 struct NMHDR/RECT）；对照 SDK commctrl.h。dwItemSpec=DWORD_PTR、lItemlParam=LPARAM。
 public struct NMCUSTOMDRAW
 {
 	struct NMHDR hdr;
-	unsigned long dwDrawStage;
-	void *hdc;
+	DWORD dwDrawStage;
+	HDC hdc;
 	struct RECT rc;
-	unsigned long long dwItemSpec;
-	unsigned int uItemState;
-	long long lItemlParam;
-};
-// FLASHWINFO：FlashWindowEx 的任务栏/标题栏闪烁参数；对照 SDK WinUser.h。cbSize 填 sizeof、hwnd=HWND。
-public struct FLASHWINFO
-{
-	unsigned long cbSize;
-	void *hwnd;
-	unsigned long dwFlags;
-	unsigned int uCount;
-	unsigned long dwTimeout;
-};
-// TRACKMOUSEEVENT：TrackMouseEvent 的光标离开/悬停追踪参数；对照 SDK WinUser.h。cbSize 填 sizeof、hwndTrack=HWND。
-public struct TRACKMOUSEEVENT
-{
-	unsigned long cbSize;
-	unsigned long dwFlags;
-	void *hwndTrack;
-	unsigned long dwHoverTime;
+	DWORD_PTR dwItemSpec;
+	UINT uItemState;
+	LPARAM lItemlParam;
 };
 // CREATESTRUCTW：WM_CREATE 的 lParam 载荷；对照 SDK WinUser.h。句柄作 void*、lpszName/lpszClass 为 LPCWSTR。
 public struct CREATESTRUCTW
 {
-	void *lpCreateParams;
-	void *hInstance;
-	void *hMenu;
-	void *hwndParent;
+	LPVOID lpCreateParams;
+	HINSTANCE hInstance;
+	HMENU hMenu;
+	HWND hwndParent;
 	int cy;
 	int cx;
 	int y;
 	int x;
-	long style;
-	const wchar_t *lpszName;
-	const wchar_t *lpszClass;
-	unsigned long dwExStyle;
+	LONG style;
+	LPCWSTR lpszName;
+	LPCWSTR lpszClass;
+	DWORD dwExStyle;
 };
 // DRAWITEMSTRUCT：WM_DRAWITEM owner-draw 绘制参数（内嵌 struct RECT）；对照 SDK WinUser.h。CtlType/CtlID/itemID/itemAction/itemState 均 UINT、hwndItem=HWND、hDC=HDC、itemData=ULONG_PTR。
 public struct DRAWITEMSTRUCT
 {
-	unsigned int CtlType;
-	unsigned int CtlID;
-	unsigned int itemID;
-	unsigned int itemAction;
-	unsigned int itemState;
-	void *hwndItem;
-	void *hDC;
+	UINT CtlType;
+	UINT CtlID;
+	UINT itemID;
+	UINT itemAction;
+	UINT itemState;
+	HWND hwndItem;
+	HDC hDC;
 	struct RECT rcItem;
-	unsigned long long itemData;
+	ULONG_PTR itemData;
 };
 // MEASUREITEMSTRUCT：WM_MEASUREITEM owner-draw 尺寸测量参数；对照 SDK WinUser.h。CtlType/CtlID/itemID/itemWidth/itemHeight 均 UINT、itemData=ULONG_PTR。
 public struct MEASUREITEMSTRUCT
 {
-	unsigned int CtlType;
-	unsigned int CtlID;
-	unsigned int itemID;
-	unsigned int itemWidth;
-	unsigned int itemHeight;
-	unsigned long long itemData;
-};
-// NOTIFYICONDATAW：Shell_NotifyIconW 的托盘图标项（Vista+ 布局，含 hBalloonIcon）；对照 SDK shellapi.h。cbSize 填 sizeof；超时/版本匿名 union 二字段同为 UINT、collapse 为 uVersion、4 字节 ABI 不变；guidItem 用已定义 struct GUID、HICON 作 void*。
-public struct NOTIFYICONDATAW
-{
-	unsigned long cbSize;
-	void *hWnd;
-	unsigned int uID;
-	unsigned int uFlags;
-	unsigned int uCallbackMessage;
-	void *hIcon;
-	wchar_t szTip[128];
-	unsigned long dwState;
-	unsigned long dwStateMask;
-	wchar_t szInfo[256];
-	unsigned long uVersion;
-	wchar_t szInfoTitle[64];
-	unsigned long dwInfoFlags;
-	struct GUID guidItem;
-	void *hBalloonIcon;
+	UINT CtlType;
+	UINT CtlID;
+	UINT itemID;
+	UINT itemWidth;
+	UINT itemHeight;
+	ULONG_PTR itemData;
 };
 
-// —— Win32 整型常量宏（P225/P226 · `public const int` 起步子集，供 import 按名取用、替代消费方十进制硬编码）——
-//   仅覆盖整型常量宏；MAKEINTRESOURCE/字符串/指针型宏仍需别的机制或维持硬编码（长期交 win32metadata 自动生成）。
+// —— Win32 整型常量 · 跨库共用（P225/P226 起步；单库专用常量已下沉到各库段的「专用常量」小节）——
+//   判据同结构体：常量只服务单一库（其取值只作为该库函数/结构的参数）→ 就近定义在该库段函数之前的「<lib> 专用常量」小节；被多个库共用的留本段。
 //   机制：被 import 的 const int 全局可作运行期读取/数组维度/switch case 标签（P256：parser eval_const_int 穿透 const 全局/局部 VarRef；常量种子经 loader const_seeds 前置入主源解析期）。
-//   非负哨兵（如 INVALID_FILE_ATTRIBUTES=0xFFFFFFFF）按 `const unsigned long` 声明与消费方同型，免符号位转换。
-//   注：const 限定当前不强制只读（本仓 sema 少诊断），按只读约定使用。
-public const int COLOR_WINDOW = 5;
+//   非负哨兵（如 INVALID_FILE_ATTRIBUTES=0xFFFFFFFF）按 `const unsigned int` 声明与消费方同型，免符号位转换；const 限定当前不强制只读（本仓 sema 少诊断），按只读约定使用。
+//   仅覆盖整型常量宏；MAKEINTRESOURCE/字符串/指针型宏仍需别的机制或维持硬编码（长期交 win32metadata 自动生成）。
+//   来源与核对：P225/P226 起步子集 + 批次 VII–XII 扩展，取值逐个对照 Windows SDK〔10.0.26100.0〕winuser.h / wingdi.h / winbase.h / commctrl.h / commdlg.h / shlwapi.h / winnt.h / pdh.h / dwmapi.h。
+public const int MAX_PATH = 260;
+
+// —— kernel32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+// 基础码值（代码页标识 / 文件属性哨兵 / 成功码）
 public const int CP_UTF8 = 65001;
+public const unsigned int INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
+public const int ERROR_SUCCESS = 0;
+// 代码页 / 字符转换
+public const unsigned int CP_ACP = 0;
+public const unsigned int MB_ERR_INVALID_CHARS = 0x00000008;
+// 进程创建 / 优先级 / 等待
+public const unsigned int CREATE_NO_WINDOW = 0x08000000;
+public const unsigned int STARTF_USESHOWWINDOW = 0x00000001;
+public const unsigned int STARTF_USESTDHANDLES = 0x00000100;
+public const unsigned int HANDLE_FLAG_INHERIT = 0x00000001;
+public const unsigned int IDLE_PRIORITY_CLASS = 0x00000040;
+public const int THREAD_PRIORITY_IDLE = -15;
+public const unsigned int INFINITE = 0xFFFFFFFF;
+// 目录 / 文件监视（CreateFileW / ReadDirectoryChangesW）
+public const unsigned int FILE_LIST_DIRECTORY = 0x00000001;
+public const unsigned int FILE_SHARE_READ = 0x00000001;
+public const unsigned int FILE_SHARE_WRITE = 0x00000002;
+public const unsigned int FILE_SHARE_DELETE = 0x00000004;
+public const unsigned int OPEN_EXISTING = 3;
+public const unsigned int FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+public const unsigned int FILE_FLAG_OVERLAPPED = 0x40000000;
+public const unsigned int FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+public const unsigned int FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001;
+public const unsigned int FILE_NOTIFY_CHANGE_DIR_NAME = 0x00000002;
+public const unsigned int FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000008;
+public const unsigned int FILE_ACTION_ADDED = 0x00000001;
+public const unsigned int FILE_ACTION_REMOVED = 0x00000002;
+public const unsigned int FILE_ACTION_MODIFIED = 0x00000003;
+public const unsigned int FILE_ACTION_RENAMED_OLD_NAME = 0x00000004;
+public const unsigned int FILE_ACTION_RENAMED_NEW_NAME = 0x00000005;
+// 驱动器类型（GetDriveTypeW 返回值）
+public const int DRIVE_FIXED = 3;
+
+// —— kernel32 专用结构（仅本段函数使用；定义紧邻其使用者）——
+public struct SYSTEMTIME
+{
+	WORD wYear;
+	WORD wMonth;
+	WORD wDayOfWeek;
+	WORD wDay;
+	WORD wHour;
+	WORD wMinute;
+	WORD wSecond;
+	WORD wMilliseconds;
+};
+// FILETIME：100ns 计数时间（文件时间/FindData 载荷）；对照 SDK minwinbase.h。两 DWORD 组合为 64 位。
+public struct FILETIME
+{
+	DWORD dwLowDateTime;
+	DWORD dwHighDateTime;
+};
+// WIN32_FIND_DATAW：FindFirstFileW/FindNextFileW 的文件项；对照 SDK minwinbase.h。MAX_PATH=260、cAlternateFileName 为 8.3 名(14)。
+public struct WIN32_FIND_DATAW
+{
+	DWORD dwFileAttributes;
+	struct FILETIME ftCreationTime;
+	struct FILETIME ftLastAccessTime;
+	struct FILETIME ftLastWriteTime;
+	DWORD nFileSizeHigh;
+	DWORD nFileSizeLow;
+	DWORD dwReserved0;
+	DWORD dwReserved1;
+	WCHAR cFileName[260];
+	WCHAR cAlternateFileName[14];
+};
+// OVERLAPPED：异步 IO 状态块；SDK 的 union{Offset/OffsetHigh;Pointer} 摊成两 DWORD、x64 布局等价（32B）。
+public struct OVERLAPPED
+{
+	ULONG_PTR Internal;
+	ULONG_PTR InternalHigh;
+	DWORD Offset;
+	DWORD OffsetHigh;
+	HANDLE hEvent;
+};
+// CRITICAL_SECTION：即 RTL_CRITICAL_SECTION（Initialize/Enter/Leave/DeleteCriticalSection 用）；对照 SDK x64。
+public struct CRITICAL_SECTION
+{
+	ULONG_PTR DebugInfo;
+	LONG LockCount;
+	LONG RecursionCount;
+	HANDLE OwningThread;
+	HANDLE LockSemaphore;
+	ULONG_PTR SpinCount;
+};
+// MEMORYSTATUSEX：GlobalMemoryStatusEx 的内存状态载荷；对照 SDK sysinfoapi.h。dwLength 填 sizeof。
+public struct MEMORYSTATUSEX
+{
+	DWORD dwLength;
+	DWORD dwMemoryLoad;
+	DWORDLONG ullTotalPhys;
+	DWORDLONG ullAvailPhys;
+	DWORDLONG ullTotalPageFile;
+	DWORDLONG ullAvailPageFile;
+	DWORDLONG ullTotalVirtual;
+	DWORDLONG ullAvailVirtual;
+	DWORDLONG ullAvailExtendedVirtual;
+};
+// SECURITY_ATTRIBUTES：句柄继承/安全描述符（CreateProcessW/CreateFileW/CreatePipe 用）；对照 SDK。
+public struct SECURITY_ATTRIBUTES
+{
+	DWORD nLength;
+	LPVOID lpSecurityDescriptor;
+	BOOL bInheritHandle;
+};
+// STARTUPINFOW：CreateProcessW 启动信息（进程/管道重定向用）；对照 SDK x64 tagSTARTUPINFOW。lpReserved/lpDesktop/lpTitle 实为 LPWSTR、此处按只读 const wchar_t* 声明不影响布局；cb 须由调用方填 sizeof。
+public struct STARTUPINFOW
+{
+	DWORD cb;
+	LPCWSTR lpReserved;
+	LPCWSTR lpDesktop;
+	LPCWSTR lpTitle;
+	DWORD dwX;
+	DWORD dwY;
+	DWORD dwXSize;
+	DWORD dwYSize;
+	DWORD dwXCountChars;
+	DWORD dwYCountChars;
+	DWORD dwFillAttribute;
+	DWORD dwFlags;
+	WORD wShowWindow;
+	WORD cbReserved2;
+	LPBYTE lpReserved2;
+	HANDLE hStdInput;
+	HANDLE hStdOutput;
+	HANDLE hStdError;
+};
+// PROCESS_INFORMATION：CreateProcessW 输出进程/线程句柄与 id；对照 SDK。
+public struct PROCESS_INFORMATION
+{
+	HANDLE hProcess;
+	HANDLE hThread;
+	DWORD dwProcessId;
+	DWORD dwThreadId;
+};
+
+// —— kernel32：CRT 默认拉入，无需 [[lib]]（段内按函数名字母序）——
+public int CloseHandle(void *hObject);
+public void ExitProcess(unsigned int uExitCode);
+public unsigned int ExpandEnvironmentStringsW(const wchar_t *lpSrc, wchar_t *lpDst, unsigned int nSize);
+public int FreeConsole(void);
+public int FreeLibrary(void *hModule);
+public char* GetCommandLineA(void);
+public wchar_t* GetCommandLineW(void);
+public int GetComputerNameA(char *lpBuffer, unsigned int *nSize);
+public int GetComputerNameW(wchar_t *lpBuffer, unsigned int *nSize);
+public void* GetConsoleWindow(void);
+public unsigned int GetCurrentDirectoryA(unsigned int nBufferLength, char *lpBuffer);
+public unsigned int GetCurrentDirectoryW(unsigned int nBufferLength, wchar_t *lpBuffer);
+public void* GetCurrentProcess(void);
+public unsigned int GetCurrentProcessId(void);
+public unsigned int GetCurrentThreadId(void);
+public unsigned int GetEnvironmentVariableA(const char *lpName, char *lpBuffer, unsigned int nSize);
+public unsigned int GetEnvironmentVariableW(const wchar_t *lpName, wchar_t *lpBuffer, unsigned int nSize);
+public unsigned int GetFileAttributesA(const char *lpFileName);
+public unsigned int GetFileAttributesW(const wchar_t *lpFileName);
+public unsigned int GetFullPathNameA(const char *lpFileName, unsigned int nBufferLength, char *lpBuffer, char **lpFilePart);
+public unsigned int GetFullPathNameW(const wchar_t *lpFileName, unsigned int nBufferLength, wchar_t *lpBuffer, wchar_t **lpFilePart);
+public unsigned int GetLastError(void);
+public void GetLocalTime(struct SYSTEMTIME *lpSystemTime);
+public unsigned int GetModuleFileNameA(void *hModule, char *lpFilename, unsigned int n);
+public unsigned int GetModuleFileNameW(void *hModule, wchar_t *lpFilename, unsigned int n);
+public void* GetModuleHandleA(const char *lpModuleName);
+public void* GetModuleHandleW(const wchar_t *lpModuleName);
+public void* GetProcAddress(void *hModule, const char *lpProcName);
+public void* GetProcessHeap(void);
+public unsigned int GetProcessId(void *hProcess);
+public unsigned int GetPrivateProfileIntW(const wchar_t *lpAppName, const wchar_t *lpKeyName, int nDefault, const wchar_t *lpFileName);
+public unsigned int GetPrivateProfileStringW(const wchar_t *lpAppName, const wchar_t *lpKeyName, const wchar_t *lpDefault, wchar_t *lpReturnedString, unsigned int nSize, const wchar_t *lpFileName);
+public void* GetStdHandle(unsigned int nStdHandle);
+public unsigned int GetSystemDirectoryA(char *lpBuffer, unsigned int uBufSize);
+public unsigned int GetSystemDirectoryW(wchar_t *lpBuffer, unsigned int uBufSize);
+public void GetSystemTime(struct SYSTEMTIME *lpSystemTime);
+public unsigned int GetTempPathA(unsigned int nBufferLength, char *lpBuffer);
+public unsigned int GetTempPathW(unsigned int nBufferLength, wchar_t *lpBuffer);
+public unsigned int GetTickCount(void);
+public unsigned long long GetTickCount64(void);
+public unsigned short GetUserDefaultLangID(void);
+public unsigned int GetWindowsDirectoryA(char *lpBuffer, unsigned int uBufSize);
+public unsigned int GetWindowsDirectoryW(wchar_t *lpBuffer, unsigned int uBufSize);
+public void* HeapAlloc(void *hHeap, unsigned int dwFlags, unsigned long long dwBytes);
+public int HeapFree(void *hHeap, unsigned int dwFlags, void *lpMem);
+public void* LoadLibraryA(const char *lpFileName);
+public void* LoadLibraryW(const wchar_t *lpFileName);
+public int MulDiv(int nNumber, int nNumerator, int nDenominator);
+public int MultiByteToWideChar(unsigned int CodePage, unsigned int dwFlags, const char *lpMultiByteStr, int cbMultiByte, wchar_t *lpWideCharStr, int cchWideChar);
+public void OutputDebugStringA(const char *lpOutputString);
+public void OutputDebugStringW(const wchar_t *lpOutputString);
+public int QueryPerformanceCounter(union LARGE_INTEGER *lpPerformanceCount);
+public int QueryPerformanceFrequency(union LARGE_INTEGER *lpFrequency);
+public unsigned int SearchPathW(const wchar_t *lpPath, const wchar_t *lpFileName, const wchar_t *lpExtension, unsigned int nBufferLength, wchar_t *lpBuffer, wchar_t **lpFilePart);
+public int SetCurrentDirectoryA(const char *lpPathName);
+public int SetCurrentDirectoryW(const wchar_t *lpPathName);
+public int SetEnvironmentVariableA(const char *lpName, const char *lpValue);
+public int SetEnvironmentVariableW(const wchar_t *lpName, const wchar_t *lpValue);
+public int SetLastError(unsigned int dwErrCode);
+public void Sleep(unsigned int dwMilliseconds);
+public void* VirtualAlloc(void *lpAddress, unsigned long long dwSize, unsigned int flAllocType, unsigned int flProtect);
+public int VirtualFree(void *lpAddress, unsigned long long dwSize, unsigned int dwFreeType);
+public int WideCharToMultiByte(unsigned int CodePage, unsigned int dwFlags, const wchar_t *lpWideCharStr, int cchWideChar, char *lpMultiByteStr, int cbMultiByte, const char *lpDefaultChar, int *lpUsedDefaultChar);
+public int WritePrivateProfileStringW(const wchar_t *lpAppName, const wchar_t *lpKeyName, const wchar_t *lpString, const wchar_t *lpFileName);
+
+// —— kernel32 批次 X 补充（追加于段末、块内字母序；进程创建/管道/线程/临界区/目录监视）——
+public int CancelIoEx(void *hFile, struct OVERLAPPED *lpOverlapped);
+public void* CreateEventW(struct SECURITY_ATTRIBUTES *lpEventAttributes, int bManualReset, int bInitialState, const wchar_t *lpName);
+public void* CreateFileW(const wchar_t *lpFileName, unsigned int dwDesiredAccess, unsigned int dwShareMode, struct SECURITY_ATTRIBUTES *lpSecurityAttributes, unsigned int dwCreationDisposition, unsigned int dwFlagsAndAttributes, void *hTemplateFile);
+public int CreatePipe(void **hReadPipe, void **hWritePipe, struct SECURITY_ATTRIBUTES *lpPipeAttributes, unsigned int nSize);
+public int CreateProcessW(const wchar_t *lpApplicationName, wchar_t *lpCommandLine, struct SECURITY_ATTRIBUTES *lpProcessAttributes, struct SECURITY_ATTRIBUTES *lpThreadAttributes, int bInheritHandles, unsigned int dwCreationFlags, void *lpEnvironment, const wchar_t *lpCurrentDirectory, struct STARTUPINFOW *lpStartupInfo, struct PROCESS_INFORMATION *lpProcessInformation);
+public void* CreateThread(struct SECURITY_ATTRIBUTES *lpThreadAttributes, unsigned long long dwStackSize, unsigned int (*lpStartAddress)(void *), void *lpParameter, unsigned int dwCreationFlags, unsigned int *lpThreadId);
+public void DeleteCriticalSection(struct CRITICAL_SECTION *lpCriticalSection);
+public void EnterCriticalSection(struct CRITICAL_SECTION *lpCriticalSection);
+public void* GetCurrentThread(void);
+public int GetExitCodeProcess(void *hProcess, unsigned int *lpExitCode);
+public int GetOverlappedResultEx(void *hFile, struct OVERLAPPED *lpOverlapped, unsigned int *lpNumberOfBytesTransferred, unsigned int dwMilliseconds, int bAlertable);
+public void InitializeCriticalSection(struct CRITICAL_SECTION *lpCriticalSection);
+public void LeaveCriticalSection(struct CRITICAL_SECTION *lpCriticalSection);
+public int ReadDirectoryChangesW(void *hDirectory, void *lpBuffer, unsigned int nBufferLength, int bWatchSubtree, unsigned int dwNotifyFilter, unsigned int *lpBytesReturned, struct OVERLAPPED *lpOverlapped, void *lpCompletionRoutine);
+public int ReadFile(void *hFile, void *lpBuffer, unsigned int nNumberOfBytesToRead, unsigned int *lpNumberOfBytesRead, struct OVERLAPPED *lpOverlapped);
+public int ResetEvent(void *hEvent);
+public int SetEvent(void *hEvent);
+public int SetHandleInformation(void *hObject, unsigned int dwMask, unsigned int dwFlags);
+public int SetPriorityClass(void *hProcess, unsigned int dwPriorityClass);
+public int SetThreadPriority(void *hThread, int nPriority);
+public unsigned int WaitForSingleObject(void *hHandle, unsigned int dwMilliseconds);
+public unsigned int WaitForSingleObjectEx(void *hHandle, unsigned int dwMilliseconds, int bAlertable);
+
+// —— kernel32 批次 XI 补充（追加于段末、块内字母序；互斥体/内存状态/语言 ID/逻辑驱动器）——
+public void* CreateMutexW(struct SECURITY_ATTRIBUTES *lpMutexAttributes, int bInitialOwner, const wchar_t *lpName);
+public unsigned int GetDriveTypeW(const wchar_t *lpRootPathName);
+public unsigned int GetLogicalDriveStringsW(unsigned int nBufferLength, wchar_t *lpBuffer);
+public unsigned short GetSystemDefaultLangID(void);
+public int GlobalMemoryStatusEx(struct MEMORYSTATUSEX *lpBuffer);
+
+// —— kernel32 批次 XII 补充（追加于段末、块内字母序；目录/文件枚举/文件读写定位/时间转换/进程终止）——
+public int CreateDirectoryW(const wchar_t *lpPathName, struct SECURITY_ATTRIBUTES *lpSecurityAttributes);
+public int DeleteFileW(const wchar_t *lpFileName);
+public int FindClose(void *hFindFile);
+public void* FindFirstFileW(const wchar_t *lpFileName, struct WIN32_FIND_DATAW *lpFindFileData);
+public int FindNextFileW(void *hFindFile, struct WIN32_FIND_DATAW *lpFindFileData);
+public int FlushFileBuffers(void *hFile);
+public void GetSystemTimeAsFileTime(struct FILETIME *lpSystemTimeAsFileTime);
+public int LocalFileTimeToFileTime(const struct FILETIME *lpLocalFileTime, struct FILETIME *lpFileTime);
+public int MoveFileExW(const wchar_t *lpExistingFileName, const wchar_t *lpNewFileName, unsigned int dwFlags);
+public int SetEndOfFile(void *hFile);
+public unsigned int SetFilePointer(void *hFile, int lDistanceToMove, int *lpDistanceToMoveHigh, unsigned int dwMoveMethod);
+public int SystemTimeToFileTime(const struct SYSTEMTIME *lpSystemTime, struct FILETIME *lpFileTime);
+public int TerminateProcess(void *hProcess, unsigned int uExitCode);
+public int WriteFile(void *hFile, const void *lpBuffer, unsigned int nNumberOfBytesToWrite, unsigned int *lpNumberOfBytesWritten, struct OVERLAPPED *lpOverlapped);
+
+// —— user32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+public const int COLOR_WINDOW = 5;
 public const int CS_HREDRAW = 2;
 public const int CS_VREDRAW = 1;
 public const int CW_USEDEFAULT = -2147483648;
 public const int IDC_ARROW = 32512;
-public const unsigned long INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
-public const int LOGPIXELSX = 88;
-public const int MAX_PATH = 260;
-public const int PATCOPY = 0x00F00062;
 public const int PM_NOREMOVE = 0;
 public const int PM_REMOVE = 1;
 public const int SM_CXSCREEN = 78;
-public const int SRCCOPY = 0x00CC0020;
 public const int SW_SHOW = 5;
 public const int VK_SHIFT = 0x10;
-public const int WHITE_BRUSH = 0;
 public const int WM_DESTROY = 2;
 public const int WM_PAINT = 15;
 public const int WM_QUIT = 18;
-public const int WS_OVERLAPPEDWINDOW = 0xCF0000;
-
-// —— Win32 GUI 常量扩展（批次 VII · 范围 A 可发布子集；取值逐个对照 Windows SDK winuser.h / wingdi.h〔10.0.26100.0〕核对）——
-// 窗口样式 WS_*（dwStyle 为 DWORD；仅 WS_POPUP 高位溢出 int，按 const unsigned long 声明，余皆落 int 正区间）
+// 窗口样式 WS_*（dwStyle 为 DWORD；仅 WS_POPUP 高位溢出 int，按 const unsigned int 声明，余皆落 int 正区间）
 public const int WS_OVERLAPPED = 0x00000000;
-public const unsigned long WS_POPUP = 0x80000000;
+public const unsigned int WS_POPUP = 0x80000000;
 public const int WS_CHILD = 0x40000000;
 public const int WS_VISIBLE = 0x10000000;
 public const int WS_DISABLED = 0x08000000;
@@ -481,6 +476,7 @@ public const int WS_MINIMIZE = 0x20000000;
 public const int WS_MAXIMIZE = 0x01000000;
 public const int WS_CLIPSIBLINGS = 0x04000000;
 public const int WS_CLIPCHILDREN = 0x02000000;
+public const int WS_OVERLAPPEDWINDOW = 0xCF0000;
 public const int WS_GROUP = 0x00020000;
 public const int WS_TABSTOP = 0x00010000;
 // 扩展窗口样式 WS_EX_*
@@ -580,67 +576,6 @@ public const int DT_PATH_ELLIPSIS = 0x00004000;
 public const int DT_END_ELLIPSIS = 0x00008000;
 public const int DT_RTLREADING = 0x00020000;
 public const int DT_WORD_ELLIPSIS = 0x00040000;
-// 画笔样式 PS_* 与端点/接头
-public const int PS_SOLID = 0;
-public const int PS_DASH = 1;
-public const int PS_DOT = 2;
-public const int PS_DASHDOT = 3;
-public const int PS_DASHDOTDOT = 4;
-public const int PS_NULL = 5;
-public const int PS_INSIDEFRAME = 6;
-public const int PS_ALTERNATE = 8;
-public const int PS_ENDCAP_ROUND = 0x00000000;
-public const int PS_ENDCAP_SQUARE = 0x00000100;
-public const int PS_ENDCAP_FLAT = 0x00000200;
-public const int PS_JOIN_ROUND = 0x00000000;
-public const int PS_JOIN_BEVEL = 0x00001000;
-public const int PS_JOIN_MITER = 0x00002000;
-// 映射模式 MM_*
-public const int MM_TEXT = 1;
-public const int MM_LOMETRIC = 2;
-public const int MM_HIMETRIC = 3;
-public const int MM_LOENGLISH = 4;
-public const int MM_HIENGLISH = 5;
-public const int MM_ISOTROPIC = 7;
-public const int MM_ANISOTROPIC = 8;
-// GetStockObject 索引（WHITE_BRUSH=0 已存于上方）
-public const int LTGRAY_BRUSH = 1;
-public const int GRAY_BRUSH = 2;
-public const int DKGRAY_BRUSH = 3;
-public const int BLACK_BRUSH = 4;
-public const int NULL_BRUSH = 5;
-public const int WHITE_PEN = 6;
-public const int BLACK_PEN = 7;
-public const int NULL_PEN = 8;
-public const int OEM_FIXED_FONT = 10;
-public const int ANSI_FIXED_FONT = 11;
-public const int ANSI_VAR_FONT = 12;
-public const int SYSTEM_FONT = 13;
-public const int DEVICE_DEFAULT_FONT = 14;
-public const int DEFAULT_PALETTE = 15;
-public const int DEFAULT_GUI_FONT = 17;
-// 光栅操作 ROP2（dwRop 为 DWORD，按 const unsigned long；SRCCOPY/PATCOPY 已存于上方）
-public const unsigned long BLACKNESS = 0x00000042;
-public const unsigned long NOTSRCCOPY = 0x00330008;
-public const unsigned long SRCERASE = 0x00440328;
-public const unsigned long DSTINVERT = 0x00550009;
-public const unsigned long MERGECOPY = 0x00C000CA;
-public const unsigned long MERGEPAINT = 0x00BB0226;
-public const unsigned long SRCINVERT = 0x00660046;
-public const unsigned long SRCAND = 0x008800C6;
-public const unsigned long SRCPAINT = 0x00EE0086;
-// 文本对齐 TA_*（SetTextAlign）与背景模式 BkMode
-public const int TA_LEFT = 0;
-public const int TA_TOP = 0;
-public const int TA_RIGHT = 2;
-public const int TA_CENTER = 6;
-public const int TA_BOTTOM = 8;
-public const int TA_BASELINE = 24;
-public const int TRANSPARENT = 1;
-public const int OPAQUE = 2;
-// SetStretchBltMode 模式
-public const int BLACKONWHITE = 1;
-public const int WHITEONBLACK = 2;
 // GetSysColor 索引 COLOR_*（COLOR_WINDOW=5 已存于上方）
 public const int COLOR_SCROLLBAR = 0;
 public const int COLOR_BACKGROUND = 1;
@@ -662,8 +597,6 @@ public const int COLOR_GRAYTEXT = 17;
 public const int COLOR_BTNTEXT = 18;
 public const int COLOR_INACTIVECAPTIONTEXT = 19;
 public const int COLOR_BTNHIGHLIGHT = 20;
-
-// —— Win32 常量扩展（批次 VIII · GUI/编辑框/菜单/DPI/字体子集；取值逐个对照 Windows SDK〔10.0.26100.0〕winuser.h / wingdi.h / windef.h / MultiMon.h / Richedit.h 核对，别名已摊平为整数）——
 // 窗口消息 WM_*（续，接批次 VII）
 public const int WM_SETFONT = 0x0030;
 public const int WM_DISPLAYCHANGE = 0x007E;
@@ -714,17 +647,6 @@ public const int IDC_SIZENS = 32645;
 public const int IDI_APPLICATION = 32512;
 // 系统颜色索引（COLOR_3DFACE 系 COLOR_BTNFACE 别名，摊平为 15）
 public const int COLOR_3DFACE = 15;
-// 字体创建参数（wingdi.h）：OUT_TT_PRECIS 真值 = 4（非 10，10 为 OUT_PS_ONLY_PRECIS）；FF_MODERN = 0x30
-public const int FW_NORMAL = 400;
-public const int DEFAULT_CHARSET = 1;
-public const int OUT_DEFAULT_PRECIS = 0;
-public const int OUT_TT_PRECIS = 4;
-public const int CLIP_DEFAULT_PRECIS = 0;
-public const int CLEARTYPE_QUALITY = 5;
-public const int DEFAULT_PITCH = 0;
-public const int FIXED_PITCH = 1;
-public const int FF_DONTCARE = 0;
-public const int FF_MODERN = 0x30;
 // WM_ACTIVATE wParam（WA_*）与 WM_NCHITTEST 返回值（HT_*）
 public const int WA_INACTIVE = 0;
 public const int HTSYSMENU = 3;
@@ -740,8 +662,6 @@ public const int DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4;
 // MessageBox 样式 MB_*（MB_ICONINFORMATION 系 MB_ICONASTERISK 别名，摊平为 0x40）
 public const int MB_OK = 0x00000000;
 public const int MB_ICONINFORMATION = 0x00000040;
-
-// —— Win32 常量扩展（批次 IX · 设置窗：控件样式/通知码、消息框、文件对话框、Shell 浏览、COM/注册表；取值逐个对照 Windows SDK〔10.0.26100.0〕winuser.h / commdlg.h / shlobj.h / winreg.h / winerror.h 核对）——
 // 按钮样式 BS_*
 public const int BS_PUSHBUTTON = 0x00000000;
 public const int BS_AUTOCHECKBOX = 0x00000003;
@@ -785,56 +705,6 @@ public const int MB_DEFBUTTON1 = 0x00000000;
 public const int IDYES = 6;
 public const int IDNO = 7;
 public const int IDCANCEL = 2;
-// 文件对话框标志 OFN_*（OPENFILENAMEW.Flags）
-public const int OFN_HIDEREADONLY = 0x00000004;
-public const int OFN_PATHMUSTEXIST = 0x00000800;
-public const int OFN_FILEMUSTEXIST = 0x00001000;
-// Shell 目录浏览标志 BIF_*（BROWSEINFOW.ulFlags）
-public const int BIF_RETURNONLYFSDIRS = 0x00000001;
-public const int BIF_NEWDIALOGSTYLE = 0x00000040;
-// COM 初始化标志 COINIT_*
-public const int COINIT_APARTMENTTHREADED = 0x2;
-// 注册表预定义键伪句柄：真身为 ((HKEY)(ULONG_PTR)((LONG)0x80000001/2))，(LONG) 后 64 位符号扩展 = 0xFFFFFFFF80000001/2；按 const long long 存符号扩展后真值，调用处以 (void*)HKEY_* 传参
-public const long long HKEY_CURRENT_USER = -2147483647;
-public const long long HKEY_LOCAL_MACHINE = -2147483646;
-// 注册表访问权限 REGSAM / 值类型 / RegGetValue 标志 / 错误码
-public const int KEY_SET_VALUE = 0x0002;
-public const int KEY_WOW64_64KEY = 0x0100;
-public const int KEY_WOW64_32KEY = 0x0200;
-public const int KEY_READ = 0x00020019;
-public const int REG_SZ = 1;
-public const int RRF_RT_REG_SZ = 0x00000002;
-public const int ERROR_SUCCESS = 0;
-
-// —— Win32 常量扩展（批次 X · 进程/管道/目录监控/滚动条/tooltip/通用控件子集；取值逐个对照 Windows SDK〔10.0.26100.0〕winbase.h / winuser.h / fileapi.h / commctrl.h / shlwapi.h 核对）——
-// 代码页 / 字符转换
-public const unsigned long CP_ACP = 0;
-public const unsigned long MB_ERR_INVALID_CHARS = 0x00000008;
-// 进程创建 / 优先级 / 等待
-public const unsigned long CREATE_NO_WINDOW = 0x08000000;
-public const unsigned long STARTF_USESHOWWINDOW = 0x00000001;
-public const unsigned long STARTF_USESTDHANDLES = 0x00000100;
-public const unsigned long HANDLE_FLAG_INHERIT = 0x00000001;
-public const unsigned long IDLE_PRIORITY_CLASS = 0x00000040;
-public const int THREAD_PRIORITY_IDLE = -15;
-public const unsigned long INFINITE = 0xFFFFFFFF;
-// 目录 / 文件监视（CreateFileW / ReadDirectoryChangesW）
-public const unsigned long FILE_LIST_DIRECTORY = 0x00000001;
-public const unsigned long FILE_SHARE_READ = 0x00000001;
-public const unsigned long FILE_SHARE_WRITE = 0x00000002;
-public const unsigned long FILE_SHARE_DELETE = 0x00000004;
-public const unsigned long OPEN_EXISTING = 3;
-public const unsigned long FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
-public const unsigned long FILE_FLAG_OVERLAPPED = 0x40000000;
-public const unsigned long FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
-public const unsigned long FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001;
-public const unsigned long FILE_NOTIFY_CHANGE_DIR_NAME = 0x00000002;
-public const unsigned long FILE_NOTIFY_CHANGE_LAST_WRITE = 0x00000008;
-public const unsigned long FILE_ACTION_ADDED = 0x00000001;
-public const unsigned long FILE_ACTION_REMOVED = 0x00000002;
-public const unsigned long FILE_ACTION_MODIFIED = 0x00000003;
-public const unsigned long FILE_ACTION_RENAMED_OLD_NAME = 0x00000004;
-public const unsigned long FILE_ACTION_RENAMED_NEW_NAME = 0x00000005;
 // 窗口消息（本批新引，批次 VII–IX 未含）
 public const int WM_USER = 0x0400;
 public const int WM_GETFONT = 0x0031;
@@ -856,19 +726,6 @@ public const int WHEEL_DELTA = 120;
 // 按钮样式补充
 public const int BS_LEFT = 0x0100;
 public const int BS_FLAT = 0x8000;
-// 通用控件 / tooltip（comctl32 · InitCommonControlsEx / TTM_*）
-public const int TTS_ALWAYSTIP = 0x01;
-public const int TTS_NOPREFIX = 0x02;
-public const int TTF_IDISHWND = 0x0001;
-public const int TTF_SUBCLASS = 0x0010;
-public const int TTM_SETDELAYTIME = 0x0403;
-public const int TTM_ADDTOOLW = 0x0432;
-public const int TTM_DELTOOLW = 0x0433;
-public const int TTDT_AUTOPOP = 2;
-public const int TTDT_INITIAL = 3;
-public const int ICC_WIN95_CLASSES = 0xFF;
-
-// —— Win32 常量扩展（批次 XI · 窗口消息/系统命令/扩展样式/控件样式与消息/对话框默认按钮/菜单/消息框图标/注册表类型/LoadImage/驱动器/颜色对话框/PDH/DWM 子集；取值逐个对照 Windows SDK〔10.0.26100.0〕winuser.h / winnt.h / winbase.h / commdlg.h / pdh.h / pdhmsg.h / dwmapi.h 核对）——
 // 窗口消息（WM_*，批次 VII–X 未含）
 public const int WM_ENTERSIZEMOVE = 0x0231;
 public const int WM_MOVING = 0x0216;
@@ -890,24 +747,9 @@ public const int TPM_BOTTOMALIGN = 0x0020;
 // 消息框图标（MB_*；MB_ICONSTOP=MB_ICONHAND、MB_ICONWARNING=MB_ICONEXCLAMATION 别名已摊平）
 public const int MB_ICONSTOP = 0x00000010;
 public const int MB_ICONWARNING = 0x00000030;
-// 注册表值类型（REG_*，SDK winnt.h）
-public const int REG_DWORD = 4;
 // LoadImageW 图像类型 / 加载标志
 public const int IMAGE_ICON = 1;
 public const int LR_LOADFROMFILE = 0x00000010;
-// 驱动器类型（GetDriveTypeW 返回值）
-public const int DRIVE_FIXED = 3;
-// 颜色对话框 ChooseColorW 的 Flags
-public const int CC_RGBINIT = 0x00000001;
-public const int CC_FULLOPEN = 0x00000002;
-// PDH 性能数据（PdhGetFormattedCounterArrayW 格式化类型 / 缓冲区不足状态码，高位置位故用 unsigned long）
-public const int PDH_FMT_DOUBLE = 0x00000200;
-public const unsigned long PDH_MORE_DATA = 0x800007D2;
-// DWM 模糊区域 DwmEnableBlurBehindWindow 的 dwFlags
-public const int DWM_BB_ENABLE = 0x00000001;
-public const int DWM_BB_BLURREGION = 0x00000002;
-
-// —— Win32 常量扩展（批次 XII · 窗口动画/鼠标追踪/任务栏闪烁/托盘图标 子集；取值逐个对照 Windows SDK〔10.0.26100.0〕winuser.h / shellapi.h 核对）——
 // 窗口动画 AnimateWindow 的 dwFlags（AW_*）
 public const int AW_HOR_POSITIVE = 0x00000001;
 public const int AW_HOR_NEGATIVE = 0x00000002;
@@ -918,12 +760,12 @@ public const int AW_HIDE = 0x00010000;
 public const int AW_ACTIVATE = 0x00020000;
 public const int AW_SLIDE = 0x00040000;
 public const int AW_BLEND = 0x00080000;
-// 鼠标追踪 TrackMouseEvent 的 dwFlags（TME_*；QUERY/CANCEL 高位置位故用 unsigned long）
+// 鼠标追踪 TrackMouseEvent 的 dwFlags（TME_*；QUERY/CANCEL 高位置位故用 unsigned int）
 public const int TME_HOVER = 0x00000001;
 public const int TME_LEAVE = 0x00000002;
 public const int TME_NONCLIENT = 0x00000010;
-public const unsigned long TME_QUERY = 0x40000000;
-public const unsigned long TME_CANCEL = 0x80000000;
+public const unsigned int TME_QUERY = 0x40000000;
+public const unsigned int TME_CANCEL = 0x80000000;
 // 任务栏闪烁 FlashWindowEx 的 dwFlags（FLASHW_*；FLASHW_ALL=CAPTION|TRAY=0x3、TIMERNOFG=TIMER|0x8=0xC）
 public const int FLASHW_STOP = 0;
 public const int FLASHW_CAPTION = 0x00000001;
@@ -931,155 +773,118 @@ public const int FLASHW_TRAY = 0x00000002;
 public const int FLASHW_ALL = 0x00000003;
 public const int FLASHW_TIMER = 0x00000004;
 public const int FLASHW_TIMERNOFG = 0x0000000C;
-// 托盘图标 Shell_NotifyIconW 的消息（NIM_*）/ uFlags（NIF_*；含 NIF_REALTIME=0x40、NIF_SHOWTIP=0x80）/ 状态（NIS_*）/ 气泡标志（NIIF_*）
-public const int NIM_ADD = 0x00000000;
-public const int NIM_MODIFY = 0x00000001;
-public const int NIM_DELETE = 0x00000002;
-public const int NIM_SETFOCUS = 0x00000003;
-public const int NIM_SETVERSION = 0x00000004;
-public const int NIF_MESSAGE = 0x00000001;
-public const int NIF_ICON = 0x00000002;
-public const int NIF_TIP = 0x00000004;
-public const int NIF_STATE = 0x00000008;
-public const int NIF_INFO = 0x00000010;
-public const int NIF_GUID = 0x00000020;
-public const int NIF_REALTIME = 0x00000040;
-public const int NIF_SHOWTIP = 0x00000080;
-public const int NIS_HIDDEN = 0x00000001;
-public const int NIS_SHAREDICON = 0x00000002;
-public const int NIIF_NONE = 0x00000000;
-public const int NIIF_INFO = 0x00000001;
-public const int NIIF_WARNING = 0x00000002;
-public const int NIIF_ERROR = 0x00000003;
-public const int NIIF_USER = 0x00000004;
-public const int NIIF_ICON_MASK = 0x0000000F;
-public const int NIIF_NOSOUND = 0x00000010;
-public const int NIIF_LARGE_ICON = 0x00000020;
-public const int NIIF_RESPECT_QUIET_TIME = 0x00000080;
 
-// —— kernel32：CRT 默认拉入，无需 [[lib]]（段内按函数名字母序）——
-public int CloseHandle(void *hObject);
-public void ExitProcess(unsigned int uExitCode);
-public unsigned long ExpandEnvironmentStringsW(const wchar_t *lpSrc, wchar_t *lpDst, unsigned long nSize);
-public int FreeConsole(void);
-public int FreeLibrary(void *hModule);
-public char* GetCommandLineA(void);
-public wchar_t* GetCommandLineW(void);
-public int GetComputerNameA(char *lpBuffer, unsigned long *nSize);
-public int GetComputerNameW(wchar_t *lpBuffer, unsigned long *nSize);
-public void* GetConsoleWindow(void);
-public unsigned long GetCurrentDirectoryA(unsigned long nBufferLength, char *lpBuffer);
-public unsigned long GetCurrentDirectoryW(unsigned long nBufferLength, wchar_t *lpBuffer);
-public void* GetCurrentProcess(void);
-public unsigned long GetCurrentProcessId(void);
-public unsigned long GetCurrentThreadId(void);
-public unsigned long GetEnvironmentVariableA(const char *lpName, char *lpBuffer, unsigned long nSize);
-public unsigned long GetEnvironmentVariableW(const wchar_t *lpName, wchar_t *lpBuffer, unsigned long nSize);
-public unsigned long GetFileAttributesA(const char *lpFileName);
-public unsigned long GetFileAttributesW(const wchar_t *lpFileName);
-public unsigned long GetFullPathNameA(const char *lpFileName, unsigned long nBufferLength, char *lpBuffer, char **lpFilePart);
-public unsigned long GetFullPathNameW(const wchar_t *lpFileName, unsigned long nBufferLength, wchar_t *lpBuffer, wchar_t **lpFilePart);
-public unsigned long GetLastError(void);
-public void GetLocalTime(struct SYSTEMTIME *lpSystemTime);
-public unsigned int GetModuleFileNameA(void *hModule, char *lpFilename, unsigned int n);
-public unsigned int GetModuleFileNameW(void *hModule, wchar_t *lpFilename, unsigned int n);
-public void* GetModuleHandleA(const char *lpModuleName);
-public void* GetModuleHandleW(const wchar_t *lpModuleName);
-public void* GetProcAddress(void *hModule, const char *lpProcName);
-public void* GetProcessHeap(void);
-public unsigned long GetProcessId(void *hProcess);
-public unsigned int GetPrivateProfileIntW(const wchar_t *lpAppName, const wchar_t *lpKeyName, int nDefault, const wchar_t *lpFileName);
-public unsigned long GetPrivateProfileStringW(const wchar_t *lpAppName, const wchar_t *lpKeyName, const wchar_t *lpDefault, wchar_t *lpReturnedString, unsigned long nSize, const wchar_t *lpFileName);
-public void* GetStdHandle(unsigned long nStdHandle);
-public unsigned int GetSystemDirectoryA(char *lpBuffer, unsigned int uBufSize);
-public unsigned int GetSystemDirectoryW(wchar_t *lpBuffer, unsigned int uBufSize);
-public void GetSystemTime(struct SYSTEMTIME *lpSystemTime);
-public unsigned int GetTempPathA(unsigned int nBufferLength, char *lpBuffer);
-public unsigned int GetTempPathW(unsigned int nBufferLength, wchar_t *lpBuffer);
-public unsigned long GetTickCount(void);
-public unsigned long long GetTickCount64(void);
-public unsigned short GetUserDefaultLangID(void);
-public unsigned int GetWindowsDirectoryA(char *lpBuffer, unsigned int uBufSize);
-public unsigned int GetWindowsDirectoryW(wchar_t *lpBuffer, unsigned int uBufSize);
-public void* HeapAlloc(void *hHeap, unsigned long dwFlags, unsigned long long dwBytes);
-public int HeapFree(void *hHeap, unsigned long dwFlags, void *lpMem);
-public void* LoadLibraryA(const char *lpFileName);
-public void* LoadLibraryW(const wchar_t *lpFileName);
-public int MulDiv(int nNumber, int nNumerator, int nDenominator);
-public int MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char *lpMultiByteStr, int cbMultiByte, wchar_t *lpWideCharStr, int cchWideChar);
-public void OutputDebugStringA(const char *lpOutputString);
-public void OutputDebugStringW(const wchar_t *lpOutputString);
-public int QueryPerformanceCounter(union LARGE_INTEGER *lpPerformanceCount);
-public int QueryPerformanceFrequency(union LARGE_INTEGER *lpFrequency);
-public unsigned long SearchPathW(const wchar_t *lpPath, const wchar_t *lpFileName, const wchar_t *lpExtension, unsigned long nBufferLength, wchar_t *lpBuffer, wchar_t **lpFilePart);
-public int SetCurrentDirectoryA(const char *lpPathName);
-public int SetCurrentDirectoryW(const wchar_t *lpPathName);
-public int SetEnvironmentVariableA(const char *lpName, const char *lpValue);
-public int SetEnvironmentVariableW(const wchar_t *lpName, const wchar_t *lpValue);
-public int SetLastError(unsigned long dwErrCode);
-public void Sleep(unsigned long dwMilliseconds);
-public void* VirtualAlloc(void *lpAddress, unsigned long long dwSize, unsigned long flAllocType, unsigned long flProtect);
-public int VirtualFree(void *lpAddress, unsigned long long dwSize, unsigned long dwFreeType);
-public int WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags, const wchar_t *lpWideCharStr, int cchWideChar, char *lpMultiByteStr, int cbMultiByte, const char *lpDefaultChar, int *lpUsedDefaultChar);
-public int WritePrivateProfileStringW(const wchar_t *lpAppName, const wchar_t *lpKeyName, const wchar_t *lpString, const wchar_t *lpFileName);
-
-// —— kernel32 批次 X 补充（追加于段末、块内字母序；进程创建/管道/线程/临界区/目录监视）——
-public int CancelIoEx(void *hFile, struct OVERLAPPED *lpOverlapped);
-public void* CreateEventW(struct SECURITY_ATTRIBUTES *lpEventAttributes, int bManualReset, int bInitialState, const wchar_t *lpName);
-public void* CreateFileW(const wchar_t *lpFileName, unsigned long dwDesiredAccess, unsigned long dwShareMode, struct SECURITY_ATTRIBUTES *lpSecurityAttributes, unsigned long dwCreationDisposition, unsigned long dwFlagsAndAttributes, void *hTemplateFile);
-public int CreatePipe(void **hReadPipe, void **hWritePipe, struct SECURITY_ATTRIBUTES *lpPipeAttributes, unsigned long nSize);
-public int CreateProcessW(const wchar_t *lpApplicationName, wchar_t *lpCommandLine, struct SECURITY_ATTRIBUTES *lpProcessAttributes, struct SECURITY_ATTRIBUTES *lpThreadAttributes, int bInheritHandles, unsigned long dwCreationFlags, void *lpEnvironment, const wchar_t *lpCurrentDirectory, struct STARTUPINFOW *lpStartupInfo, struct PROCESS_INFORMATION *lpProcessInformation);
-public void* CreateThread(struct SECURITY_ATTRIBUTES *lpThreadAttributes, unsigned long long dwStackSize, unsigned long (*lpStartAddress)(void *), void *lpParameter, unsigned long dwCreationFlags, unsigned long *lpThreadId);
-public void DeleteCriticalSection(struct CRITICAL_SECTION *lpCriticalSection);
-public void EnterCriticalSection(struct CRITICAL_SECTION *lpCriticalSection);
-public void* GetCurrentThread(void);
-public int GetExitCodeProcess(void *hProcess, unsigned long *lpExitCode);
-public int GetOverlappedResultEx(void *hFile, struct OVERLAPPED *lpOverlapped, unsigned long *lpNumberOfBytesTransferred, unsigned long dwMilliseconds, int bAlertable);
-public void InitializeCriticalSection(struct CRITICAL_SECTION *lpCriticalSection);
-public void LeaveCriticalSection(struct CRITICAL_SECTION *lpCriticalSection);
-public int ReadDirectoryChangesW(void *hDirectory, void *lpBuffer, unsigned long nBufferLength, int bWatchSubtree, unsigned long dwNotifyFilter, unsigned long *lpBytesReturned, struct OVERLAPPED *lpOverlapped, void *lpCompletionRoutine);
-public int ReadFile(void *hFile, void *lpBuffer, unsigned long nNumberOfBytesToRead, unsigned long *lpNumberOfBytesRead, struct OVERLAPPED *lpOverlapped);
-public int ResetEvent(void *hEvent);
-public int SetEvent(void *hEvent);
-public int SetHandleInformation(void *hObject, unsigned long dwMask, unsigned long dwFlags);
-public int SetPriorityClass(void *hProcess, unsigned long dwPriorityClass);
-public int SetThreadPriority(void *hThread, int nPriority);
-public unsigned long WaitForSingleObject(void *hHandle, unsigned long dwMilliseconds);
-public unsigned long WaitForSingleObjectEx(void *hHandle, unsigned long dwMilliseconds, int bAlertable);
-
-// —— kernel32 批次 XI 补充（追加于段末、块内字母序；互斥体/内存状态/语言 ID/逻辑驱动器）——
-public void* CreateMutexW(struct SECURITY_ATTRIBUTES *lpMutexAttributes, int bInitialOwner, const wchar_t *lpName);
-public unsigned int GetDriveTypeW(const wchar_t *lpRootPathName);
-public unsigned long GetLogicalDriveStringsW(unsigned long nBufferLength, wchar_t *lpBuffer);
-public unsigned short GetSystemDefaultLangID(void);
-public int GlobalMemoryStatusEx(struct MEMORYSTATUSEX *lpBuffer);
-
-// —— kernel32 批次 XII 补充（追加于段末、块内字母序；目录/文件枚举/文件读写定位/时间转换/进程终止）——
-public int CreateDirectoryW(const wchar_t *lpPathName, struct SECURITY_ATTRIBUTES *lpSecurityAttributes);
-public int DeleteFileW(const wchar_t *lpFileName);
-public int FindClose(void *hFindFile);
-public void* FindFirstFileW(const wchar_t *lpFileName, struct WIN32_FIND_DATAW *lpFindFileData);
-public int FindNextFileW(void *hFindFile, struct WIN32_FIND_DATAW *lpFindFileData);
-public int FlushFileBuffers(void *hFile);
-public void GetSystemTimeAsFileTime(struct FILETIME *lpSystemTimeAsFileTime);
-public int LocalFileTimeToFileTime(const struct FILETIME *lpLocalFileTime, struct FILETIME *lpFileTime);
-public int MoveFileExW(const wchar_t *lpExistingFileName, const wchar_t *lpNewFileName, unsigned long dwFlags);
-public int SetEndOfFile(void *hFile);
-public unsigned long SetFilePointer(void *hFile, long lDistanceToMove, long *lpDistanceToMoveHigh, unsigned long dwMoveMethod);
-public int SystemTimeToFileTime(const struct SYSTEMTIME *lpSystemTime, struct FILETIME *lpFileTime);
-public int TerminateProcess(void *hProcess, unsigned int uExitCode);
-public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfBytesToWrite, unsigned long *lpNumberOfBytesWritten, struct OVERLAPPED *lpOverlapped);
+// —— user32 专用结构（仅本段函数使用；定义紧邻其使用者）——
+public struct MSG
+{
+	HWND hwnd;
+	UINT message;
+	WPARAM wParam;
+	LPARAM lParam;
+	DWORD time;
+	struct POINT pt;
+};
+public struct PAINTSTRUCT
+{
+	HDC hdc;
+	BOOL fErase;
+	struct RECT rcPaint;
+	BOOL fRestore;
+	BOOL fIncUpdate;
+	BYTE rgbReserved[32];
+};
+public struct WNDCLASS
+{
+	UINT style;
+	WNDPROC lpfnWndProc;
+	int cbClsExtra;
+	int cbWndExtra;
+	HINSTANCE hInstance;
+	HICON hIcon;
+	HCURSOR hCursor;
+	HBRUSH hbrBackground;
+	LPCSTR lpszMenuName;
+	LPCSTR lpszClassName;
+};
+// WNDCLASSEX 按 A 系建模（lpszMenuName/lpszClassName 取 const char*，与既存 WNDCLASS 同风格），配 RegisterClassExA 使用；cbSize 须由调用方填 sizeof。
+public struct WNDCLASSEX
+{
+	UINT cbSize;
+	UINT style;
+	WNDPROC lpfnWndProc;
+	int cbClsExtra;
+	int cbWndExtra;
+	HINSTANCE hInstance;
+	HICON hIcon;
+	HCURSOR hCursor;
+	HBRUSH hbrBackground;
+	LPCSTR lpszMenuName;
+	LPCSTR lpszClassName;
+	HICON hIconSm;
+};
+// WNDCLASSEXW = WNDCLASSEX 的宽字符版（lpszMenuName/lpszClassName 取 const wchar_t*），配 RegisterClassExW 使用；布局与 SDK tagWNDCLASSEXW 逐字段一致（cbSize/style 为 UINT、lpfnWndProc 为 WNDPROC、余为句柄 void*）；cbSize 须由调用方填 sizeof。
+public struct WNDCLASSEXW
+{
+	UINT cbSize;
+	UINT style;
+	WNDPROC lpfnWndProc;
+	int cbClsExtra;
+	int cbWndExtra;
+	HINSTANCE hInstance;
+	HICON hIcon;
+	HCURSOR hCursor;
+	HBRUSH hbrBackground;
+	LPCWSTR lpszMenuName;
+	LPCWSTR lpszClassName;
+	HICON hIconSm;
+};
+// MONITORINFO：GetMonitorInfoW 的第二参数（cbSize 需先填 sizeof）；布局对照 SDK tagMONITORINFO（DWORD cbSize / RECT rcMonitor / RECT rcWork / DWORD dwFlags）。
+public struct MONITORINFO
+{
+	DWORD cbSize;
+	struct RECT rcMonitor;
+	struct RECT rcWork;
+	DWORD dwFlags;
+};
+// SCROLLINFO：Get/SetScrollInfo 滚动条状态；对照 SDK tagSCROLLINFO。cbSize 须由调用方填 sizeof。
+public struct SCROLLINFO
+{
+	UINT cbSize;
+	UINT fMask;
+	int nMin;
+	int nMax;
+	UINT nPage;
+	int nPos;
+	int nTrackPos;
+};
+// FLASHWINFO：FlashWindowEx 的任务栏/标题栏闪烁参数；对照 SDK WinUser.h。cbSize 填 sizeof、hwnd=HWND。
+public struct FLASHWINFO
+{
+	UINT cbSize;
+	HWND hwnd;
+	DWORD dwFlags;
+	UINT uCount;
+	DWORD dwTimeout;
+};
+// TRACKMOUSEEVENT：TrackMouseEvent 的光标离开/悬停追踪参数；对照 SDK WinUser.h。cbSize 填 sizeof、hwndTrack=HWND。
+public struct TRACKMOUSEEVENT
+{
+	DWORD cbSize;
+	DWORD dwFlags;
+	HWND hwndTrack;
+	DWORD dwHoverTime;
+};
 
 // —— user32：[[lib("user32")]] 声明库归属（段内按函数名字母序）——
-[[lib("user32")]] public int AdjustWindowRect(struct RECT *lpRect, unsigned long dwStyle, int bMenu);
-[[lib("user32")]] public int AdjustWindowRectEx(struct RECT *lpRect, unsigned long dwStyle, int bMenu, unsigned long dwExStyle);
+[[lib("user32")]] public int AdjustWindowRect(struct RECT *lpRect, unsigned int dwStyle, int bMenu);
+[[lib("user32")]] public int AdjustWindowRectEx(struct RECT *lpRect, unsigned int dwStyle, int bMenu, unsigned int dwExStyle);
 [[lib("user32")]] public int AppendMenuW(void *hMenu, unsigned int uFlags, unsigned long long uIDNewItem, const wchar_t *lpNewItem);
 [[lib("user32")]] public void* BeginPaint(void *hWnd, struct PAINTSTRUCT *lpPaint);
 [[lib("user32")]] public unsigned int CheckMenuItem(void *hMenu, unsigned int uIDCheckItem, unsigned int uCheck);
 [[lib("user32")]] public int ClientToScreen(void *hWnd, struct POINT *lpPoint);
 [[lib("user32")]] public void* CreatePopupMenu(void);
-[[lib("user32")]] public void* CreateWindowExA(unsigned long dwExStyle, const char *lpClassName, const char *lpWindowName, unsigned long dwStyle, int X, int Y, int nWidth, int nHeight, void *hWndParent, void *hMenu, void *hInstance, void *lpParam);
-[[lib("user32")]] public void* CreateWindowExW(unsigned long dwExStyle, const wchar_t *lpClassName, const wchar_t *lpWindowName, unsigned long dwStyle, int X, int Y, int nWidth, int nHeight, void *hWndParent, void *hMenu, void *hInstance, void *lpParam);
+[[lib("user32")]] public void* CreateWindowExA(unsigned int dwExStyle, const char *lpClassName, const char *lpWindowName, unsigned int dwStyle, int X, int Y, int nWidth, int nHeight, void *hWndParent, void *hMenu, void *hInstance, void *lpParam);
+[[lib("user32")]] public void* CreateWindowExW(unsigned int dwExStyle, const wchar_t *lpClassName, const wchar_t *lpWindowName, unsigned int dwStyle, int X, int Y, int nWidth, int nHeight, void *hWndParent, void *hMenu, void *hInstance, void *lpParam);
 [[lib("user32")]] public long long DefWindowProcA(void *hWnd, unsigned int Msg, void *wParam, long long lParam);
 [[lib("user32")]] public long long DefWindowProcW(void *hWnd, unsigned int Msg, void *wParam, long long lParam);
 [[lib("user32")]] public int DestroyIcon(void *hIcon);
@@ -1116,7 +921,7 @@ public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfB
 [[lib("user32")]] public int GetMessageW(struct MSG *lpMsg, void *hWnd, unsigned int wMsgFilterMin, unsigned int wMsgFilterMax);
 [[lib("user32")]] public int GetMonitorInfoW(void *hMonitor, struct MONITORINFO *lpmi);
 [[lib("user32")]] public void* GetParent(void *hWnd);
-[[lib("user32")]] public unsigned long GetSysColor(int nIndex);
+[[lib("user32")]] public unsigned int GetSysColor(int nIndex);
 [[lib("user32")]] public void* GetSysColorBrush(int nIndex);
 [[lib("user32")]] public int GetSystemMetrics(int nIndex);
 [[lib("user32")]] public int GetSystemMetricsForDpi(int nIndex, unsigned int uDpi);
@@ -1143,7 +948,7 @@ public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfB
 [[lib("user32")]] public void* LoadIconW(void *hInstance, const wchar_t *lpIconName);
 [[lib("user32")]] public int MessageBoxA(void *hWnd, const char *lpText, const char *lpCaption, unsigned int uType);
 [[lib("user32")]] public int MessageBoxW(void *hWnd, const wchar_t *lpText, const wchar_t *lpCaption, unsigned int uType);
-[[lib("user32")]] public void* MonitorFromRect(const struct RECT *lprc, unsigned long dwFlags);
+[[lib("user32")]] public void* MonitorFromRect(const struct RECT *lprc, unsigned int dwFlags);
 [[lib("user32")]] public int MoveWindow(void *hWnd, int X, int Y, int nWidth, int nHeight, int bRepaint);
 [[lib("user32")]] public int PeekMessageA(struct MSG *lpMsg, void *hWnd, unsigned int wMin, unsigned int wMax, unsigned int wRemoveMsg);
 [[lib("user32")]] public int PeekMessageW(struct MSG *lpMsg, void *hWnd, unsigned int wMin, unsigned int wMax, unsigned int wRemoveMsg);
@@ -1164,7 +969,7 @@ public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfB
 [[lib("user32")]] public int SetCursorPos(int x, int y);
 [[lib("user32")]] public void* SetFocus(void *hWnd);
 [[lib("user32")]] public int SetForegroundWindow(void *hWnd);
-[[lib("user32")]] public int SetLayeredWindowAttributes(void *hWnd, unsigned long crKey, unsigned char bAlpha, unsigned long dwFlags);
+[[lib("user32")]] public int SetLayeredWindowAttributes(void *hWnd, unsigned int crKey, unsigned char bAlpha, unsigned int dwFlags);
 [[lib("user32")]] public int SetProcessDpiAwarenessContext(void *value);
 [[lib("user32")]] public long long SetTimer(void *hWnd, long long nIDEvent, unsigned int uElapse, void *lpTimerFunc);
 [[lib("user32")]] public int SetWindowLongA(void *hWnd, int nIndex, int dwNewLong);
@@ -1192,12 +997,12 @@ public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfB
 // —— user32 批次 XI 补充（追加于段末、块内字母序；对话框消息/图像加载/显示器查找）——
 [[lib("user32")]] public int IsDialogMessageW(void *hDlg, struct MSG *lpMsg);
 [[lib("user32")]] public void* LoadImageW(void *hInst, const wchar_t *lpszName, unsigned int uType, int cxDesired, int cyDesired, unsigned int fuLoad);
-[[lib("user32")]] public void* MonitorFromWindow(void *hwnd, unsigned long dwFlags);
+[[lib("user32")]] public void* MonitorFromWindow(void *hwnd, unsigned int dwFlags);
 
 // —— user32 批次 XII 补充（追加于段末、块内字母序；窗口/菜单/属性/区域/系统参数/动画/闪烁/鼠标追踪）——
-[[lib("user32")]] public int AdjustWindowRectExForDpi(struct RECT *lpRect, unsigned long dwStyle, int bMenu, unsigned long dwExStyle, unsigned int dpi);
-[[lib("user32")]] public int AllowSetForegroundWindow(unsigned long dwProcessId);
-[[lib("user32")]] public int AnimateWindow(void *hWnd, unsigned long dwTime, unsigned long dwFlags);
+[[lib("user32")]] public int AdjustWindowRectExForDpi(struct RECT *lpRect, unsigned int dwStyle, int bMenu, unsigned int dwExStyle, unsigned int dpi);
+[[lib("user32")]] public int AllowSetForegroundWindow(unsigned int dwProcessId);
+[[lib("user32")]] public int AnimateWindow(void *hWnd, unsigned int dwTime, unsigned int dwFlags);
 [[lib("user32")]] public int BringWindowToTop(void *hWnd);
 [[lib("user32")]] public long long CallWindowProcW(void *lpPrevWndFunc, void *hWnd, unsigned int Msg, void *wParam, long long lParam);
 [[lib("user32")]] public void* CopyIcon(void *hIcon);
@@ -1205,7 +1010,7 @@ public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfB
 [[lib("user32")]] public int FlashWindowEx(struct FLASHWINFO *pfwi);
 [[lib("user32")]] public int GetMenuItemCount(void *hMenu);
 [[lib("user32")]] public void* GetPropW(void *hWnd, const wchar_t *lpString);
-[[lib("user32")]] public unsigned long GetWindowThreadProcessId(void *hWnd, unsigned long *lpdwProcessId);
+[[lib("user32")]] public unsigned int GetWindowThreadProcessId(void *hWnd, unsigned int *lpdwProcessId);
 [[lib("user32")]] public int InvalidateRgn(void *hWnd, void *hRgn, int bErase);
 [[lib("user32")]] public int IsChild(void *hWndParent, void *hWnd);
 [[lib("user32")]] public int MapWindowPoints(void *hWndFrom, void *hWndTo, struct POINT *lpPoints, unsigned int cPoints);
@@ -1221,33 +1026,127 @@ public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfB
 [[lib("user32")]] public int TrackMouseEvent(struct TRACKMOUSEEVENT *lpEventTrack);
 [[lib("user32")]] public int TrackPopupMenuEx(void *hMenu, unsigned int uFlags, int x, int y, void *hWnd, void *lptpm);
 
+// —— gdi32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+public const int LOGPIXELSX = 88;
+public const int PATCOPY = 0x00F00062;
+public const int SRCCOPY = 0x00CC0020;
+public const int WHITE_BRUSH = 0;
+// 画笔样式 PS_* 与端点/接头
+public const int PS_SOLID = 0;
+public const int PS_DASH = 1;
+public const int PS_DOT = 2;
+public const int PS_DASHDOT = 3;
+public const int PS_DASHDOTDOT = 4;
+public const int PS_NULL = 5;
+public const int PS_INSIDEFRAME = 6;
+public const int PS_ALTERNATE = 8;
+public const int PS_ENDCAP_ROUND = 0x00000000;
+public const int PS_ENDCAP_SQUARE = 0x00000100;
+public const int PS_ENDCAP_FLAT = 0x00000200;
+public const int PS_JOIN_ROUND = 0x00000000;
+public const int PS_JOIN_BEVEL = 0x00001000;
+public const int PS_JOIN_MITER = 0x00002000;
+// 映射模式 MM_*
+public const int MM_TEXT = 1;
+public const int MM_LOMETRIC = 2;
+public const int MM_HIMETRIC = 3;
+public const int MM_LOENGLISH = 4;
+public const int MM_HIENGLISH = 5;
+public const int MM_ISOTROPIC = 7;
+public const int MM_ANISOTROPIC = 8;
+// GetStockObject 索引（WHITE_BRUSH=0 已存于上方）
+public const int LTGRAY_BRUSH = 1;
+public const int GRAY_BRUSH = 2;
+public const int DKGRAY_BRUSH = 3;
+public const int BLACK_BRUSH = 4;
+public const int NULL_BRUSH = 5;
+public const int WHITE_PEN = 6;
+public const int BLACK_PEN = 7;
+public const int NULL_PEN = 8;
+public const int OEM_FIXED_FONT = 10;
+public const int ANSI_FIXED_FONT = 11;
+public const int ANSI_VAR_FONT = 12;
+public const int SYSTEM_FONT = 13;
+public const int DEVICE_DEFAULT_FONT = 14;
+public const int DEFAULT_PALETTE = 15;
+public const int DEFAULT_GUI_FONT = 17;
+// 光栅操作 ROP2（dwRop 为 DWORD，按 const unsigned int；SRCCOPY/PATCOPY 已存于上方）
+public const unsigned int BLACKNESS = 0x00000042;
+public const unsigned int NOTSRCCOPY = 0x00330008;
+public const unsigned int SRCERASE = 0x00440328;
+public const unsigned int DSTINVERT = 0x00550009;
+public const unsigned int MERGECOPY = 0x00C000CA;
+public const unsigned int MERGEPAINT = 0x00BB0226;
+public const unsigned int SRCINVERT = 0x00660046;
+public const unsigned int SRCAND = 0x008800C6;
+public const unsigned int SRCPAINT = 0x00EE0086;
+// 文本对齐 TA_*（SetTextAlign）与背景模式 BkMode
+public const int TA_LEFT = 0;
+public const int TA_TOP = 0;
+public const int TA_RIGHT = 2;
+public const int TA_CENTER = 6;
+public const int TA_BOTTOM = 8;
+public const int TA_BASELINE = 24;
+public const int TRANSPARENT = 1;
+public const int OPAQUE = 2;
+// SetStretchBltMode 模式
+public const int BLACKONWHITE = 1;
+public const int WHITEONBLACK = 2;
+// 字体创建参数（wingdi.h）：OUT_TT_PRECIS 真值 = 4（非 10，10 为 OUT_PS_ONLY_PRECIS）；FF_MODERN = 0x30
+public const int FW_NORMAL = 400;
+public const int DEFAULT_CHARSET = 1;
+public const int OUT_DEFAULT_PRECIS = 0;
+public const int OUT_TT_PRECIS = 4;
+public const int CLIP_DEFAULT_PRECIS = 0;
+public const int CLEARTYPE_QUALITY = 5;
+public const int DEFAULT_PITCH = 0;
+public const int FIXED_PITCH = 1;
+public const int FF_DONTCARE = 0;
+public const int FF_MODERN = 0x30;
+
+// —— gdi32 专用结构（仅本段函数使用；定义紧邻其使用者）——
+public struct SIZE
+{
+	LONG cx;
+	LONG cy;
+};
+// 【待核·布局】SDK tagLOGPEN = { UINT lopnStyle; POINT lopnWidth; COLORREF lopnColor; }（x64 24 字节），
+//   本结构现为 POINT+int+COLORREF（16 字节）且字段名不同——疑为布局缺陷（CreatePenIndirect 按 SDK 读字段会错位）。
+//   本批只对齐类型拼写，不改布局/字段名（p215 依赖 poPenLocation/iPenWidth），问题另行定向。
+public struct LOGPEN
+{
+	struct POINT poPenLocation;
+	int iPenWidth;
+	COLORREF oPenColor;
+};
+
 // —— gdi32：[[lib("gdi32")]] 声明库归属（段内按函数名字母序；句柄 HDC/HBRUSH/... 统一作 void*）——
 [[lib("gdi32")]] public int Arc(void *hDC, int x1, int y1, int x2, int y2, int xArc1, int yArc1, int xArc2, int yArc2);
-[[lib("gdi32")]] public int BitBlt(void *hDC, int x, int y, int nWidth, int nHeight, void *hSrcDC, int xSrc, int ySrc, unsigned long dwRop);
+[[lib("gdi32")]] public int BitBlt(void *hDC, int x, int y, int nWidth, int nHeight, void *hSrcDC, int xSrc, int ySrc, unsigned int dwRop);
 [[lib("gdi32")]] public void* CreateCompatibleBitmap(void *hDC, int cx, int cy);
 [[lib("gdi32")]] public void* CreateCompatibleDC(void *hDC);
-[[lib("gdi32")]] public void* CreateFontW(int nHeight, int nWidth, int nEscapement, int nOrientation, int fnWeight, unsigned long fdwItalic, unsigned long fdwUnderline, unsigned long fdwStrikeOut, unsigned long fdwCharSet, unsigned long fdwOutputPrecision, unsigned long fdwClipPrecision, unsigned long fdwQuality, unsigned long fdwPitchAndFamily, const wchar_t *lpszFace);
-[[lib("gdi32")]] public void* CreatePen(int iStyle, int cWidth, unsigned long color);
+[[lib("gdi32")]] public void* CreateFontW(int nHeight, int nWidth, int nEscapement, int nOrientation, int fnWeight, unsigned int fdwItalic, unsigned int fdwUnderline, unsigned int fdwStrikeOut, unsigned int fdwCharSet, unsigned int fdwOutputPrecision, unsigned int fdwClipPrecision, unsigned int fdwQuality, unsigned int fdwPitchAndFamily, const wchar_t *lpszFace);
+[[lib("gdi32")]] public void* CreatePen(int iStyle, int cWidth, unsigned int color);
 [[lib("gdi32")]] public void* CreatePenIndirect(struct LOGPEN *plpen);
-[[lib("gdi32")]] public void* CreateSolidBrush(unsigned long color);
+[[lib("gdi32")]] public void* CreateSolidBrush(unsigned int color);
 [[lib("gdi32")]] public int DeleteDC(void *hDC);
 [[lib("gdi32")]] public int DeleteObject(void *ho);
 [[lib("gdi32")]] public int Ellipse(void *hDC, int left, int top, int right, int bottom);
-[[lib("gdi32")]] public unsigned long GetBkColor(void *hDC);
+[[lib("gdi32")]] public unsigned int GetBkColor(void *hDC);
 [[lib("gdi32")]] public int GetClipBox(void *hDC, struct RECT *lprc);
 [[lib("gdi32")]] public int GetDeviceCaps(void *hDC, int nIndex);
 [[lib("gdi32")]] public int GetObjectA(void *h, int cCount, void *lpv);
 [[lib("gdi32")]] public int GetObjectW(void *h, int cCount, void *lpv);
-[[lib("gdi32")]] public unsigned long GetPixel(void *hDC, int x, int y);
+[[lib("gdi32")]] public unsigned int GetPixel(void *hDC, int x, int y);
 [[lib("gdi32")]] public void* GetStockObject(int fn);
 [[lib("gdi32")]] public int GetStretchBltMode(void *hDC);
-[[lib("gdi32")]] public unsigned long GetTextColor(void *hDC);
+[[lib("gdi32")]] public unsigned int GetTextColor(void *hDC);
 [[lib("gdi32")]] public int GetTextExtentPoint32A(void *hDC, const char *lpString, int c, struct SIZE *lpSize);
 [[lib("gdi32")]] public int GetTextExtentPoint32W(void *hDC, const wchar_t *lpString, int c, struct SIZE *lpSize);
 [[lib("gdi32")]] public int GetTextMetricsA(void *hDC, void *lptm);
 [[lib("gdi32")]] public int LineTo(void *hDC, int x, int y);
 [[lib("gdi32")]] public int MoveToEx(void *hDC, int x, int y, struct POINT *lpPoint);
-[[lib("gdi32")]] public int PatBlt(void *hDC, int x, int y, int nWidth, int nHeight, unsigned long dwRop);
+[[lib("gdi32")]] public int PatBlt(void *hDC, int x, int y, int nWidth, int nHeight, unsigned int dwRop);
 [[lib("gdi32")]] public int Polygon(void *hDC, const struct POINT *apt, int cpt);
 [[lib("gdi32")]] public int Polyline(void *hDC, const struct POINT *apt, int cpt);
 [[lib("gdi32")]] public int Rectangle(void *hDC, int left, int top, int right, int bottom);
@@ -1256,13 +1155,13 @@ public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfB
 [[lib("gdi32")]] public int SaveDC(void *hDC);
 [[lib("gdi32")]] public int SelectClipRgn(void *hDC, void *hrgn);
 [[lib("gdi32")]] public void* SelectObject(void *hDC, void *h);
-[[lib("gdi32")]] public unsigned long SetBkColor(void *hDC, unsigned long color);
+[[lib("gdi32")]] public unsigned int SetBkColor(void *hDC, unsigned int color);
 [[lib("gdi32")]] public int SetBkMode(void *hDC, int iBkMode);
-[[lib("gdi32")]] public unsigned long SetPixel(void *hDC, int x, int y, unsigned long color);
+[[lib("gdi32")]] public unsigned int SetPixel(void *hDC, int x, int y, unsigned int color);
 [[lib("gdi32")]] public int SetStretchBltMode(void *hDC, int mode);
 [[lib("gdi32")]] public int SetTextAlign(void *hDC, unsigned int wFlags);
-[[lib("gdi32")]] public unsigned long SetTextColor(void *hDC, unsigned long color);
-[[lib("gdi32")]] public int StretchBlt(void *hDC, int xDest, int yDest, int wDest, int hDest, void *hSrcDC, int xSrc, int ySrc, int wSrc, int hSrc, unsigned long rop);
+[[lib("gdi32")]] public unsigned int SetTextColor(void *hDC, unsigned int color);
+[[lib("gdi32")]] public int StretchBlt(void *hDC, int xDest, int yDest, int wDest, int hDest, void *hSrcDC, int xSrc, int ySrc, int wSrc, int hSrc, unsigned int rop);
 [[lib("gdi32")]] public int TextOutA(void *hDC, int x, int y, const char *lpString, int c);
 [[lib("gdi32")]] public int TextOutW(void *hDC, int x, int y, const wchar_t *lpString, int c);
 
@@ -1274,48 +1173,388 @@ public int WriteFile(void *hFile, const void *lpBuffer, unsigned long nNumberOfB
 [[lib("gdi32")]] public void* CreateRoundRectRgn(int x1, int y1, int x2, int y2, int w, int h);
 [[lib("gdi32")]] public int FillRgn(void *hDC, void *hRgn, void *hBrush);
 
+// —— comdlg32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+// 文件对话框标志 OFN_*（OPENFILENAMEW.Flags）
+public const int OFN_HIDEREADONLY = 0x00000004;
+public const int OFN_PATHMUSTEXIST = 0x00000800;
+public const int OFN_FILEMUSTEXIST = 0x00001000;
+// 颜色对话框 ChooseColorW 的 Flags
+public const int CC_RGBINIT = 0x00000001;
+public const int CC_FULLOPEN = 0x00000002;
+
+// —— comdlg32 专用结构（仅本段函数使用；定义紧邻其使用者）——
+// OPENFILENAMEW：GetOpenFileNameW/GetSaveFileNameW 参数（commdlg.h tagOFNW）。cbSize/各 DWORD 作 unsigned int，句柄(hwndOwner/hInstance)/回调(lpfnHook)/保留(pvReserved) 作 void*，lCustData=LPARAM 作 long long，WORD 索引起止作 unsigned short；lpstrFile/lpstrCustomFilter/lpstrFileTitle 为调用方分配的 wchar_t 缓冲区，只读入参用 const wchar_t*。cbSize 须由调用方填 sizeof。对照 SDK 10.0.26100.0 逐字段核对。
+public struct OPENFILENAMEW
+{
+	DWORD lStructSize;
+	HWND hwndOwner;
+	HINSTANCE hInstance;
+	LPCWSTR lpstrFilter;
+	LPWSTR lpstrCustomFilter;
+	DWORD nMaxCustFilter;
+	DWORD nFilterIndex;
+	LPWSTR lpstrFile;
+	DWORD nMaxFile;
+	LPWSTR lpstrFileTitle;
+	DWORD nMaxFileTitle;
+	LPCWSTR lpstrInitialDir;
+	LPCWSTR lpstrTitle;
+	DWORD Flags;
+	WORD nFileOffset;
+	WORD nFileExtension;
+	LPCWSTR lpstrDefExt;
+	LPARAM lCustData;
+	void *lpfnHook;
+	LPCWSTR lpTemplateName;
+	void *pvReserved;
+	DWORD dwReserved;
+	DWORD FlagsEx;
+};
+// CHOOSECOLORW：ChooseColorW 的颜色对话框参数；对照 SDK tagCHOOSECOLORW。lpCustColors 为调用方 COLORREF 数组、lpfnHook 函数指针按既有设计作 void*。lStructSize 填 sizeof。
+public struct CHOOSECOLORW
+{
+	DWORD lStructSize;
+	HWND hwndOwner;
+	HWND hInstance;
+	COLORREF rgbResult;
+	COLORREF *lpCustColors;
+	DWORD Flags;
+	LPARAM lCustData;
+	void *lpfnHook;
+	LPCWSTR lpTemplateName;
+};
+
 // —— comdlg32：[[lib("comdlg32")]] 通用对话框（段内字母序）——
 [[lib("comdlg32")]] public int ChooseColorW(struct CHOOSECOLORW *lpcc);
 [[lib("comdlg32")]] public int GetOpenFileNameW(struct OPENFILENAMEW *lpofn);
 
-// —— ole32：[[lib("ole32")]] COM 套间初始化/任务内存（段内字母序；HRESULT=LSTATUS 系 32 位 long）——
-[[lib("ole32")]] public long CoInitializeEx(void *pvReserved, unsigned long dwCoInit);
+// —— ole32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+// COM 初始化标志 COINIT_*
+public const int COINIT_APARTMENTTHREADED = 0x2;
+
+// —— ole32：[[lib("ole32")]] COM 套间初始化/任务内存（段内字母序；HRESULT=LSTATUS 系 32 位 int）——
+[[lib("ole32")]] public int CoInitializeEx(void *pvReserved, unsigned int dwCoInit);
 [[lib("ole32")]] public void CoTaskMemFree(void *pv);
 [[lib("ole32")]] public void CoUninitialize(void);
 
-// —— shell32：[[lib("shell32")]] Shell 目录浏览/已知文件夹/托盘图标（段内字母序；LPITEMIDLIST/PCIDLIST_ABSOLUTE 作 void*，HRESULT=long）——
+// —— shell32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+// Shell 目录浏览标志 BIF_*（BROWSEINFOW.ulFlags）
+public const int BIF_RETURNONLYFSDIRS = 0x00000001;
+public const int BIF_NEWDIALOGSTYLE = 0x00000040;
+// 托盘图标 Shell_NotifyIconW 的消息（NIM_*）/ uFlags（NIF_*；含 NIF_REALTIME=0x40、NIF_SHOWTIP=0x80）/ 状态（NIS_*）/ 气泡标志（NIIF_*）
+public const int NIM_ADD = 0x00000000;
+public const int NIM_MODIFY = 0x00000001;
+public const int NIM_DELETE = 0x00000002;
+public const int NIM_SETFOCUS = 0x00000003;
+public const int NIM_SETVERSION = 0x00000004;
+public const int NIF_MESSAGE = 0x00000001;
+public const int NIF_ICON = 0x00000002;
+public const int NIF_TIP = 0x00000004;
+public const int NIF_STATE = 0x00000008;
+public const int NIF_INFO = 0x00000010;
+public const int NIF_GUID = 0x00000020;
+public const int NIF_REALTIME = 0x00000040;
+public const int NIF_SHOWTIP = 0x00000080;
+public const int NIS_HIDDEN = 0x00000001;
+public const int NIS_SHAREDICON = 0x00000002;
+public const int NIIF_NONE = 0x00000000;
+public const int NIIF_INFO = 0x00000001;
+public const int NIIF_WARNING = 0x00000002;
+public const int NIIF_ERROR = 0x00000003;
+public const int NIIF_USER = 0x00000004;
+public const int NIIF_ICON_MASK = 0x0000000F;
+public const int NIIF_NOSOUND = 0x00000010;
+public const int NIIF_LARGE_ICON = 0x00000020;
+public const int NIIF_RESPECT_QUIET_TIME = 0x00000080;
+
+// —— shell32 专用结构（仅本段函数使用；定义紧邻其使用者）——
+// BROWSEINFOW：SHBrowseForFolderW 参数（shlobj.h _BROWSEINFOW）。hwndOwner/pidlRoot/lpfn(回调)/作 void*，pszDisplayName 为调用方缓冲区 wchar_t*，lpszTitle 只读 const wchar_t*，ulFlags=UINT 作 unsigned int，lParam=LPARAM 作 long long，iImage=int。对照 SDK 核对。
+public struct BROWSEINFOW
+{
+	HWND hwndOwner;
+	void *pidlRoot;
+	LPWSTR pszDisplayName;
+	LPCWSTR lpszTitle;
+	UINT ulFlags;
+	void *lpfn;
+	LPARAM lParam;
+	int iImage;
+};
+// NOTIFYICONDATAW：Shell_NotifyIconW 的托盘图标项（Vista+ 布局，含 hBalloonIcon）；对照 SDK shellapi.h。cbSize 填 sizeof；超时/版本匿名 union 二字段同为 UINT、collapse 为 uVersion、4 字节 ABI 不变；guidItem 用已定义 struct GUID，hIcon/hBalloonIcon=HICON（句柄族 void*）。
+public struct NOTIFYICONDATAW
+{
+	DWORD cbSize;
+	HWND hWnd;
+	UINT uID;
+	UINT uFlags;
+	UINT uCallbackMessage;
+	HICON hIcon;
+	WCHAR szTip[128];
+	DWORD dwState;
+	DWORD dwStateMask;
+	WCHAR szInfo[256];
+	UINT uVersion;
+	WCHAR szInfoTitle[64];
+	DWORD dwInfoFlags;
+	struct GUID guidItem;
+	HICON hBalloonIcon;
+};
+
+// —— shell32：[[lib("shell32")]] Shell 目录浏览/已知文件夹/托盘图标（段内字母序；LPITEMIDLIST/PCIDLIST_ABSOLUTE 作 void*，HRESULT=int）——
 [[lib("shell32")]] public void* SHBrowseForFolderW(struct BROWSEINFOW *lpbi);
-[[lib("shell32")]] public long SHGetFolderPathW(void *hwnd, int csidl, void *hToken, unsigned long dwFlags, wchar_t *pszPath);
+[[lib("shell32")]] public int SHGetFolderPathW(void *hwnd, int csidl, void *hToken, unsigned int dwFlags, wchar_t *pszPath);
 [[lib("shell32")]] public int SHGetPathFromIDListW(void *pidl, wchar_t *pszPath);
 [[lib("shell32")]] public int Shell_NotifyIconW(unsigned int dwMessage, struct NOTIFYICONDATAW *lpData);
 
-// —— advapi32：[[lib("advapi32")]] 注册表（段内字母序；HKEY/PHKEY 作 void*/void**，LSTATUS=long，REGSAM/dword=unsigned long，BYTE*=unsigned char*）——
-[[lib("advapi32")]] public long RegCloseKey(void *hKey);
-[[lib("advapi32")]] public long RegCreateKeyExW(void *hKey, const wchar_t *lpSubKey, unsigned long Reserved, wchar_t *lpClass, unsigned long dwOptions, unsigned long samDesired, void *lpSecurityAttributes, void **phkResult, unsigned long *lpdwDisposition);
-[[lib("advapi32")]] public long RegDeleteValueW(void *hKey, const wchar_t *lpValueName);
-[[lib("advapi32")]] public long RegOpenKeyExW(void *hKey, const wchar_t *lpSubKey, unsigned long ulOptions, unsigned long samDesired, void **phkResult);
-[[lib("advapi32")]] public long RegGetValueW(void *hkey, const wchar_t *lpSubKey, const wchar_t *lpValue, unsigned long dwFlags, unsigned long *pdwType, void *pvData, unsigned long *pcbData);
-[[lib("advapi32")]] public long RegQueryValueExW(void *hKey, const wchar_t *lpValueName, unsigned long *lpReserved, unsigned long *lpType, unsigned char *lpData, unsigned long *lpcbData);
-[[lib("advapi32")]] public long RegSetValueExW(void *hKey, const wchar_t *lpValueName, unsigned long Reserved, unsigned long dwType, const unsigned char *lpData, unsigned long cbData);
+// —— advapi32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+// 注册表预定义键伪句柄：真身为 ((HKEY)(ULONG_PTR)((LONG)0x80000001/2))，(LONG) 后 64 位符号扩展 = 0xFFFFFFFF80000001/2；按 const long long 存符号扩展后真值，调用处以 (void*)HKEY_* 传参
+public const long long HKEY_CURRENT_USER = -2147483647;
+public const long long HKEY_LOCAL_MACHINE = -2147483646;
+// 注册表访问权限 REGSAM / 值类型 / RegGetValue 标志 / 错误码
+public const int KEY_SET_VALUE = 0x0002;
+public const int KEY_WOW64_64KEY = 0x0100;
+public const int KEY_WOW64_32KEY = 0x0200;
+public const int KEY_READ = 0x00020019;
+public const int REG_SZ = 1;
+public const int RRF_RT_REG_SZ = 0x00000002;
+// 注册表值类型（REG_*，SDK winnt.h）
+public const int REG_DWORD = 4;
+
+// —— advapi32：[[lib("advapi32")]] 注册表（段内字母序；HKEY/PHKEY 作 void*/void**，LSTATUS=int，REGSAM/dword=unsigned int，BYTE*=unsigned char*）——
+[[lib("advapi32")]] public int RegCloseKey(void *hKey);
+[[lib("advapi32")]] public int RegCreateKeyExW(void *hKey, const wchar_t *lpSubKey, unsigned int Reserved, wchar_t *lpClass, unsigned int dwOptions, unsigned int samDesired, void *lpSecurityAttributes, void **phkResult, unsigned int *lpdwDisposition);
+[[lib("advapi32")]] public int RegDeleteValueW(void *hKey, const wchar_t *lpValueName);
+[[lib("advapi32")]] public int RegOpenKeyExW(void *hKey, const wchar_t *lpSubKey, unsigned int ulOptions, unsigned int samDesired, void **phkResult);
+[[lib("advapi32")]] public int RegGetValueW(void *hkey, const wchar_t *lpSubKey, const wchar_t *lpValue, unsigned int dwFlags, unsigned int *pdwType, void *pvData, unsigned int *pcbData);
+[[lib("advapi32")]] public int RegQueryValueExW(void *hKey, const wchar_t *lpValueName, unsigned int *lpReserved, unsigned int *lpType, unsigned char *lpData, unsigned int *lpcbData);
+[[lib("advapi32")]] public int RegSetValueExW(void *hKey, const wchar_t *lpValueName, unsigned int Reserved, unsigned int dwType, const unsigned char *lpData, unsigned int cbData);
+
+// —— comctl32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+// 通用控件 / tooltip（comctl32 · InitCommonControlsEx / TTM_*）
+public const int TTS_ALWAYSTIP = 0x01;
+public const int TTS_NOPREFIX = 0x02;
+public const int TTF_IDISHWND = 0x0001;
+public const int TTF_SUBCLASS = 0x0010;
+public const int TTM_SETDELAYTIME = 0x0403;
+public const int TTM_ADDTOOLW = 0x0432;
+public const int TTM_DELTOOLW = 0x0433;
+public const int TTDT_AUTOPOP = 2;
+public const int TTDT_INITIAL = 3;
+public const int ICC_WIN95_CLASSES = 0xFF;
+
+// —— comctl32 专用结构（仅本段函数使用；定义紧邻其使用者）——
+// INITCOMMONCONTROLSEX：InitCommonControlsEx 的初始化请求；对照 SDK。dwSize 填 sizeof。
+public struct INITCOMMONCONTROLSEX
+{
+	DWORD dwSize;
+	DWORD dwICC;
+};
 
 // —— comctl32：[[lib("comctl32")]] 通用控件初始化（段内字母序）——
 [[lib("comctl32")]] public int InitCommonControlsEx(struct INITCOMMONCONTROLSEX *picce);
 
 // —— shlwapi：[[lib("shlwapi")]] 轻量路径/工具函数（段内字母序）——
-[[lib("shlwapi")]] public int PathCompactPathExW(wchar_t *pszOut, const wchar_t *pszSrc, unsigned long cchMax, unsigned long dwFlags);
+[[lib("shlwapi")]] public int PathCompactPathExW(wchar_t *pszOut, const wchar_t *pszSrc, unsigned int cchMax, unsigned int dwFlags);
 
-// —— dwmapi：[[lib("dwmapi")]] 玻璃模糊区域（段内字母序；HWND/HRGN 作 void*，HRESULT=long）——
-[[lib("dwmapi")]] public long DwmEnableBlurBehindWindow(void *hWnd, const struct DWM_BLURBEHIND *pBlurBehind);
-[[lib("dwmapi")]] public long DwmSetWindowAttribute(void *hWnd, unsigned long dwAttribute, const void *pvAttribute, unsigned long cbAttribute);
+// —— dwmapi 专用常量（仅本段函数使用；定义紧邻其使用者）——
+// DWM 模糊区域 DwmEnableBlurBehindWindow 的 dwFlags
+public const int DWM_BB_ENABLE = 0x00000001;
+public const int DWM_BB_BLURREGION = 0x00000002;
 
-// —— pdh：[[lib("pdh")]] 性能数据查询（段内字母序；PDH_HQUERY/HCOUNTER 作 void*，PDH_STATUS=long，DWORD_PTR=unsigned long long，出参 *ph 作 void**，ItemBuffer 作 void*——PDH_FMT_COUNTERVALUE_ITEM_W 含匿名 union、留待 win32metadata 自动生成）——
-[[lib("pdh")]] public long PdhAddCounterW(void *hQuery, const wchar_t *szFullCounterPath, unsigned long long dwUserData, void **phCounter);
-[[lib("pdh")]] public long PdhCloseQuery(void *hQuery);
-[[lib("pdh")]] public long PdhCollectQueryData(void *hQuery);
-[[lib("pdh")]] public long PdhGetFormattedCounterArrayW(void *hCounter, unsigned long dwFormat, unsigned long *lpdwItemsFound, unsigned long *lpdwBufferLength, void *ppBuffer);
-[[lib("pdh")]] public long PdhOpenQueryW(const wchar_t *szDataSource, unsigned long long dwUserData, void **phQuery);
+// —— dwmapi 专用结构（仅本段函数使用；定义紧邻其使用者）——
+// DWM_BLURBEHIND：DwmEnableBlurBehindWindow 的模糊描述；对照 SDK dwmapi.h。HRGN 句柄作 void*。
+public struct DWM_BLURBEHIND
+{
+	DWORD dwFlags;
+	BOOL fEnable;
+	HRGN hRgnBlur;
+	BOOL fTransitionOnMaximized;
+};
 
-// —— imm32：[[lib("imm32")]] 输入法上下文（段内字母序；HIMC/HWND 作 void*，SDK 形参 IN DWORD→unsigned long，返回 LONG→long）——
+// —— dwmapi：[[lib("dwmapi")]] 玻璃模糊区域（段内字母序；HWND/HRGN 作 void*，HRESULT=int）——
+[[lib("dwmapi")]] public int DwmEnableBlurBehindWindow(void *hWnd, const struct DWM_BLURBEHIND *pBlurBehind);
+[[lib("dwmapi")]] public int DwmSetWindowAttribute(void *hWnd, unsigned int dwAttribute, const void *pvAttribute, unsigned int cbAttribute);
+
+// —— pdh 专用常量（仅本段函数使用；定义紧邻其使用者）——
+// PDH 性能数据（PdhGetFormattedCounterArrayW 格式化类型 / 缓冲区不足状态码，高位置位故用 unsigned int）
+public const int PDH_FMT_DOUBLE = 0x00000200;
+public const unsigned int PDH_MORE_DATA = 0x800007D2;
+
+// —— pdh：[[lib("pdh")]] 性能数据查询（段内字母序；PDH_HQUERY/HCOUNTER 作 void*，PDH_STATUS=int，DWORD_PTR=unsigned long long，出参 *ph 作 void**，ItemBuffer 作 void*——PDH_FMT_COUNTERVALUE_ITEM_W 含匿名 union、留待 win32metadata 自动生成）——
+[[lib("pdh")]] public int PdhAddCounterW(void *hQuery, const wchar_t *szFullCounterPath, unsigned long long dwUserData, void **phCounter);
+[[lib("pdh")]] public int PdhCloseQuery(void *hQuery);
+[[lib("pdh")]] public int PdhCollectQueryData(void *hQuery);
+[[lib("pdh")]] public int PdhGetFormattedCounterArrayW(void *hCounter, unsigned int dwFormat, unsigned int *lpdwItemsFound, unsigned int *lpdwBufferLength, void *ppBuffer);
+[[lib("pdh")]] public int PdhOpenQueryW(const wchar_t *szDataSource, unsigned long long dwUserData, void **phQuery);
+
+// —— imm32：[[lib("imm32")]] 输入法上下文（段内字母序；HIMC/HWND 作 void*，SDK 形参 IN DWORD→unsigned int，返回 LONG→int）——
 [[lib("imm32")]] public void* ImmGetContext(void *hWnd);
-[[lib("imm32")]] public long ImmGetCompositionStringW(void *hIMC, unsigned long dwIndex, void *lpBuf, unsigned long dwBufLen);
+[[lib("imm32")]] public int ImmGetCompositionStringW(void *hIMC, unsigned int dwIndex, void *lpBuf, unsigned int dwBufLen);
 [[lib("imm32")]] public int ImmReleaseContext(void *hWnd, void *hIMC);
+
+// —— ws2_32 专用常量（仅本段函数使用；定义紧邻其使用者）——
+//   Winsock 地址族/套接字类型/协议/初始化哨兵；INVALID_SOCKET 作 unsigned long long（x64 SOCKET=UINT_PTR=8）。
+public const int AF_INET = 2;
+public const int AF_INET6 = 23;   // Windows winsock2.h AF_INET6=23（非 Linux 的 10）
+public const int SOCK_STREAM = 1;
+public const int SOCK_DGRAM = 2;
+public const int IPPROTO_TCP = 6;
+public const int IPPROTO_UDP = 17;
+public const unsigned int INADDR_ANY = 0;
+public const unsigned long long INVALID_SOCKET = 0xFFFFFFFFFFFFFFFFull;
+public const int SOCKET_ERROR = -1;
+public const int SOMAXCONN = -1;
+public const int AI_PASSIVE = 0x00000001;
+public const int AI_CANONNAME = 0x00000002;
+public const int AI_NUMERICHOST = 0x00000004;
+public const int AI_NUMERICSERV = 0x00000008;
+public const int AI_ADDRCONFIG = 0x00000400;
+public const int IPPROTO_IP = 0;
+public const int SOL_SOCKET = 0xFFFF;
+public const int SO_DEBUG = 0x0001;
+public const int SO_REUSEADDR = 0x0004;
+public const int SO_KEEPALIVE = 0x0008;
+public const int SO_BROADCAST = 0x0020;
+public const int SO_LINGER = 0x0080;
+public const int SO_SNDBUF = 0x1001;
+public const int SO_RCVBUF = 0x1002;
+public const int SO_ERROR = 0x1007;
+public const int SO_TYPE = 0x1008;
+public const int TCP_NODELAY = 0x0001;
+public const int FD_SETSIZE = 64;
+// —— ws2_32 Winsock 错误码（WSABASEERR=10000 + BSD errno，值按 winsock2.h 文档；供 WSAGetLastError 比对）——
+public const int WSAEINTR = 10004;
+public const int WSAEBADF = 10009;
+public const int WSAEACCES = 10013;
+public const int WSAEFAULT = 10014;
+public const int WSAEINVAL = 10022;
+public const int WSAEMFILE = 10024;
+public const int WSAEWOULDBLOCK = 10035;
+public const int WSAEINPROGRESS = 10036;
+public const int WSAEALREADY = 10037;
+public const int WSAENOTSOCK = 10038;
+public const int WSAEDESTADDRREQ = 10039;
+public const int WSAEMSGSIZE = 10040;
+public const int WSAEPROTOTYPE = 10041;
+public const int WSAENOPROTOOPT = 10042;
+public const int WSAEPROTONOSUPPORT = 10043;
+public const int WSAESOCKTNOSUPPORT = 10044;
+public const int WSAEOPNOTSUPP = 10045;
+public const int WSAEAFNOSUPPORT = 10047;
+public const int WSAEADDRINUSE = 10048;
+public const int WSAEADDRNOTAVAIL = 10049;
+public const int WSAENETDOWN = 10050;
+public const int WSAENETUNREACH = 10051;
+public const int WSAECONNABORTED = 10053;
+public const int WSAECONNRESET = 10054;
+public const int WSAENOBUFS = 10055;
+public const int WSAEISCONN = 10056;
+public const int WSAENOTCONN = 10057;
+public const int WSAESHUTDOWN = 10058;
+public const int WSAETIMEDOUT = 10060;
+public const int WSAECONNREFUSED = 10061;
+public const int WSAEHOSTUNREACH = 10065;
+// —— ws2_32 ioctlsocket 命令（值按 winsock2.h；u_long 于 LLP64 宽 4，按底层 unsigned int 书写）——
+public const unsigned int FIONBIO = 0x8004667e;
+public const unsigned int FIONREAD = 0x4004667f;
+
+// —— ws2_32 专用结构（仅本段函数使用；定义紧邻其使用者；x64/LLP64 自然对齐，字段按底层类型书写）——
+//   WSADATA（故 WSAStartup 出参作 void*）/ hostent（含指针数组与 union）布局繁复、无运行期证伪 → 与 TEXTMETRIC 同策略留待 win32metadata 自动生成。fd_set 经复核布局可 sizeof 证伪（fd_count + SOCKET[64]），改为手写（见下）。
+public struct in_addr
+{
+	unsigned int s_addr;   // sizeof 4（简化：真实为 union S_un{b/w/S_addr}，首址同宽同 4）
+};
+public struct sockaddr
+{
+	unsigned short sa_family;   // ADDRESS_FAMILY（u_short, 2）
+	char sa_data[14];           // sizeof sockaddr = 16
+};
+public struct sockaddr_in
+{
+	unsigned short sin_family;   // ADDRESS_FAMILY（2）
+	unsigned short sin_port;     // 网络字节序（2）
+	struct in_addr sin_addr;     // 4
+	char sin_zero[8];            // 填充至 16；sizeof sockaddr_in = 16
+};
+
+// addrinfo：getaddrinfo 的出入参与链表结构（对照 SDK ws2tcpip.h struct addrinfo；x64 sizeof=48）
+public struct addrinfo
+{
+	int ai_flags;                 // 偏移 0
+	int ai_family;                // 4
+	int ai_socktype;              // 8
+	int ai_protocol;              // 12
+	unsigned int ai_addrlen;      // socklen_t，16（指针成员前补至 24）
+	char *ai_canonname;           // 24（SDK 顺序 canonname 先于 addr）
+	struct sockaddr *ai_addr;     // 32
+	struct addrinfo *ai_next;     // 40；sizeof addrinfo = 48
+};
+
+// fd_set：select 的读/写/异常就绪集（对照 SDK winsock2.h；x64 SOCKET=unsigned long long=8；sizeof fd_set=520）
+public struct fd_set
+{
+	unsigned int fd_count;             // 偏移 0（u_int）；SOCKET 成员对齐 8 → 补至 8
+	unsigned long long fd_array[64];   // SOCKET[FD_SETSIZE]，偏移 8；64*8=512；sizeof fd_set = 520
+};
+// timeval：select 超时（对照 SDK winsock2.h struct timeval；long 于 LLP64 宽 4，按底层 int 书写；sizeof=8）
+public struct timeval
+{
+	int tv_sec;    // 偏移 0（SDK long，LLP64 宽 4）
+	int tv_usec;   // 4；sizeof timeval = 8
+};
+
+// —— ws2_32：[[lib("ws2_32")]] BSD 套接字起步族（段内字母序，case-sensitive：大写 WSA* 先于小写函数；SOCKET 形参/返回按底层类型 unsigned long long；struct sockaddr* 形参按指针 * 贴名）——
+[[lib("ws2_32")]] public int WSACleanup(void);
+[[lib("ws2_32")]] public int WSAStartup(unsigned short wVersionRequested, void *lpWSAData);
+[[lib("ws2_32")]] public unsigned long long accept(unsigned long long s, struct sockaddr *addr, int *addrlen);
+[[lib("ws2_32")]] public int bind(unsigned long long s, const struct sockaddr *name, int namelen);
+[[lib("ws2_32")]] public int closesocket(unsigned long long s);
+[[lib("ws2_32")]] public int connect(unsigned long long s, const struct sockaddr *name, int namelen);
+[[lib("ws2_32")]] public int gethostname(char *name, int namelen);
+[[lib("ws2_32")]] public unsigned int htonl(unsigned int hostlong);
+[[lib("ws2_32")]] public unsigned short htons(unsigned short hostshort);
+[[lib("ws2_32")]] public unsigned int inet_addr(const char *cp);
+[[lib("ws2_32")]] public int listen(unsigned long long s, int backlog);
+[[lib("ws2_32")]] public unsigned int ntohl(unsigned int netlong);
+[[lib("ws2_32")]] public unsigned short ntohs(unsigned short netshort);
+[[lib("ws2_32")]] public int recv(unsigned long long s, char *buf, int len, int flags);
+[[lib("ws2_32")]] public int send(unsigned long long s, const char *msg, int len, int flags);
+[[lib("ws2_32")]] public int shutdown(unsigned long long s, int how);
+[[lib("ws2_32")]] public unsigned long long socket(int af, int type, int protocol);
+
+// —— ws2_32 批次补充：地址解析族（追加于段末、块内字母序；addrinfo* 按指针贴名；gai_strerror 返回 char* 按指针贴类型）——
+[[lib("ws2_32")]] public void freeaddrinfo(struct addrinfo *res);
+[[lib("ws2_32")]] public char* gai_strerror(int error);
+[[lib("ws2_32")]] public int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res);
+
+// —— ws2_32 批次补充：套接字选项族（追加于段末、块内字母序；optval 按 SDK 作 char* 字节缓冲指针）——
+[[lib("ws2_32")]] public int getsockopt(unsigned long long s, int level, int optname, char *optval, int *optlen);
+[[lib("ws2_32")]] public int setsockopt(unsigned long long s, int level, int optname, const char *optval, int optlen);
+
+// —— ws2_32 批次补充：I/O 多路复用族（追加于段末；fd_set* 按指针贴名，timeout 按 SDK 作 const struct timeval*）——
+[[lib("ws2_32")]] public int select(int nfds, struct fd_set *readfds, struct fd_set *writefds, struct fd_set *exceptfds, const struct timeval *timeout);
+
+// —— ws2_32 批次补充：错误码族（追加于段末、块内字母序；WSAGetLastError/WSASetLastError 为线程局部错误码，与网络无关，可硬验证）——
+[[lib("ws2_32")]] public int WSAGetLastError(void);
+[[lib("ws2_32")]] public void WSASetLastError(int iError);
+
+// —— ws2_32 批次补充：地址转换族（追加于段末、块内字母序；inet_ntop 返回 const char* 按指针贴类型，src/dst 按 SDK 作 void* 二进制缓冲；size 按 socklen_t 作 int）——
+[[lib("ws2_32")]] public const char* inet_ntop(int af, const void *src, char *dst, int size);
+[[lib("ws2_32")]] public int inet_pton(int af, const char *src, void *dst);
+
+// —— ws2_32 批次补充：socket 查询族（追加于段末、块内字母序；namelen 按 socklen_t 作 int*；ioctlsocket cmd 按 u_long 作 unsigned int、argp u_long* 作 unsigned int*）——
+[[lib("ws2_32")]] public int getpeername(unsigned long long s, struct sockaddr *name, int *namelen);
+[[lib("ws2_32")]] public int getsockname(unsigned long long s, struct sockaddr *name, int *namelen);
+[[lib("ws2_32")]] public int ioctlsocket(unsigned long long s, unsigned int cmd, unsigned int *argp);
+
+// —— crypt32 专用常量（CryptoAPI 字符串编解码标志；值按 crypt32.h 文档，CRYPT_STRING_* 作 int）——
+public const int CRYPT_STRING_BASE64 = 0x00000001;
+public const int CRYPT_STRING_BINARY = 0x00000002;
+public const int CRYPT_STRING_HEX = 0x00000004;
+public const int CRYPT_STRING_HEXRAW = 0x0000000C;
+public const int CRYPT_STRING_NOSPACE = 0x10000000;
+public const int CRYPT_STRING_NOCRLF = 0x40000000;
+
+// —— crypt32：[[lib("crypt32")]] CryptoAPI 起步族（Base64/十六进制编解码，纯缓冲进出、本地可硬验证；BOOL 按 int、BYTE* 按 char*、DWORD 按 int）——
+[[lib("crypt32")]] public int CryptBinaryToStringA(const char *pbBinary, int cbBinary, int dwFlags, char *pszString, int *pcchString);
+[[lib("crypt32")]] public int CryptStringToBinaryA(const char *pszString, int cchString, int dwFlags, char *pbBinary, int *pcbBinary, int *pdwSkip, int *pdwFlags);
