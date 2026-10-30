@@ -19,6 +19,7 @@
 #include "colang/type_resolver.h"
 #include "colang/type_spell.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cctype>
 #include <string>
@@ -85,7 +86,12 @@ public:
 		for (const auto &g : tu->globals)
 			if (g.is_deprecated) dep_globals_[g.name] = g.deprecated_msg;
 		for (const auto &s : tu->structs)
-			if (!s.tag.empty()) structs_[s.tag] = &s;
+		{
+			if (s.tag.empty()) continue;
+			structs_[s.tag] = &s;
+			// P305：单建一份「真定义」索引（前置引用空壳不得盖住定义，成员名校核依赖它）。
+			if (s.is_definition) real_struct_defs_[s.tag] = &s;
+		}
 		// P217：enum 类型标签登记表（供跨模块类型可见性门禁查 is_public/source_module_key）
 		for (const auto &e : tu->enums)
 			if (!e.tag.empty()) enums_[e.tag] = &e;
@@ -106,6 +112,16 @@ public:
 			// P300 形参借用（0.4.0 收尾）：class 句柄作方法形参（不 retain、出域不 release、
 			//   重绑定不转移所有权，由 codegen borrowed_slots_ 承载）；普通函数 class 形参本无门禁、口径一致。
 		}
+		// P304：文件作用域 typedef 的导出面登记（全量，含非 public）。typedef 在 AST 里不留别名（parse
+		//   期已展开），这两张表只用于两处诊断口径：写错模块别名、与非 public 的限定访问拒收。
+		for (const auto &td : tu->typedefs)
+		{
+			if (td.name.empty()) continue;
+			typedef_names_.insert(td.name);
+			if (!td.source_module_key.empty()) typedef_owner_[td.name].insert(td.source_module_key);
+		}
+		// P302：限定类型名 `mod.Tag` 的别名键（依赖 build_catalog 已建的逐模块 public 视图）。
+		if (per_module_) register_qualified_type_aliases(tu);
 		// 路 B 阶段1（ambient 切断）：登记「主源自身声明」的名字集（source_module_key 空，
 		//   含主源自带 #include 带入的原型）。宿主自身可见的名字优先于被导入模块的同名项，跨模块可见性
 		//   门禁据此豁免——根除「cannot import non-public symbol 'printf'」类 ambient 误报（宿主与子模块
@@ -170,7 +186,39 @@ public:
 					enforce_type_visible(m.type, s.loc);
 					enforce_complete_type(m.type, s.loc, IctxField); // P255：字段不完整类型
 				}
-		// 仅检查函数体（全局初始化器暂不查，降低误伤面）
+		// 0.4.1：全局/文件作用域初始化式的类型相容（原「全局初始化器暂不查」的保守口径收窄为
+		//   「只查可判定的相容性」：聚合初始化、数组目标、未知类型与另族形态仍交既有机器件）
+		for (const auto &g : tu->globals)
+		{
+			if (!g.init || g.is_extern || is_nullptr(g.init) || g.init->kind == ExprKind::InitList) continue;
+			if (!g.type || g.type->kind == TypeKind::Array) continue;
+			if (is_ternary_src(g.init) && !ternary_has_void_arm(g.init)) continue; // 条件运算符来源不判（P335：void 臂例外）
+			const CTypePtr rt = resolve_type(g.init);
+			const Compat cc = assign_compat(rt, g.type, g.init);
+			if (cc != Compat::Ok && cc != Compat::Skip)
+				report(cc == Compat::VoidValue && !g.ident_loc.file.empty() ? g.ident_loc : g.init->loc,
+				       compat_init_msg(g.type, rt, cc));
+		}
+		// P324：文件作用域聚合初始化器元素位类型相容（上面对 InitList 跳过，此处补上）
+		for (const auto &g : tu->globals)
+			if (g.init && !g.is_extern && g.init->kind == ExprKind::InitList)
+				check_aggregate_init(g.type, g.init);
+		// P334：文件作用域初始化式里的二元操作数结构合法性（优先于 P332/P317；全局初值不走 check_expr）
+		for (const auto &g : tu->globals)
+			if (g.init && !g.is_extern) check_binary_operands_chain(g.init, 0);
+		// P317：文件作用域初始化式里的指针差相容（不受上段 assign 口径限制，见 check_ptr_diff_chain）
+		for (const auto &g : tu->globals)
+			if (g.init && !g.is_extern) check_ptr_diff_chain(g.init, 0);
+		// P323：文件作用域初始化式里的下标基型（同上：全局初值不走 check_expr）
+		for (const auto &g : tu->globals)
+			if (g.init && !g.is_extern) check_subscript_chain(g.init, 0);
+		// P333：文件作用域初始化式里的 sizeof/_Alignof 操作数完整性（同上：全局初值不走 check_expr）
+		for (const auto &g : tu->globals)
+			if (g.init && !g.is_extern) check_sizeof_chain(g.init, 0);
+		// P332：文件作用域初始化式里的不完整记录指针算术（同上：全局初值不走 check_expr）
+		for (const auto &g : tu->globals)
+			if (g.init && !g.is_extern) check_ptr_arith_chain(g.init, 0);
+		// 仅检查函数体（全局初始化器的类型相容已在上段单独查）
 		// P249：[[noreturn]] 直接登记为「永不返回」，先于控制流推断——使仅有声明（无 body、
 		//   如头文件原型）的 noreturn 函数在调用点同样按不返回处理。
 		for (const auto &n : noreturn_funcs_) dead_ends_.insert(n);
@@ -191,15 +239,6 @@ public:
 	void build_catalog(const TUPtr &tu)
 	{
 		// 模块 key → 文件名 stem（去扩展名）：默认限定名。
-		auto stem_of = [](const std::string &key) -> std::string
-		{
-			std::string base = key;
-			auto slash = base.find_last_of("/\\");
-			if (slash != std::string::npos) base = base.substr(slash + 1);
-			auto dot = base.find_last_of('.');
-			if (dot != std::string::npos) base = base.substr(0, dot);
-			return base;
-		};
 		for (const auto &f : tu->funcs)
 		{
 			if (f.source_module_key.empty() || !f.is_public) continue;
@@ -216,24 +255,55 @@ public:
 		{
 			if (s.source_module_key.empty() || !s.is_public || !s.is_definition || s.tag.empty()) continue;
 			catalog_.by_module[s.source_module_key].structs[s.tag] = &s;
+			xmod_type_owners_[s.tag].insert(s.source_module_key); // P302：标签归属（歧义裁定用）
 		}
 		for (const auto &e : tu->enums)
 		{
 			if (e.source_module_key.empty() || !e.is_public || e.tag.empty()) continue;
 			catalog_.by_module[e.source_module_key].enums[e.tag] = &e;
+			xmod_type_owners_[e.tag].insert(e.source_module_key); // P302
 		}
 		// P300 Co class（跨模块 import）：逐模块 public class 视图（class 恒为定义、无 is_definition 位）。
 		for (const auto &c : tu->classes)
 		{
 			if (c.source_module_key.empty() || !c.is_public || c.tag.empty()) continue;
 			catalog_.by_module[c.source_module_key].classes[c.tag] = &c;
+			xmod_type_owners_[c.tag].insert(c.source_module_key); // P302：类名同属类型命名空间
+		}
+		// P302：同名 public 标签被多个模块导出——定义侧无条件告警（与用户口径一致：同名即提）。
+		//   宿主裸名引用将被拒（see enforce_type_visible），须改用限定名 `mod.Tag`。
+		//   报告点取首个公开定义的位置；候选按「stem.Tag」列出，顺序稳定便于回归。
+		for (const auto &kv : xmod_type_owners_)
+		{
+			if (kv.second.size() < 2) continue;
+			std::vector<std::string> names;
+			for (const auto &k : kv.second) names.push_back(alias_for_key(tu.get(), k));
+			std::sort(names.begin(), names.end());
+			std::string list;
+			for (const auto &n : names) list += (list.empty() ? "" : ", ") + n + "." + kv.first;
+			SourceLoc at{};
+			bool have_loc = false;
+			for (const auto &s : tu->structs)
+				if (s.tag == kv.first && s.is_definition && !s.source_module_key.empty())
+				{ at = s.loc; have_loc = true; break; }
+			if (!have_loc)
+				for (const auto &e : tu->enums)
+					if (e.tag == kv.first && !e.source_module_key.empty())
+					{ at = e.loc; have_loc = true; break; }
+			if (!have_loc)
+				for (const auto &c : tu->classes)
+					if (c.tag == kv.first && !c.source_module_key.empty())
+					{ at = c.loc; have_loc = true; break; }
+			if (have_loc)
+				warn(at, "tag '" + kv.first + "' is exported by multiple imported modules (" + list +
+					"); unqualified references are an error, use a qualified name");
 		}
 		// 限定名映射：主源本层 imports 的 `as ModAlias`（无别名取文件 stem）→ resolved_module_key。
 		//   consts 表暂空（public const int 的跨模块导出面留待限定访问实现步补齐）。
 		for (const auto &d : tu->imports)
 		{
 			if (d.resolved_module_key.empty()) continue;
-			const std::string alias = d.module_alias.empty() ? stem_of(d.resolved_module_key) : d.module_alias;
+			const std::string alias = d.module_alias.empty() ? stem_of_key(d.resolved_module_key) : d.module_alias;
 			catalog_.qualified[alias] = d.resolved_module_key;
 			// 确保被 import 但无 public 导出的模块也有条目（限定名可解析到空视图）。
 			catalog_.by_module.emplace(d.resolved_module_key, View{});
@@ -246,10 +316,49 @@ public:
 		for (const auto &g : tu->globals) g_keys[g.name].insert(g.source_module_key);
 		for (auto &f : tu->funcs)
 			if (!f.source_module_key.empty() && fn_keys[f.name].size() > 1)
-				f.symbol_name = "__" + sanitize_ident(stem_of(f.source_module_key)) + "__" + f.name;
+				f.symbol_name = "__" + sanitize_ident(stem_of_key(f.source_module_key)) + "__" + f.name;
 		for (auto &g : tu->globals)
 			if (!g.source_module_key.empty() && g_keys[g.name].size() > 1)
-				g.symbol_name = "__" + sanitize_ident(stem_of(g.source_module_key)) + "__" + g.name;
+				g.symbol_name = "__" + sanitize_ident(stem_of_key(g.source_module_key)) + "__" + g.name;
+	}
+
+	// 模块 key → 文件名 stem（去扩展名）——默认限定名（与 alias 同名）。
+	static std::string stem_of_key(const std::string &key)
+	{
+		std::string base = key;
+		auto slash = base.find_last_of("/\\");
+		if (slash != std::string::npos) base = base.substr(slash + 1);
+		auto dot = base.find_last_of('.');
+		if (dot != std::string::npos) base = base.substr(0, dot);
+		return base;
+	}
+
+	// P302：模块 key 在宿主侧的**可书写限定名**：`as ModAlias` 优先，否则文件 stem。
+	//   诊断候选必须用此口径——若一律报 stem，写了 `as a` 的用户照抄 `leaf_a.Leaf`
+	//   会被 `unknown module alias` 拒收，把用户指向一个写不出来的名字。
+	static std::string alias_for_key(const TranslationUnit *tu, const std::string &key)
+	{
+		if (tu)
+			for (const auto &d : tu->imports)
+				if (d.resolved_module_key == key && !d.module_alias.empty()) return d.module_alias;
+		return stem_of_key(key);
+	}
+
+	// P302：把各导入模块的 public 类型以别名键 `alias.Tag` 注入本地类型表。
+	//   宿主书写 `a.Leaf` 后，structs_/enums_/classes_ 的既有按 tag 查找路径（成员表、
+	//   完整性检查、大小/对齐）原样命中该模块的那份定义，无需逐点改签名。
+	void register_qualified_type_aliases(const TUPtr &tu)
+	{
+		for (const auto &d : tu->imports)
+		{
+			if (d.resolved_module_key.empty()) continue;
+			const std::string alias = d.module_alias.empty() ? stem_of_key(d.resolved_module_key) : d.module_alias;
+			auto vit = catalog_.by_module.find(d.resolved_module_key);
+			if (vit == catalog_.by_module.end()) continue;
+			for (const auto &kv : vit->second.structs) structs_[alias + "." + kv.first] = kv.second;
+			for (const auto &kv : vit->second.enums) enums_[alias + "." + kv.first] = kv.second;
+			for (const auto &kv : vit->second.classes) classes_[alias + "." + kv.first] = kv.second;
+		}
 	}
 
 	// 路 B 阶段2-c：将任意字符串洗为合法 C 标识符（非 [A-Za-z0-9_] 一律换 '_'）。
@@ -588,6 +697,28 @@ private:
 		return t && (t->kind == TypeKind::Pointer || t->kind == TypeKind::Array);
 	}
 
+	// P323：下标基型判据（C 6.5.2.1 只许数组或指向**对象**的指针——指向函数的指针不可下标）。
+	//   修前直接复用 is_ptr_or_array，把 `Pointer{Function}` 与数组一并放行 → `fp[1]`/`tbl[0][0]`
+	//   零诊断（运行期按函数体字节取址，实测 AV 与错值）。
+	static bool is_subscriptable(const CTypePtr &t)
+	{
+		if (!t) return false;
+		if (t->kind == TypeKind::Array) return true;
+		if (t->kind == TypeKind::Pointer) return !t->base || t->base->kind != TypeKind::Function;
+		return false;
+	}
+
+	// 下标基里的函数型：裸函数指示符（未 decay）或指向函数的指针 → 返回该**函数型本身**。
+	//   clang 文案印未 decay 的原型（`subscript of pointer to function type 'int (void)'`），
+	//   故此处只剥掉指针层，拼写交给 describe_type。
+	static CTypePtr subscript_fn_type(const CTypePtr &t)
+	{
+		if (!t) return nullptr;
+		if (t->kind == TypeKind::Function) return t;
+		if (t->kind == TypeKind::Pointer && t->base && t->base->kind == TypeKind::Function) return t->base;
+		return nullptr;
+	}
+
 	// 返回类型同一性判定：忽略限定符拼写，只比结构（原型/定义冲突检查用）
 	static bool same_type(const CTypePtr &a, const CTypePtr &b)
 	{
@@ -614,6 +745,552 @@ private:
 		default:
 			return a->is_unsigned == b->is_unsigned;
 		}
+	}
+
+	// 严格同一性：限定符（const/volatile/restrict/_Atomic）与数组维度全同才算同一（`_Generic` 重复关联用）。
+	//   不能直接用 `types_compatible`：它有意忽略 volatile/restrict/_Atomic 与数组维度，
+	//   而 clang 实测接受 `_Generic(x, int: 1, volatile int: 2)`（CTS 0005_0005 误报后改走本谓词）。
+	static bool same_type_strict(const CTypePtr &a, const CTypePtr &b)
+	{
+		if (!a || !b) return !a && !b;
+		if (a->kind != b->kind) return false;
+		if (a->is_const != b->is_const || a->is_volatile != b->is_volatile ||
+		    a->is_restrict != b->is_restrict || a->is_atomic != b->is_atomic)
+			return false;
+		switch (a->kind)
+		{
+		case TypeKind::Pointer:
+			return same_type_strict(a->base, b->base);
+		case TypeKind::Array:
+			return a->array_size == b->array_size && same_type_strict(a->base, b->base);
+		case TypeKind::Function:
+		{
+			if (a->is_variadic != b->is_variadic || a->params.size() != b->params.size())
+				return false;
+			if (!same_type_strict(a->base, b->base)) return false;
+			for (std::size_t i = 0; i < a->params.size(); ++i)
+				if (!same_type_strict(a->params[i], b->params[i])) return false;
+			return true;
+		}
+		case TypeKind::Struct:
+		case TypeKind::Union:
+		case TypeKind::Enum:
+			return a->tag == b->tag;
+		case TypeKind::BitInt:
+			return a->bit_width == b->bit_width && a->is_unsigned == b->is_unsigned;
+		default:
+			return a->is_unsigned == b->is_unsigned;
+		}
+	}
+
+	// —— 0.4.1 类型相容性判定（赋值 / 初始化 / 实参三处共用）——
+	// 与 `same_type`（原型冲突、忽略限定符）和 `types_compatible`（_Generic、逐层比限定符）语义均不同：
+	//   这里回答「一个值能否赋入该对象」（C 6.5.16.1），且**只区分能对齐 clang 文本**的几类。
+	//   刻意不判（Skip）而一律放行：整数↔指针（clang 走 -Wint-conversion 且带 `; take the address with &`
+	//   fix-it）、目标丢限定符（clang 仅 warning）、Void、任一侧类型推断不出——防误伤。
+	// ground-truth（clang 23.1.0 `-std=c23`，_tmp/p_compat_*.c 探针，2026-10-28）：
+	//   AggMismatch  assigning to 'X' from incompatible type 'Y'
+	//   PtrMismatch  incompatible pointer types assigning to 'X' from 'Y'
+	//   FnPtrMismatch incompatible function pointer types …（源侧拼裸函数类型，不带 `*`）
+	//   初始化/传参另有各自句式，见 compat_init_msg / compat_arg_msg；行尾 [-W…] 分组标记
+	//   按本仓既有诊断惯例（全部不带）省略。
+	// P322：指针↔整型的**隐式**转换另立两向（C23 起 clang 一律 error，属 -Wint-conversion 族）。
+	//   不借道 PtrMismatch——那会把三句式印成 "incompatible pointer types"，与 clang 不同文。
+	// P331：`void` 不是对象类型。作**源**时 clang 三句式一律印 "incompatible type 'void'"（**不是** "of type"），
+	//   正好落 compat_{init,assign,arg}_msg 的**默认分支**；作**目标**（`vp[1] = …`）另立专属句。
+	enum class Compat { Ok, AggMismatch, PtrMismatch, FnPtrMismatch, PtrToInt, IntToPtr, VoidValue, Skip };
+
+	static bool is_arithmetic_kind(TypeKind k)
+	{
+		switch (k)
+		{
+		case TypeKind::Bool: case TypeKind::Char: case TypeKind::WChar:
+		case TypeKind::Char8: case TypeKind::Char16: case TypeKind::Char32:
+		case TypeKind::Short: case TypeKind::Int: case TypeKind::Long:
+		case TypeKind::LongLong: case TypeKind::Float: case TypeKind::Double:
+		case TypeKind::BitInt: case TypeKind::Enum:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	// P322：整型族（**不含** Float/Double，也不含 Bool）。Bool 由调用处单列放行——clang 对
+	//   `bool b = 指针;` 只发 -Wpointer-bool-conversion（warning，cc=0，探针 u10g2:10），
+	//   而 `enum E e = 指针;` 是 error（u10g2:11）→ 二者必须分开。
+	static bool is_integer_kind(TypeKind k)
+	{
+		switch (k)
+		{
+		case TypeKind::Char: case TypeKind::WChar:
+		case TypeKind::Char8: case TypeKind::Char16: case TypeKind::Char32:
+		case TypeKind::Short: case TypeKind::Int: case TypeKind::Long:
+		case TypeKind::LongLong: case TypeKind::BitInt: case TypeKind::Enum:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	// 判型侧衰减（C 6.3.2.1）：数组→元素指针、函数→函数指针
+	static CTypePtr compat_decay(const CTypePtr &t)
+	{
+		if (!t) return nullptr;
+		if (t->kind == TypeKind::Array) return make_pointer(t->base);
+		if (t->kind == TypeKind::Function) return make_pointer(t);
+		return t;
+	}
+
+	// P322：只判「整型常量表达式」的字面值，**算不出即 Unknown**（调用方据此放行）。
+	//   C 6.3.2.3p3 把「值为 0 的整型常量表达式」定义为空指针常量；clang 对 `int *p = 1 - 1;`
+	//   只发 -Wnon-literal-null-conversion（warning、cc=0，探针 u10h 十一形）⇒ 本仓必须放行。
+	//   AST 上只能确定字面量/一元/二元三类；`sizeof`、Cast、变量与调用一律 Unknown。
+	static bool try_eval_int(const ExprPtr &e, std::intmax_t &out)
+	{
+		if (!e) return false;
+		if (e->kind == ExprKind::IntLiteral || e->kind == ExprKind::CharLiteral)
+		{
+			out = e->int_val;
+			return true;
+		}
+		if (e->kind == ExprKind::Unary)
+		{
+			std::intmax_t v = 0;
+			if (!try_eval_int(e->lhs, v)) return false;
+			if (e->op == "+") { out = v; return true; }
+			if (e->op == "-") { out = -v; return true; }
+			if (e->op == "~") { out = ~v; return true; }
+			if (e->op == "!") { out = v ? 0 : 1; return true; }
+			return false;
+		}
+		if (e->kind == ExprKind::Binary)
+		{
+			std::intmax_t a = 0, b = 0;
+			if (!try_eval_int(e->lhs, a) || !try_eval_int(e->rhs, b)) return false;
+			const std::string &o = e->op;
+			if (o == "+") { out = a + b; return true; }
+			if (o == "-") { out = a - b; return true; }
+			if (o == "*") { out = a * b; return true; }
+			if (o == "/") { if (!b) return false; out = a / b; return true; }
+			if (o == "%") { if (!b) return false; out = a % b; return true; }
+			if (o == "&") { out = a & b; return true; }
+			if (o == "|") { out = a | b; return true; }
+			if (o == "^") { out = a ^ b; return true; }
+			if (o == "<<") { if (b < 0 || b > 62) return false; out = a << b; return true; }
+			if (o == ">>") { if (b < 0 || b > 62) return false; out = a >> b; return true; }
+			return false;
+		}
+		return false;
+	}
+
+	// 三态：只有能算出**非零**才报；值为 0（空指针常量）与算不出的形（变量/sizeof/Cast）
+	//   一律放行——`int *p = sizeof(int) - 4;` 在 parser 里未必折成字面量，若按「算不出即非零」
+	//   处理就会误拒合法 C（首次落码实测 u10h 报 8:26/21:5 两行即是此错）。
+	enum class IntEval { Unknown, Zero, NonZero };
+
+	static IntEval eval_int_state(const ExprPtr &e)
+	{
+		std::intmax_t v = 0;
+		if (!try_eval_int(e, v)) return IntEval::Unknown;
+		return v == 0 ? IntEval::Zero : IntEval::NonZero;
+	}
+
+	// 「整型 - 指针」是非法二元式（C 6.5.6p2：减法的合法组合只有「指针-整型」与
+	//   「指针-指针」）——clang 报 `invalid operands to binary expression ('long' and 'SH *')`
+	//   并把整个式子定型为 poison，因此外层赋值**不再**报 int-conversion
+	//   （ground-truth：探针 u10j:5 `1 - ip` / u10j:9 `(arr - ip) - ip` 均无该条；
+	//    对照 w9:13 `long c4 = sa - ip - sp;` clang 只报 13:14 的差面）。
+	// colang 未建模 poison 与 invalid-operands 族；若沿用 rhs 的指针型去判 PtrToInt，
+	//   就会多报一条 clang 没有的诊断（P322 落码实测 w9:13:23 即此错）→ 该形状一律放行。
+	// 需 resolve_type（非静态成员）→ 本函数与 assign_compat 均不带 static。
+	bool is_int_minus_ptr(const ExprPtr &e)
+	{
+		if (!e || e->kind != ExprKind::Binary || e->op != "-") return false;
+		const CTypePtr r = resolve_type(e->rhs);
+		if (!r || r->kind != TypeKind::Pointer) return false;
+		const CTypePtr l = compat_decay(resolve_type(e->lhs));
+		return !l || l->kind != TypeKind::Pointer;
+	}
+
+	// 双侧指针：比较 pointee（多级指针逐层下钻）
+	static Compat pointee_compat(const CTypePtr &f, const CTypePtr &t)
+	{
+		const CTypePtr fb = f->base;
+		const CTypePtr tb = t->base;
+		if (!fb || !tb) return Compat::Skip;
+		// enum 的底层整型无法从 CType 还原：clang 对 enum* ↔ 整型* 走 `-Wpointer-sign`
+		//   （「converts between pointers to integer types with different sign」）另族句式，
+		//   不属本批四式 → 放行。
+		if (fb->kind == TypeKind::Enum || tb->kind == TypeKind::Enum) return Compat::Skip;
+		const bool ff = fb->kind == TypeKind::Function;
+		const bool tf = tb->kind == TypeKind::Function;
+		if (ff || tf)
+		{
+			// clang 对 `void *` ↔ 函数指针静默接受（对象/函数指针互转是扩展）→ 放行；
+			//   「函数指针 ↔ 对象指针」非 void 时才是 incompatible pointer types。
+			if (fb->kind == TypeKind::Void || tb->kind == TypeKind::Void) return Compat::Skip;
+			if (!ff || !tf) return Compat::PtrMismatch;
+			return same_type(fb, tb) ? Compat::Ok : Compat::FnPtrMismatch;
+		}
+		// 任一侧 void* ⇒ 相容（void* 与对象指针可隐式互转）
+		if (fb->kind == TypeKind::Void || tb->kind == TypeKind::Void) return Compat::Ok;
+		// 目标丢限定符（const int* → int*）：clang 只是 warning，本批不判
+		if (!tb->is_const && fb->is_const) return Compat::Skip;
+		// 指向数组：`int (*p)[4] = 多维数组名` 合法（元素同型即容，维度不符才错）；
+		//   数组名本身已由 compat_decay 剥去最外层，这层比的是「元素类型」一侧的数组。
+		if (fb->kind == TypeKind::Array || tb->kind == TypeKind::Array)
+		{
+			if (fb->kind != tb->kind) return Compat::PtrMismatch;
+			if (fb->array_size && tb->array_size && fb->array_size != tb->array_size)
+				return Compat::PtrMismatch;
+			return same_type(fb->base, tb->base) ? Compat::Ok : Compat::PtrMismatch;
+		}
+		if (fb->kind == tb->kind)
+		{
+			if (fb->kind == TypeKind::Struct || fb->kind == TypeKind::Union || fb->kind == TypeKind::Class)
+				return fb->tag == tb->tag ? Compat::Ok : Compat::PtrMismatch;
+			if (fb->kind == TypeKind::Pointer) return pointee_compat(fb, tb);
+			if (is_arithmetic_kind(fb->kind)) return Compat::Ok;
+		}
+		return Compat::PtrMismatch;
+	}
+
+	// `src` 仅 P322 的「整型→指针」向需要：判 `src` 是否空指针常量（算不出则放行）。
+	// `compound` 标记复合赋值（`+=`/`-=`…）：其语义是 `p = p op n`，右侧整型只与**左值自身**
+	//   参与算术，不与目标指针直接比对——`p += 2` 是合法指针算术（实测 p83_edge.co:19 误拒）。
+	Compat assign_compat(const CTypePtr &from, const CTypePtr &to, const ExprPtr &src = nullptr,
+	                     bool compound = false)
+	{
+		if (!from || !to) return Compat::Skip;
+		// P331：`void` 不是对象类型。作源时三句式都印 "incompatible type 'void'"，正好落默认分支；
+		//   作目标（`vp[1] = …`）由 Assign 分支的 `incomplete type 'void' is not assignable` 专管，
+		//   这里放行以免双报。
+		if (to->kind == TypeKind::Void) return Compat::Skip;
+		if (from->kind == TypeKind::Void) return Compat::VoidValue;
+		const CTypePtr f = compat_decay(from);
+		const CTypePtr t = compat_decay(to);
+		if (!f || !t) return Compat::Skip;
+		const bool fp = f->kind == TypeKind::Pointer;
+		const bool tp = t->kind == TypeKind::Pointer;
+		if (fp != tp)
+		{
+			// P322：指针 ↔ 整型（C23 起 clang 一律 error）。两向分开报、句式与既有三式不同。
+			//   · 指针→整型：目标为整型族即报（`bool` 不在 is_integer_kind 内 → 放行）；
+			//   · 整型→指针：仅能算出**非零**的整型常量才报；值为 0 的整型常量表达式是空指针
+			//     常量（u10h 十一形 clang cc=0），算不出的形（变量/sizeof/Cast）亦放行（宁漏不错）。
+			if (fp && is_integer_kind(t->kind))
+			{
+				// 「整型 - 指针」非法式的 poison 结果不判（见 is_int_minus_ptr）
+				if (is_int_minus_ptr(src)) return Compat::Skip;
+				return Compat::PtrToInt;
+			}
+			if (tp && !compound && is_integer_kind(f->kind) && eval_int_state(src) == IntEval::NonZero)
+				return Compat::IntToPtr;
+			// P326：指针 → 非整型/非 bool/非 void 目标（浮点、聚合）。clang 一律 error 且用
+			//   通用 "incompatible type" 句式（落 compat_{init,assign,arg}_msg 的默认分支，零新句式）。
+			//   · bool 目标仅 -Wpointer-bool-conversion（warning、cc=0，探针 p326_init:19/assign:11/arg:15）
+			//     → 必须放行，不入本判据；
+			//   · void 目标已由函数首部 to->kind==Void 早退（避免与 "not assignable" 专管双报）；
+			//   · 「整型 - 指针」poison 式同 PtrToInt 侧，一并放行（见 is_int_minus_ptr）；
+			//   · 反向浮点→指针（int *p = 1.5）走 tp 侧、本批不收（真值 clang 报同句，拆登后续批次）。
+			if (fp && t->kind != TypeKind::Bool && !is_integer_kind(t->kind) &&
+				!is_int_minus_ptr(src))
+				return Compat::AggMismatch;
+			return Compat::Skip; // 整数↔浮点等仍另族（本就不判）
+		}
+		if (fp) return pointee_compat(f, t);
+		if (is_arithmetic_kind(f->kind) && is_arithmetic_kind(t->kind)) return Compat::Ok;
+		// class 句柄同类约束交 check_class_handle_compat（避免双报）
+		if (f->kind == TypeKind::Class && t->kind == TypeKind::Class) return Compat::Ok;
+		if ((f->kind == TypeKind::Struct || f->kind == TypeKind::Union) &&
+			f->kind == t->kind && f->tag == t->tag)
+			return Compat::Ok;
+		return Compat::AggMismatch;
+	}
+
+	// `char` 与 `signed char` 在 CType 里同为 Char 且 is_unsigned=false（不可区分），
+	//   而 clang 视二者为不同类型 → 涉 Char 叶子的「相容」判定一律放行，宁可漏报不误报。
+	static bool has_char_leaf(const CTypePtr &t)
+	{
+		if (!t) return false;
+		if (t->kind == TypeKind::Char) return true;
+		if (t->kind == TypeKind::Pointer || t->kind == TypeKind::Array || t->kind == TypeKind::Function)
+			return has_char_leaf(t->base);
+		return false;
+	}
+
+	// —— P317：指针差的 pointee 相容（C 6.5.9p4：两个操作数须指向相容类型）——
+	// **不得复用 `pointee_compat`**：它与本判据在两条规则上正好相反。
+	//   · `void *` ↔ 对象指针：赋值相容（可隐式互转，那里判 Ok），指针差 clang **拒**
+	//     （探针 x5.c：`7:13 'void *' and 'int *' are not pointers to compatible types`）；
+	//     两侧都是 void 才接受（GNU 扩展按字节差，探针 x1.c/y2.c：cc=0/run=0）。
+	//   · 限定符差异（`int *` ↔ `const int *`）：指针差 clang **接受**（探针 w4f.c）
+	//     → 这里不比 is_const/is_volatile/restrict。
+	// ground-truth（clang 23.1.0 `-std=c23`，探针 w4b/w4c/w4e/w4f/w4g/w4j）：
+	//   拒 short*↔int*、char*↔int*、long*↔int*、unsigned int*↔int*、void*↔对象指针、
+	//     struct A*↔struct B*、int**↔int*、int(*)[3]↔int(*)[4]、enum E1*↔enum E2*、
+	//     异原型函数指针、函数指针↔对象指针、char*↔unsigned char*；
+	//   接受 int*↔const int*、void*↔void*、void*↔const void*、enum*↔int*、同型异对象、
+	//     数组名 decay 后同型（int[3] ↔ int[4] 的 decay 结果均为 int*）。
+	// 一律放行（宁漏不错、绝不新增误拒）：任一侧类型推断不出、超过深度护栏、
+	//   `char` ↔ `signed char`（CType 里同为 Char 且 is_unsigned=false，不可区分）、
+	//   `enum *` ↔ 其它整型指针（底层型无法从 CType 还原）。
+	static bool pd_pointee(const CTypePtr &a, const CTypePtr &b, int depth)
+	{
+		if (!a || !b || depth > 8) return true;
+		if (a->kind == TypeKind::Void || b->kind == TypeKind::Void)
+			return a->kind == b->kind;            // void↔void 相容；void↔其余不相容
+		if (a->kind == TypeKind::Enum || b->kind == TypeKind::Enum)
+		{
+			if (a->kind != b->kind) return is_arithmetic_kind(a->kind) && is_arithmetic_kind(b->kind);
+			return a->tag == b->tag;              // enum E1* ↔ enum E2*：clang 拒
+		}
+		if (a->kind != b->kind) return false;      // short*↔int*、char*↔int*、数组↔标量…
+		// Char：`char` 与 `signed char` 在 CType 里同为 is_unsigned=false（不可区分）
+		//   → 该对一律判相容（clang 拒、colang 漏报，属知情缺口）；而 `unsigned char`
+		//   是 Char + is_unsigned=true，与二者都不同形 → 按符号位判（clang 同拒，探针 w5.c:22）。
+		if (a->kind == TypeKind::Char) return a->is_unsigned == b->is_unsigned;
+		if (is_arithmetic_kind(a->kind))
+		{
+			if (a->is_unsigned != b->is_unsigned) return false; // int*↔unsigned int*：clang 拒
+			if (a->kind == TypeKind::BitInt && a->bit_width != b->bit_width) return false;
+			return true;
+		}
+		if (a->kind == TypeKind::Pointer) return pd_pointee(a->base, b->base, depth + 1);
+		if (a->kind == TypeKind::Array)
+		{
+			// `int (*)[3]` ↔ `int (*)[4]`：clang 拒（探针 w4e.c）；一维未定（size==0）不比
+			if (a->array_size && b->array_size && a->array_size != b->array_size) return false;
+			return pd_pointee(a->base, b->base, depth + 1);
+		}
+		if (a->kind == TypeKind::Function) return same_type(a, b); // 异原型不相容
+		if (a->kind == TypeKind::Struct || a->kind == TypeKind::Union || a->kind == TypeKind::Class)
+			return a->tag == b->tag;
+		return true;                                // 其余形不建模：一律放行
+	}
+
+	// 条件运算符来源不判：colang 未建模 `?:` 的复合类型（分支不相容时 clang 取 `void *`，
+	//   诊断落在 `-Wpointer-type-mismatch` 另族「pointer type mismatch ('int **' and 'const int **')」，
+	//   且转出的赋值本身被接受，见 CTS 0202_0097/0100/0103/0106）→ 三处接入一律放行，宁可漏报。
+	static bool is_ternary_src(const ExprPtr &e)
+	{
+		return e && e->kind == ExprKind::Ternary;
+	}
+
+	// P335：三元式含 Void 臂时不再「整体不判」（clang C 6.5.15p5 结果即 void，
+	//   相容检查自然命中 VoidValue，无 pointer-type-mismatch 误拒风险）。
+	bool ternary_has_void_arm(const ExprPtr &e)
+	{
+		if (!e || e->kind != ExprKind::Ternary || e->args.size() < 2) return false;
+		CTypePtr a = resolve_type(e->args[0]);
+		CTypePtr b = resolve_type(e->args[1]);
+		return (a && a->kind == TypeKind::Void) || (b && b->kind == TypeKind::Void);
+	}
+
+	// 赋值形态
+	static std::string compat_assign_msg(const CTypePtr &to, const CTypePtr &from, Compat c)
+	{
+		const std::string t = describe_type(to);
+		const std::string f = describe_type(from);
+		if (c == Compat::PtrToInt)
+			return "incompatible pointer to integer conversion assigning to " + t + " from " + f;
+		if (c == Compat::IntToPtr)
+			return "incompatible integer to pointer conversion assigning to " + t + " from " + f;
+		if (c == Compat::PtrMismatch)
+			return "incompatible pointer types assigning to " + t + " from " + f;
+		if (c == Compat::FnPtrMismatch)
+			return "incompatible function pointer types assigning to " + t + " from " + f;
+		return "assigning to " + t + " from incompatible type " + f;
+	}
+
+	// 初始化形态（clang 对指针用 "with an expression of type"，非指针用 "of incompatible type"）
+	static std::string compat_init_msg(const CTypePtr &to, const CTypePtr &from, Compat c)
+	{
+		const std::string t = describe_type(to);
+		const std::string f = describe_type(from);
+		if (c == Compat::PtrToInt)
+			return "incompatible pointer to integer conversion initializing " + t + " with an expression of type " + f;
+		if (c == Compat::IntToPtr)
+			return "incompatible integer to pointer conversion initializing " + t + " with an expression of type " + f;
+		if (c == Compat::PtrMismatch)
+			return "incompatible pointer types initializing " + t + " with an expression of type " + f;
+		if (c == Compat::FnPtrMismatch)
+			return "incompatible function pointer types initializing " + t + " with an expression of type " + f;
+		return "initializing " + t + " with an expression of incompatible type " + f;
+	}
+
+	// 实参形态（源侧在前、目标形参在后）
+	static std::string compat_arg_msg(const CTypePtr &to, const CTypePtr &from, Compat c)
+	{
+		const std::string t = describe_type(to);
+		const std::string f = describe_type(from);
+		if (c == Compat::PtrToInt)
+			return "incompatible pointer to integer conversion passing " + f + " to parameter of type " + t;
+		if (c == Compat::IntToPtr)
+			return "incompatible integer to pointer conversion passing " + f + " to parameter of type " + t;
+		if (c == Compat::PtrMismatch)
+			return "incompatible pointer types passing " + f + " to parameter of type " + t;
+		if (c == Compat::FnPtrMismatch)
+			return "incompatible function pointer types passing " + f + " to parameter of type " + t;
+		return "passing " + f + " to parameter of incompatible type " + t;
+	}
+
+	// ============================================================
+	// P324：聚合初始化器 `{...}` 元素位类型相容（C 6.7.9）
+	//   每个元素位按其目标子类型做一次 assign_compat（等价标量初始化/赋值口径），
+	//   不合法即报 compat_init_msg 文案、定位在该元素表达式自身 loc。
+	//   游标镜像 codegen::elide_fold（brace elision），但工作在 CType 层（非 llvm::Type）：
+	//     · Array 槽型 = to->base；Struct 逐 C 成员 members[i].type（经 find_struct_def_by_tag 回查）；
+	//       Union 裸初值 → 首成员，`.m=` → 指定成员。
+	//     · 元素是子 InitList → 对该槽目标型整体递归；标量元素落聚合槽 → brace elision 逐叶子消费。
+	//   一律放行（宁漏不错、绝不新增误拒）：型解不出、struct/union 定义不完整、三元无 void 臂源、
+	//     链式设计符（desig_chain≥2，交 codegen 物理路径）、字符串进字符数组（不触及元素位）。
+	// ============================================================
+	static bool agg_slot(const CTypePtr &t)
+	{
+		return t && (t->kind == TypeKind::Array || t->kind == TypeKind::Struct || t->kind == TypeKind::Union);
+	}
+
+	// 标量槽位：对表达式做一次 assign_compat（复用三元/常量性既有放行护栏）
+	void check_scalar_slot(const CTypePtr &to, const ExprPtr &it)
+	{
+		if (!to || !it) return;
+		if (is_ternary_src(it) && !ternary_has_void_arm(it)) return; // 条件运算符来源不判（防误拒）
+		const CTypePtr ft = resolve_type(it);
+		const Compat cc = assign_compat(ft, to, it);
+		if (cc != Compat::Ok && cc != Compat::Skip)
+			report(it->loc, compat_init_msg(to, ft, cc));
+	}
+
+	// 消费聚合对象 `to` 的一个子对象槽 slot：当前项带括号 → 作为 slot 自己的 brace 组递归；
+	//   当前项扁平且 slot 是聚合 → brace elision（共享游标继续逐叶子）；否则标量 → assign_compat
+	void agg_consume(const CTypePtr &slot, const std::vector<ExprPtr> &args, std::size_t &pos, int depth)
+	{
+		if (!slot || depth > 16 || pos >= args.size()) return;
+		if (args[pos] && args[pos]->kind == ExprKind::InitList) // 带括号子初始化器 → 它是 slot 的花括号内容
+		{
+			ExprPtr sub = args[pos++];
+			agg_walk_init(slot, sub, depth + 1);
+			return;
+		}
+		if (agg_slot(slot))
+		{
+			// 非括号项若是**与槽同型的聚合表达式**（struct/union）→ 整体赋值（clang 接受），不 elide；
+			//   否则为 brace elision（异型聚合/标量扁平填入子对象），共享游标逐叶子。
+			const CTypePtr nt = args[pos] ? resolve_type(args[pos]) : nullptr;
+			if (nt && (nt->kind == TypeKind::Struct || nt->kind == TypeKind::Union) &&
+			    assign_compat(nt, slot, args[pos]) == Compat::Ok)
+			{
+				ExprPtr whole = args[pos++];
+				check_scalar_slot(slot, whole); // 同型聚合 → Ok，静默放行
+				return;
+			}
+			agg_walk_pos(slot, args, pos, depth + 1);
+			return;
+		}
+		ExprPtr it = args[pos++];
+		if (it && it->kind == ExprKind::InitList && it->args.size() == 1 && it->args[0]) it = it->args[0]; // {x}≡x
+		if (it) check_scalar_slot(slot, it);
+	}
+
+	// 位置式游标（镜像 elide_fold）：`args` 是聚合对象 `to` 的花括号内容，逐子对象槽消费
+	void agg_walk_pos(const CTypePtr &to, const std::vector<ExprPtr> &args, std::size_t &pos, int depth)
+	{
+		if (!to || depth > 16) return;
+		if (!agg_slot(to)) // 防御：标量对象直接到达（正常经 agg_consume 已拆包）
+		{
+			if (pos >= args.size()) return;
+			ExprPtr it = args[pos++];
+			if (it && it->kind == ExprKind::InitList && it->args.size() == 1 && it->args[0]) it = it->args[0];
+			if (it) check_scalar_slot(to, it);
+			return;
+		}
+		if (to->kind == TypeKind::Array)
+		{
+			// 字符串字面量整体初始化字符数组（§6.7.9p14）：不逐元素（不触及元素位）
+			if (args.size() == 1 && args[0] && args[0]->kind == ExprKind::StringLiteral) return;
+			for (std::size_t k = 0; k < to->array_size && pos < args.size(); ++k)
+				agg_consume(to->base, args, pos, depth);
+			return;
+		}
+		if (to->kind == TypeKind::Union)
+		{
+			if (pos >= args.size()) return;
+			if (to->tag.empty()) { pos++; return; }
+			const StructDef *sd = find_struct_def_by_tag(to->tag);
+			if (!sd || !sd->is_definition || sd->members.empty()) { pos++; return; } // 不完整 → 放行并消费一项防错位
+			agg_consume(sd->members[0].type, args, pos, depth); // union 仅填首成员（§6.7.9p19）
+			return;
+		}
+		// struct：逐 C 成员位共享游标
+		if (to->tag.empty()) return;
+		const StructDef *sd = find_struct_def_by_tag(to->tag);
+		if (!sd || !sd->is_definition) return; // 不完整/未知 → 放行
+		for (const auto &m : sd->members)
+		{
+			if (pos >= args.size()) break;
+			agg_consume(m.type, args, pos, depth);
+		}
+	}
+
+	// 把单项元素应用到槽型 slot（子 InitList→递归；标量落聚合槽→brace elision；否则标量检查）
+	void agg_apply_to_slot(const CTypePtr &slot, const ExprPtr &elem, int depth)
+	{
+		if (!slot || !elem || depth > 16) return;
+		if (elem->kind == ExprKind::InitList) { agg_walk_init(slot, elem, depth + 1); return; }
+		if (agg_slot(slot)) { std::vector<ExprPtr> one{elem}; std::size_t pos = 0; agg_walk_pos(slot, one, pos, depth + 1); return; }
+		check_scalar_slot(slot, elem);
+	}
+
+	// 指定式：命中一级 `[idx]`/`.field` → 定位槽后应用；链式（desig_chain≥2）跳过
+	void agg_walk_desig(const CTypePtr &to, const std::vector<ExprPtr> &args, int depth)
+	{
+		if (!to || depth > 16) return;
+		const StructDef *sd = nullptr;
+		if (to->kind == TypeKind::Struct || to->kind == TypeKind::Union)
+		{
+			if (to->tag.empty()) return;
+			sd = find_struct_def_by_tag(to->tag);
+			if (!sd || !sd->is_definition || sd->members.empty()) return; // 不完整/未知 → 放行
+		}
+		for (const auto &ae : args)
+		{
+			if (!ae) continue;
+			if (ae->desig_chain.size() >= 2) continue; // 链式交 codegen 物理路径（本批不建模，知情边界）
+			CTypePtr slot;
+			if (to->kind == TypeKind::Array)
+			{
+				if (ae->desig_index >= 0) slot = to->base;
+			}
+			else if (sd)
+			{
+				if (!ae->desig_field.empty())
+					for (const auto &m : sd->members) if (m.name == ae->desig_field) { slot = m.type; break; }
+				else if (ae->desig_index >= 0 && static_cast<std::size_t>(ae->desig_index) < sd->members.size())
+					slot = sd->members[static_cast<std::size_t>(ae->desig_index)].type; // GNU `[idx]` 指成员
+			}
+			if (!slot) continue; // 定位不到槽 → 放行（宁漏不错）
+			agg_apply_to_slot(slot, ae, depth);
+		}
+	}
+
+	// 对一个 InitList 分派：含设计符 → 指定式；否则 → 位置式游标
+	void agg_walk_init(const CTypePtr &to, const ExprPtr &init, int depth)
+	{
+		if (!to || !init || init->kind != ExprKind::InitList || depth > 16) return;
+		bool has_desig = false;
+		for (const auto &ae : init->args)
+			if (ae && (ae->desig_index >= 0 || !ae->desig_field.empty() || !ae->desig_chain.empty())) { has_desig = true; break; }
+		if (has_desig) agg_walk_desig(to, init->args, depth);
+		else { std::size_t pos = 0; agg_walk_pos(to, init->args, pos, depth); }
+	}
+
+	// 对外入口：仅对聚合目标（Array/Struct/Union）展开；标量目标写 `{}` 非本批形态 → 放行
+	void check_aggregate_init(const CTypePtr &to, const ExprPtr &init)
+	{
+		if (!to || !init || init->kind != ExprKind::InitList) return;
+		if (!agg_slot(to)) return;
+		agg_walk_init(to, init, 0);
 	}
 
 	// —— 控制流可达性（「非 void 函数漏 return」告警用）——
@@ -876,9 +1553,101 @@ private:
 	const StructDef *find_struct_def_by_tag(const std::string &tag) const
 	{
 		if (!main_tu_) return nullptr;
+		// P302：限定名 `alias.Tag` —— 按「别名 → 模块 key → 该模块的定义」精确定位，
+		//   不再回落首匹配（否则宿主写 a.Leaf 可能拿到 b 的布局）。
+		//   注意：点号不是限定名的专利——parser 把块内定义的标签改名为 `X.__blkN`，
+		//   故首段不属于导入别名时必走下方裸 tag 精确匹配。
+		const auto dot = tag.find('.');
+		if (dot != std::string::npos)
+		{
+			const std::string alias = tag.substr(0, dot);
+			const std::string nm = tag.substr(dot + 1);
+			auto qit = catalog_.qualified.find(alias);
+			if (qit != catalog_.qualified.end())
+			{
+				for (const auto &s : main_tu_->structs)
+					if (s.tag == nm && s.is_definition && s.source_module_key == qit->second) return &s;
+				return nullptr;
+			}
+		}
 		for (const auto &s : main_tu_->structs)
 			if (s.tag == tag && s.is_definition) return &s;
 		return nullptr;
+	}
+
+	// —— P305：成员名校核（`.` / `->` 指向记录类型时，成员名不存在不得静默编过）——
+	// 修前：`struct Point { int x; int y; }; p.z = 1;` 无任何诊断，codegen 走
+	//   `resolve_member_info` 未命中分支的默认 0 号槽，按基址写内存 → 越界/静默错写。
+	// 诊断口径逐字对 clang（探针 _tmp\memb\g1~g8 实测）：
+	//   命名记录 → `no member named 'z' in 'struct Point'`（经 typedef 访问亦拼 tag，不用别名糖）；
+	//   `typedef struct {…} A;` 匿名记录 → `no member named 'z' in 'A'`；
+	//   只有前置声明 → `incomplete definition of type 'struct I'` + 前置声明 note；
+	//   `->` 的解引用基不是记录（如 `void *`/`int *`）→ `member reference base type 'void' is not a structure or union`。
+	const StructDef *record_def_of(const std::string &tag) const
+	{
+		if (tag.empty()) return nullptr;
+		auto it = structs_.find(tag);
+		if (it != structs_.end() && it->second && it->second->is_definition) return it->second;
+		auto rd = real_struct_defs_.find(tag);
+		if (rd != real_struct_defs_.end()) return rd->second;
+		if (it != structs_.end()) return it->second; // 只有前置声明的空壳
+		return nullptr;
+	}
+
+	// 记录名拼写（带引号）：命名记录一律 `struct/union Tag`，匿名记录回退到 typedef 别名，
+	//   合成 tag（`__anon_struct_N`）与块内改名后缀（`X.__blkN`）绝不外泄到诊断。
+	std::string spell_record(const CTypePtr &rec) const
+	{
+		if (!rec) return "<type>";
+		if (rec->kind == TypeKind::Class) return "'" + spell_tag(rec->tag) + "'";
+		if (rec->tag.rfind("__anon_", 0) == 0)
+			return rec->alias.empty() ? std::string("<anonymous record>") : "'" + rec->alias + "'";
+		return std::string("'") + (rec->kind == TypeKind::Union ? "union " : "struct ") + spell_tag(rec->tag) + "'";
+	}
+
+	// 成员名是否存在：含穿过匿名 struct/union 的名提升（与 struct_member_impl 同口径）。
+	bool struct_has_member(const StructDef *sd, const std::string &field, int depth) const
+	{
+		if (!sd || !sd->is_definition || depth > 16) return false;
+		for (const auto &m : sd->members)
+			if (!m.name.empty() && m.name == field) return true;
+		for (const auto &m : sd->members)
+		{
+			if (m.name.empty() && m.type &&
+				(m.type->kind == TypeKind::Struct || m.type->kind == TypeKind::Union) &&
+				!m.type->tag.empty())
+			{
+				if (struct_has_member(record_def_of(m.type->tag), field, depth + 1)) return true;
+			}
+		}
+		return false;
+	}
+
+	// 基类型已确认为记录类型后的成员名校核（`.` 直接用、`->` 由调用方先解引用）。
+	void check_member_exists(const CTypePtr &rec, const std::string &field, const SourceLoc &loc)
+	{
+		if (!rec || field.empty() || rec->tag.empty()) return; // 无 tag 的匿名内联记录：无可校核
+		if (rec->kind == TypeKind::Class)
+		{
+			auto cit = classes_.find(rec->tag);
+			if (cit == classes_.end() || !cit->second) return; // 类定义缺失：另有路径报
+			for (const auto &m : cit->second->members)
+				if (!m.name.empty() && m.name == field) return; // 含 static 成员
+			for (const auto &m : cit->second->methods)
+				if (m.name == field) return;                    // 方法访问（obj.method / obj.method()）
+			report(loc, "no member named '" + field + "' in " + spell_record(rec));
+			return;
+		}
+		const StructDef *sd = record_def_of(rec->tag);
+		if (!sd || !sd->is_definition)
+		{
+			// 只有前置声明、无 {} 定义：clang 同文诊断 + 前置声明 note。
+			const std::string sp = spell_record(rec);
+			if (sd) report_with_note(loc, "incomplete definition of type " + sp, sd->loc, "forward declaration of " + sp);
+			return;
+		}
+		if (struct_has_member(sd, field, 0)) return;
+		report(loc, "no member named '" + field + "' in " + spell_record(rec));
 	}
 
 	// P212：封装——在主源上下文下检查名字引用；非主源代码直接放行。
@@ -919,7 +1688,87 @@ private:
 		report(loc, "reference to '" + name + "' is ambiguous (imported from multiple modules)");
 	}
 
+	// P304：该 typedef 名是否属于指定模块（不看 public）——用于把「模块里确实有这个类型、
+	//   但没导出」与「根本没这个名字」分成两条诊断。
+	bool typedef_owned_by(const std::string &name, const std::string &module_key) const
+	{
+		auto it = typedef_owner_.find(name);
+		return it != typedef_owner_.end() && it->second.count(module_key) > 0;
+	}
+
 	// P217：主源将导入的非 public struct/enum 当类型用 → 拒收。仅主源（cur_source_module_key_ 空）触发。
+	// P302：`alias.Tag` 的模块归属校验与类别校正。
+	//   非限定名返回 false（交常规路径）；限定名一律返回 true（已处理，不再叠裸名判定）。
+	bool resolve_qualified_type(const CTypePtr &t, const SourceLoc &loc)
+	{
+		const auto dot = t->tag.find('.');
+		if (dot == std::string::npos) return false;
+		const std::string alias = t->tag.substr(0, dot);
+		const std::string nm = t->tag.substr(dot + 1);
+		auto qit = catalog_.qualified.find(alias);
+		if (qit == catalog_.qualified.end())
+		{
+			// 非导入别名：点号只是 parser 的块内改名（`X.__blkN`）——不当限定名处理，
+			//   交回常规 tag 路径；仅当第二段确实是已登记标签/typedef 时（如写错模块名 `zz.Leaf`）
+			//   才按「未知模块别名」拒收，避免拼写错静默成未知类型。
+			if (structs_.count(nm) || enums_.count(nm) || classes_.count(nm) || typedef_names_.count(nm))
+			{
+				report(loc, "unknown module alias '" + alias + "' in type name '" + t->tag + "'");
+				return true;
+			}
+			return false;
+		}
+		auto vit = catalog_.by_module.find(qit->second);
+		if (vit == catalog_.by_module.end()) return true;
+		const ModuleCatalog::View &v = vit->second;
+		auto sit = v.structs.find(nm);
+		if (sit != v.structs.end())
+		{
+			t->kind = (sit->second->is_union ? TypeKind::Union : TypeKind::Struct);
+			return true;
+		}
+		if (v.enums.count(nm)) { t->kind = TypeKind::Enum; return true; }
+		if (v.classes.count(nm)) { t->kind = TypeKind::Class; return true; }
+		// 裁定⑥口径：非 public / 不存在均不入导出面 → 限定名不可命中
+		report(loc, "no public type '" + nm + "' in module '" + alias + "'");
+		return true;
+	}
+
+	// P302：宿主本 TU 是否自有该标签的**定义**（导入项与前置引用空壳都不算）。
+	bool host_defines_type(const std::string &tag) const
+	{
+		if (!main_tu_) return false;
+		for (const auto &s : main_tu_->structs)
+			if (s.tag == tag && s.source_module_key.empty() && s.is_definition) return true;
+		for (const auto &e : main_tu_->enums)
+			if (e.tag == tag && e.source_module_key.empty()) return true;
+		for (const auto &c : main_tu_->classes)
+			if (c.tag == tag && c.source_module_key.empty()) return true;
+		return false;
+	}
+
+	// P302：裸名引用「被多个模块导出的同名标签」→ 报错并要求限定名。
+	//   宿主自定义同名类型时按宿主胜出豁免（与函数/全局的裁定②同口径）。
+	//   注意：豁免须看「宿主的真定义」——parser 对主源引用 `Leaf x;` 会先造一条前置引用项
+	//   （is_definition=false、key 空），若用 host_own_names_ 判定会把这类空壳当自有点而漏报。
+	//   返回 true 表示已报错（调用方跳过后续可见性检查，避免叠加误报）。
+	bool reject_ambiguous_bare_type(const std::string &tag, const SourceLoc &loc)
+	{
+		if (!per_module_) return false;
+		if (!cur_source_module_key_.empty()) return false; // 仅宿主裸名；子模块内部自有绑定
+		if (host_defines_type(tag)) return false;
+		auto own = xmod_type_owners_.find(tag);
+		if (own == xmod_type_owners_.end() || own->second.size() < 2) return false;
+		std::vector<std::string> names;
+		for (const auto &k : own->second) names.push_back(alias_for_key(main_tu_, k) + "." + tag);
+		std::sort(names.begin(), names.end());
+		std::string list;
+		for (const auto &n : names) list += (list.empty() ? "" : ", ") + n;
+		report(loc, "reference to '" + tag + "' is ambiguous (defined in multiple imported modules: " +
+			list + "); use a qualified name");
+		return true;
+	}
+
 	//   沿 Pointer/Array 的 base 逐层剥、Function 遍历返回类型与参数，得基类型后仅对 Struct/Union/Enum
 	//   且非空 tag 查表；命中且 source_module_key 非空（导入类型）才调 ensure_visible_from_main。
 	//   注：枚举常量名在 parse 期折成整数字面量、非类型引用，故门禁只作用于 enum 类型标签。
@@ -927,6 +1776,13 @@ private:
 	{
 		if (!cur_source_module_key_.empty()) return; // 仅主源；子模块内部互引放行
 		if (!t) return;
+		// P302：标签位的跨模块归属裁定（限定名校验/校正；裸名多模块同名则拒）。
+		//   沿指针/数组递归时由 base 再次进入，故此处只需处理自带标签的层级。
+		if (!t->tag.empty())
+		{
+			if (resolve_qualified_type(t, loc)) return;
+			if (reject_ambiguous_bare_type(t->tag, loc)) return;
+		}
 		switch (t->kind)
 		{
 		case TypeKind::Pointer:
@@ -1016,7 +1872,7 @@ private:
 		CTypePtr st = resolve_type(src);
 		if (!st) return; // 推断不出，保守跳过
 		if (st->kind != TypeKind::Class)
-			report(loc, "class handle requires a handle value, got incompatible type '" + describe_type(st) + "'");
+			report(loc, "class handle requires a handle value, got incompatible type " + describe_type(st));
 		else if (!want.empty() && !st->tag.empty() && st->tag != want)
 			report(loc, "cannot bind handle of class '" + st->tag + "' to class handle '" + want + "'");
 	}
@@ -1025,13 +1881,13 @@ private:
 	//   作前置诊断，把 LLVM 校验器的 `Cannot allocate unsized type` 挡在前面、报 clang 同款主错误。
 	//   剥层规则：沿 Array 下探（记 saw_array），遇 Pointer/Function 立即停（不完整类型经指针合法），
 	//   落到 Struct/Union 且 tag 非空、find_struct_def_by_tag 为空 ⇒ 不完整、报错。Enum 不纳入（越界）。
-	//   仅主源触发（cur_source_module_key_ 空），镜像 enforce_type_visible 的门禁以压低回归面。
+	//   P301：主源与子模块同口径。此前仅主源触发（cur_source_module_key_ 空），子模块里按值用到
+	//   不完整类型时会一路漏给 codegen，opaque %struct. 作 alloca 使 LLVM 直接崩溃（ADR 见 PROJECT.md）。
 	enum IncompleteCtx { IctxVar, IctxField, IctxGlobal };
 
 	void enforce_complete_type(const CTypePtr &t, const SourceLoc &loc, IncompleteCtx ctx)
 	{
-		if (!cur_source_module_key_.empty()) return; // 仅主源；imported 项/函数体自然跳过
-		const CTypePtr *node = &t;                    // 逐层指向当前类型（base 为其成员，AST 存活整趟 sema）
+		const CTypePtr *node = &t; // 逐层指向当前类型（base 为其成员，AST 存活整趟 sema）
 		bool saw_array = false;
 		while (node && *node)
 		{
@@ -1061,6 +1917,60 @@ private:
 				return; // 标量/void/enum 不纳入
 			}
 		}
+	}
+
+	// P329：下标基指向**不完整记录**（C 6.5.2.1 要求指向完整对象类型；clang 同文拒收
+	//   `subscript of pointer to incomplete type 'struct I'`）。判据与 P255 的
+	//   enforce_complete_type **同源**（find_struct_def_by_tag 落空即不完整）：
+	//   · 只收 Struct/Union——clang 接受 `enum E; enum E *ep; ep[1];`（仅 MS 扩展 warning）；
+	//   · 匿名内联记录必是完整定义，tag 为空者按完整处理；
+	//   · `void *` / 标量指针不入判（前者 P330 已定口径：按 1 字节步进放行）。
+	//   返回该记录型本身，供 describe_type 拼 `'struct I'`（typedef 形自带 aka 双轨）。
+	CTypePtr incomplete_subscript_base(const CTypePtr &t) const
+	{
+		if (!t || t->kind != TypeKind::Pointer || !t->base) return nullptr;
+		const CTypePtr &b = t->base;
+		if (b->kind != TypeKind::Struct && b->kind != TypeKind::Union) return nullptr;
+		if (b->tag.empty()) return nullptr;
+		if (find_struct_def_by_tag(b->tag)) return nullptr; // 有 {} 定义 ⇒ 完整
+		return b;
+	}
+
+	// P333：`sizeof` / `_Alignof` 的操作数是**不完整记录**（C 6.5.3.4 要求操作数类型完整；clang 同文
+	//   拒收 `invalid application of 'sizeof' to an incomplete type 'struct I'`）。判据与 P255/P329
+	//   **同源**（find_struct_def_by_tag 落空即不完整）：只收 Struct/Union——Enum 前置声明必放行
+	//   （`enum E; enum E *ep; sizeof(*ep)` clang cc=0，仅 MS 扩展 warning）；匿名内联记录按完整。
+	CTypePtr incomplete_record_type(const CTypePtr &t) const
+	{
+		if (!t) return nullptr;
+		if (t->kind != TypeKind::Struct && t->kind != TypeKind::Union) return nullptr;
+		if (t->tag.empty()) return nullptr;
+		if (find_struct_def_by_tag(t->tag)) return nullptr; // 有 {} 定义 ⇒ 完整
+		return t;
+	}
+
+	// P333：定位两轨（探针 p333a~ag 逐形实测的 clang 口径）——类型形在 `sizeof` 关键字列（`loc`），
+	//   表达式形在**关键字之后的第一个 token**（`op_loc`，parser 的 sizeof 分支填写：括号形即 `(`、
+	//   无括号形即操作数首 token）。已被更早诊断命中者其操作数型已毒化/不可解析，故不叠报。
+	void check_sizeof(const ExprPtr &e)
+	{
+		if (e->op != "sizeof" && e->op != "alignof") return;
+		const CTypePtr t = e->type ? e->type : resolve_type(e->lhs);
+		const CTypePtr inc = incomplete_record_type(t);
+		if (!inc) return;
+		report(e->type ? e->loc : e->op_loc,
+		       "invalid application of '" + e->op + "' to an incomplete type " + describe_type(inc));
+	}
+
+	// 文件作用域初始化式专用的**只查 sizeof/_Alignof 操作数完整性**递归（理由同 check_ptr_diff_chain：
+	//   全局初值不走 check_expr，而该形可藏在 Cast 壳、聚合元素位与嵌套表达式里）。
+	void check_sizeof_chain(const ExprPtr &e, int depth)
+	{
+		if (!e || depth > 16) return;
+		if (e->kind == ExprKind::Unary) check_sizeof(e);
+		check_sizeof_chain(e->lhs, depth + 1);
+		check_sizeof_chain(e->rhs, depth + 1);
+		for (const auto &x : e->args) check_sizeof_chain(x, depth + 1);
 	}
 
 	// 变量类型查找（内层→外层→全局，未找到返回 null）。P254：提为成员，供
@@ -1140,14 +2050,75 @@ private:
 			if (it != self->funcs_.end()) return it->second->return_type;
 			return nullptr;
 		}
+		// P320：函数名 → 完整 Function 型（供共享解析器的 `&函数名` 取真实原型，
+		//   不再退化成 `void *`）。funcs_ 已按「定义优先」归并同名的原型/定义两条记录。
+		CTypePtr func_type(const std::string &n)
+		{
+			auto it = self->funcs_.find(n);
+			if (it == self->funcs_.end() || !it->second) return nullptr;
+			std::vector<CTypePtr> ps;
+			for (const auto &p : it->second->params) ps.push_back(p.type);
+			return make_func_type(it->second->return_type, std::move(ps), it->second->is_variadic);
+		}
 		// 目标数据模型的 long 位宽（供共享解析器整型提升取正确宽度）。
 		unsigned long_bits() const { return static_cast<unsigned>(self->opts_.target.sizeof_long) * 8u; }
 	};
 
 	CTypePtr resolve_type(const ExprPtr &e)
 	{
+		// P329：表达式里嵌着「指向不完整记录的指针下标」时，其结果型按「未知」返回——
+		//   check_subscript 已按 clang 报出，外层壳（取址 `&`、运算、实参、成员、逗号…）
+		//   不得再叠一句异族诊断（口径同 P323 对 `Pointer{Function}` 的 poison，但那里的
+		//   判据是纯结构性的、能放在共享模板里；本判据依赖符号表，故只留在 sema 包装层）。
+		if (has_incomplete_poison(e, 0)) return nullptr;
 		SemaTypeEnv env{this};
 		return resolve_expr_type(e, env);
+	}
+
+	// 上述 poison 的判据：递归找本层已报过的两类不完整记录面——
+	//   ① P329：`[]` 且任一侧是指向不完整记录的指针；
+	//   ② P332：`+` 任一侧 / `-` 左侧 / `++`/`--` / `+=`/`-=` 的操作数。
+	//   只下探能把子式类型**原样（或包一层）传出去**的壳；标量/字面量/成员名等一律不探。
+	//   命中即意味着程序已拒收，不再区分外层用在哪里（全式定型当作不可知）。
+	bool has_incomplete_poison(const ExprPtr &e, int depth)
+	{
+		if (!e || depth > 8) return false;
+		if (e->kind == ExprKind::Binary)
+		{
+			const bool lhs_bad = incomplete_subscript_base(resolve_type(e->lhs)) != nullptr;
+			if ((e->op == "[]" || e->op == "+") &&
+				(lhs_bad || incomplete_subscript_base(resolve_type(e->rhs))))
+				return true;
+			if (e->op == "-" && lhs_bad) return true;
+		}
+		if ((e->kind == ExprKind::Unary && (e->op == "++" || e->op == "--")) ||
+			(e->kind == ExprKind::Assign && (e->op == "+=" || e->op == "-=")))
+		{
+			if (incomplete_subscript_base(resolve_type(e->lhs))) return true;
+		}
+		switch (e->kind)
+		{
+		case ExprKind::Unary:
+		case ExprKind::Member:
+		case ExprKind::Assign:
+		case ExprKind::Cast:
+			return has_incomplete_poison(e->lhs, depth + 1);
+		case ExprKind::Binary:
+		case ExprKind::Comma:
+			return has_incomplete_poison(e->lhs, depth + 1) ||
+			       has_incomplete_poison(e->rhs, depth + 1);
+		case ExprKind::Call:
+			if (e->lhs && has_incomplete_poison(e->lhs, depth + 1)) return true;
+			for (const auto &x : e->args)
+				if (has_incomplete_poison(x, depth + 1)) return true;
+			return false;
+		case ExprKind::Ternary:
+			for (const auto &x : e->args)
+				if (has_incomplete_poison(x, depth + 1)) return true;
+			return false;
+		default:
+			return false;
+		}
 	}
 
 	// —— P254：const 只读强制（可写位置的只读判定，clang 同文诊断）——
@@ -1450,10 +2421,344 @@ private:
 			base->module_qualifier = true;
 			return true;
 		}
+		// P303：枚举常量 `alias.RED`——枚举常量在本模块内是整型常量（parser 即折成字面量），
+		//   跨模块限定访问按同值就地折成 IntLiteral，与裸 `RED` 同语义；不折则落到下面的
+		//   "no public symbol" 拒收（枚举常量不属于 globals/funcs 两类导出面）。
+		for (const auto &ekv : view.enums)
+		{
+			const EnumDef *ed = ekv.second;
+			if (!ed) continue;
+			for (const auto &ec : ed->constants)
+			{
+				if (ec.name != mname) continue;
+				e->kind = ExprKind::IntLiteral;
+				e->int_val = ec.value;
+				e->type = nullptr;
+				base->module_qualifier = true;
+				return true;
+			}
+		}
 		// 裁定⑥：非 public 不入导出面 → 限定访问不可命中（与按名 import 非 public 同口径）。
+		// P302：若该名在被导入模块里是类型，改用类型口径的诊断（否则 type-only 名字会报成 'symbol'）。
+		{
+			auto sit = structs_.find(mname);
+			auto eit = enums_.find(mname);
+			auto cit = classes_.find(mname);
+			const bool same_mod = (sit != structs_.end() && sit->second && sit->second->source_module_key == qit->second) ||
+			                      (eit != enums_.end() && eit->second && eit->second->source_module_key == qit->second) ||
+			                      (cit != classes_.end() && cit->second && cit->second->source_module_key == qit->second) ||
+			                      typedef_owned_by(mname, qit->second);
+			if (same_mod)
+			{
+				report(e->loc, "no public type '" + mname + "' in module '" + alias + "'");
+				base->module_qualifier = true;
+				return true;
+			}
+		}
 		report(e->loc, "no public symbol '" + mname + "' in module '" + alias + "'");
 		base->module_qualifier = true;
 		return true;
+	}
+
+	// P303：`Class::name` 的名字校核——缺此判定时未命中一律静默漏给 codegen
+	//   （class_static_ref 未命中返回 nullptr，会落到成员 GEP 的兜底路径，产出坏 IR）。
+	//   放行：static 数据成员、同名方法（静态/实例）。拒收：非 static 数据成员、无此名。
+	//   限定类名 `alias.Tag` 在 classes_ 中已有别名键，故此处按 base->tag 直查即可。
+	void check_class_static_scope(const std::string &tag, const std::string &mname, const SourceLoc &loc)
+	{
+		auto cit = classes_.find(tag);
+		if (cit == classes_.end() || !cit->second) return; // 别名键/定义缺失已由其他路径报
+		bool has_data = false, has_static = false, has_method = false;
+		for (const auto &m : cit->second->members)
+		{
+			if (m.name.empty() || m.name != mname) continue;
+			has_data = true;
+			if (m.is_static) has_static = true;
+		}
+		if (!has_data)
+			for (const auto &m : cit->second->methods)
+				if (m.name == mname) { has_method = true; break; }
+		if (has_static || has_method) return;
+		if (has_data) report(loc, "invalid use of non-static data member '" + mname + "'");
+		else report(loc, "no member named '" + mname + "' in '" + tag + "'");
+	}
+
+	// P303：`alias.Tag::member` 中 `alias.Tag` 解析不出类时的**类型口径**诊断。
+	//   返回 true 表示已按限定名处理（已报错或已确认模块归属），调用方不再叠通用诊断；
+	//   false 交回通用诊断（非限定名/别名未知）。成功后标记 module_qualifier，使递归子
+	//   表达式的 undeclared 检查不叠加第二条错。
+	bool report_bad_qualified_class(const ExprPtr &ref)
+	{
+		if (!per_module_ || !ref) return false;
+		const auto dot = ref->name.find('.');
+		if (dot == std::string::npos) return false;
+		const std::string alias = ref->name.substr(0, dot);
+		const std::string nm = ref->name.substr(dot + 1);
+		auto qit = catalog_.qualified.find(alias);
+		if (qit == catalog_.qualified.end()) return false;
+		ref->module_qualifier = true;
+		auto vit = catalog_.by_module.find(qit->second);
+		if (vit == catalog_.by_module.end()) return true;
+		const ModuleCatalog::View &v = vit->second;
+		if (v.classes.count(nm)) return true; // 已导出为类（解析失败属上层问题，静默）
+		if (v.structs.count(nm) || v.enums.count(nm))
+			report(ref->loc, "no public class '" + nm + "' in module '" + alias + "'");
+		else
+			report(ref->loc, "no public type '" + nm + "' in module '" + alias + "'");
+		return true;
+	}
+
+	// —— P317：指针差的类型相容（C 6.5.9p4）——
+	// 两侧先按 C 6.3.2.1 衰减（数组名→元素指针、函数名→函数指针），均为指针才入判据；
+	//   文案两侧取**衰减后**的指针拼写（`sa - arr` → `'short *' and 'int *'`），
+	//   typedef 侧由 describe_type 自带 aka 双轨（探针 w9.c：`'SH *' (aka 'short *') and 'int *'`）。
+	// 定在**运算符** loc（`e->op_loc`）：P316 的常量性文案定在表达式起点，两面各归其位。
+	// 只收 `-`：`sa + arr` clang 走 `invalid operands to binary expression` 另族（且打印**未衰减**
+	//   的数组型）；`sa < arr` 等比较 clang **仅 warning**（cc=0，探针 w4i.c）→ 收了即比 clang 严。
+	// 返回 true 表示已报（P332 的算术句据此让位：clang 对两个指针的 `-` 只报相容性句）。
+	bool check_ptr_diff(const ExprPtr &e)
+	{
+		const CTypePtr a = compat_decay(resolve_type(e->lhs));
+		const CTypePtr b = compat_decay(resolve_type(e->rhs));
+		if (!a || !b) return false;
+		if (a->kind != TypeKind::Pointer || b->kind != TypeKind::Pointer) return false;
+		if (pd_pointee(a->base, b->base, 0)) return false;
+		report(e->op_loc, describe_type(a) + " and " + describe_type(b) +
+			" are not pointers to compatible types");
+		return true;
+	}
+
+	// —— P332：不完整记录指针的算术 ——
+	// C 6.5.6p2/p3 要求算术所用指针指向**完整对象类型**；clang 同文拒收
+	//   `arithmetic on a pointer to an incomplete type 'struct I'`。判据与 P255/P329/P333
+	//   **同源**（复用 incomplete_subscript_base：Struct/Union + tag 非空 + 查不到定义；
+	//   Enum 必放行、`void *` 按 P330 口径放行、匿名内联记录按完整）。形状覆盖（p332a~ar 实测）：
+	//   `+` **任一侧**（`1 + ip` 同报）、`-` **只判左侧**（`1 - ip` 走 invalid-operands 另族，
+	//   本批不建模）、`++`/`--`、`+=`/`-=`。定位：Binary 用 `op_loc`（运算符列），
+	//   Unary/Assign 用 `loc`（parser 在这两处存的正是运算符起点，探针 d/l/m/e/n 逐列相符）。
+	void check_ptr_arith(const ExprPtr &e)
+	{
+		CTypePtr inc;
+		SourceLoc loc;
+		if (e->kind == ExprKind::Binary)
+		{
+			if (e->op == "+")
+			{
+				inc = incomplete_subscript_base(resolve_type(e->lhs));
+				if (!inc) inc = incomplete_subscript_base(resolve_type(e->rhs));
+			}
+			else if (e->op == "-")
+				inc = incomplete_subscript_base(resolve_type(e->lhs));
+			else
+				return;
+			loc = e->op_loc;
+		}
+		else if (e->kind == ExprKind::Unary)
+		{
+			if (e->op != "++" && e->op != "--") return;
+			inc = incomplete_subscript_base(resolve_type(e->lhs));
+			loc = e->loc;
+		}
+		else if (e->kind == ExprKind::Assign)
+		{
+			if (e->op != "+=" && e->op != "-=") return;
+			inc = incomplete_subscript_base(resolve_type(e->lhs));
+			loc = e->loc;
+		}
+		else
+			return;
+		if (!inc) return;
+		report(loc, "arithmetic on a pointer to an incomplete type " + describe_type(inc));
+	}
+
+	// 文件作用域初始化式专用的**只查指针算术**递归（理由同 check_ptr_diff_chain：全局初值不走
+	//   check_expr，而该形可藏在 Cast 壳、聚合元素位与嵌套表达式里）。
+	void check_ptr_arith_chain(const ExprPtr &e, int depth)
+	{
+		if (!e || depth > 16) return;
+		if (e->kind == ExprKind::Binary || e->kind == ExprKind::Unary || e->kind == ExprKind::Assign)
+			check_ptr_arith(e);
+		check_ptr_arith_chain(e->lhs, depth + 1);
+		check_ptr_arith_chain(e->rhs, depth + 1);
+		for (const auto &x : e->args) check_ptr_arith_chain(x, depth + 1);
+	}
+
+	// 文件作用域初始化式专用的**只查指针差**递归。不复用 `check_expr`：它带整套表达式诊断，
+	//   接入全局初值面会一次性改动词表（与本批「单面收敛」纪律不符，且极易新增误拒）。
+	//   上段的 assign 循环只看顶层表达式、且对 InitList/数组目标整条跳过，而指针差是
+	//   **表达式内部**的性质（`long j = (long)(sa - arr);`、`{ sa - arr, 0 }`），故另开一条。
+	void check_ptr_diff_chain(const ExprPtr &e, int depth)
+	{
+		if (!e || depth > 16) return;
+		if (e->kind == ExprKind::Binary && e->op == "-") check_ptr_diff(e);
+		check_ptr_diff_chain(e->lhs, depth + 1);
+		check_ptr_diff_chain(e->rhs, depth + 1);
+		for (const auto &x : e->args) check_ptr_diff_chain(x, depth + 1);
+	}
+
+	// —— P323：下标基型（check_expr 与文件域链共用同一处判据）——
+	// 任一侧可下标即放行（C 6.5.2.1 只要求其一；`arr[f]` 的另一侧由既有判据各归其位）。
+	// 有函数型基则报 clang 那句（印未 decay 的原型、定在基址起点）；否则报 clang 的
+	//   `subscripted value is not an array, pointer, or vector` 并定在**该层 `[` 的列**
+	//   （P328：`op_loc` 由 parser 的后缀 `[` 分支填写；函数句仍用 `loc`，P323 已与 clang
+	//   同行同列、不得改）。
+	void check_subscript(const ExprPtr &e)
+	{
+		const CTypePtr a = resolve_type(e->lhs);
+		const CTypePtr b = resolve_type(e->rhs);
+		if (!a || !b) return;
+		if (is_subscriptable(a) || is_subscriptable(b))
+		{
+			// P329：指向不完整记录的指针下标（clang 同句、定在该层 `[` 的列，P328 口径）。
+			//   结果型已由 resolve_type 毒化，故此处不会与下游异族句叠报。
+			CTypePtr ib = incomplete_subscript_base(a);
+			if (!ib) ib = incomplete_subscript_base(b);
+			if (ib) report(e->op_loc, "subscript of pointer to incomplete type " + describe_type(ib));
+			return;
+		}
+		const CTypePtr fa = subscript_fn_type(a);
+		const CTypePtr fn = fa ? fa : subscript_fn_type(b);
+		if (fn)
+			report(e->loc, "subscript of pointer to function type " + describe_type(fn));
+		else
+			report(e->op_loc, "subscripted value is not an array, pointer, or vector");
+	}
+
+	// 文件作用域初始化式专用的**只查下标基型**递归（理由同 check_ptr_diff_chain：全局初值不走
+	//   check_expr，而 `int v = f[1];` 这类下标藏在表达式内部——含聚合元素位、Cast 壳、嵌套）。
+	void check_subscript_chain(const ExprPtr &e, int depth)
+	{
+		if (!e || depth > 16) return;
+		if (e->kind == ExprKind::Binary && e->op == "[]") check_subscript(e);
+		check_subscript_chain(e->lhs, depth + 1);
+		check_subscript_chain(e->rhs, depth + 1);
+		for (const auto &x : e->args) check_subscript_chain(x, depth + 1);
+	}
+
+	// P331：`void` 不是对象类型，不能参与任何双目运算——clang 一律
+	//   `invalid operands to binary expression ('void' and 'int')`（两侧按**书写顺序**、未衰减拼写；
+	//   两侧都是 void 时印 `('void' and 'void')`）。定位：Binary 用 `op_loc`（运算符列）；复合赋值
+	//   （`vp[1] += 1` / `x += vp[1]`）clang 同句、定在运算符起点（parser 的 Assign 存的正是它）。
+	//   两侧型都解得出才判（宁漏不错：另一侧未知时不报）。
+	bool check_void_binary(const ExprPtr &e)
+	{
+		if (!e || !e->lhs || !e->rhs) return false;
+		const CTypePtr lt = resolve_type(e->lhs);
+		const CTypePtr rt = resolve_type(e->rhs);
+		if (!lt || !rt) return false;
+		const bool lv = lt->kind == TypeKind::Void;
+		const bool rv = rt->kind == TypeKind::Void;
+		if (!lv && !rv) return false;
+		report(e->kind == ExprKind::Assign ? e->loc : e->op_loc,
+		       "invalid operands to binary expression (" + describe_type(lt) + " and " + describe_type(rt) + ")");
+		return true;
+	}
+
+	// P334：指针操作数在结构非法位置——clang
+	//   `invalid operands to binary expression ('X' and 'Y')`。
+	//   规则（C 6.5.6/6.5.5/6.5.10）：
+	//     + : ptr + ptr 非法
+	//     - : int - ptr 非法
+	//     * / % & | ^ << >> : 任一侧指针非法
+	//   排除：比较/逻辑/下标/逗号（各走自己的族）；含 void（P331 先手）。
+	//   定位：Binary 用 op_loc、Assign 用 loc（与 P331 同口径）。
+	//   优先级：P334 > P332 > P317（结构非法即短路，不再查完整性/兼容性）。
+	static bool is_ptr_like(const CTypePtr &t)
+	{
+		return t && (t->kind == TypeKind::Pointer || t->kind == TypeKind::Array ||
+					 t->kind == TypeKind::Function);
+	}
+
+	bool check_binary_operands(const ExprPtr &e)
+	{
+		if (!e || !e->lhs || !e->rhs) return false;
+		const std::string &op = e->op;
+		// 排除：比较/逻辑/下标/逗号
+		if (op == "[]" || op == "," || op == "&&" || op == "||" ||
+			op == "==" || op == "!=" || op == "<" || op == ">" ||
+			op == "<=" || op == ">=")
+			return false;
+		const CTypePtr lt = resolve_type(e->lhs);
+		const CTypePtr rt = resolve_type(e->rhs);
+		if (!lt || !rt) return false;
+		// void 侧交 P331 先手
+		if (lt->kind == TypeKind::Void || rt->kind == TypeKind::Void) return false;
+		const bool lp = is_ptr_like(lt);
+		const bool rp = is_ptr_like(rt);
+		bool fire = false;
+		if (op == "+")
+		{
+			if (lp && rp) fire = true;
+		}
+		else if (op == "-")
+		{
+			if (!lp && rp) fire = true;
+		}
+		else if (op == "*" || op == "/" || op == "%" ||
+				 op == "&" || op == "|" || op == "^" ||
+				 op == "<<" || op == ">>")
+		{
+			if (lp || rp) fire = true;
+		}
+		// 复合赋值（Assign 节点 op 形如 "+=" "-=" "*=" 等）
+		if (!fire && e->kind == ExprKind::Assign && op.size() > 1 && op != "=")
+		{
+			char c0 = op[0];
+			if (c0 == '-' && !lp && rp) fire = true;
+			else if (c0 == '+' && lp && rp) fire = true;
+			else if ((c0 == '*' || c0 == '/' || c0 == '%' ||
+					  c0 == '&' || c0 == '|' || c0 == '^' ||
+					  c0 == '<' || c0 == '>') && (lp || rp))
+				fire = true;
+		}
+		if (fire)
+		{
+			report(e->kind == ExprKind::Assign ? e->loc : e->op_loc,
+				   "invalid operands to binary expression (" +
+				   describe_type(lt) + " and " + describe_type(rt) + ")");
+		}
+		return fire;
+	}
+
+	// P334：文件作用域初始化式专用递归链（全局初值不走 check_expr，理由同 P332/P317 链）。
+	void check_binary_operands_chain(const ExprPtr &e, int depth)
+	{
+		if (!e || depth > 16) return;
+		if (e->kind == ExprKind::Binary || e->kind == ExprKind::Assign)
+			check_binary_operands(e);
+		check_binary_operands_chain(e->lhs, depth + 1);
+		check_binary_operands_chain(e->rhs, depth + 1);
+		for (const auto &x : e->args) check_binary_operands_chain(x, depth + 1);
+	}
+
+	// P331：`++`/`--` 的操作数是 `void` 值——clang `cannot increment value of type 'void'` /
+	//   `cannot decrement value of type 'void'`，定在运算符起点（parser 在 Unary 上存的 loc）。
+	void check_void_incdec(const ExprPtr &e)
+	{
+		if (!e->lhs || (e->op != "++" && e->op != "--")) return;
+		const CTypePtr t = resolve_type(e->lhs);
+		if (!t || t->kind != TypeKind::Void) return;
+		report(e->loc, std::string("cannot ") + (e->op == "++" ? "increment" : "decrement") + " value of type 'void'");
+	}
+
+	// P335：条件位（if/while/do-while/for）操作数为 void 值——clang
+	//   `statement requires expression of scalar type ('void' invalid)`，定在语句关键字列（s->loc）。
+	//   仅当条件型解得出且为 Void 才报（宁漏不错：不完整型/未知型不报）。
+	void check_cond_scalar(const StmtPtr &s)
+	{
+		if (!s->expr) return;
+		CTypePtr t = resolve_type(s->expr);
+		if (t && t->kind == TypeKind::Void)
+			report(s->loc, "statement requires expression of scalar type ('void' invalid)");
+	}
+
+	// P335：switch 选择位为 void 值——clang 文案用 `integer type`（区别于 scalar）。
+	void check_cond_integer(const StmtPtr &s)
+	{
+		if (!s->expr) return;
+		CTypePtr t = resolve_type(s->expr);
+		if (t && t->kind == TypeKind::Void)
+			report(s->loc, "statement requires expression of integer type ('void' invalid)");
 	}
 
 	// —— 表达式检查 ——
@@ -1522,18 +2827,63 @@ private:
 			}
 			// P300 Co class（§4.5）：类句柄赋值须源/目标同类，拒绝跨类/非句柄右值。
 			if (L) check_class_handle_compat(resolve_type(L), e->rhs, e->loc);
+			// P331：复合赋值的任一侧是 `void` 值时 clang 只报 invalid operands 一句
+			//   （`vp[1] += 1` → ('void' and 'int')、`x += vp[1]` → ('int' and 'void')），不叠相容句。
+			const bool void_bin = e->op != "=" && check_void_binary(e);
+			const bool bad_ops = !void_bin && e->op != "=" && check_binary_operands(e);
 			// C23 模型 B：nullptr（nullptr_t）只能赋给指针类型；赋给类型已知的非指针左值是约束违例。
-			if (L && is_nullptr(e->rhs))
+			if (!void_bin && !bad_ops && L && is_nullptr(e->rhs))
 			{
 				CTypePtr lt = resolve_type(L);
 				if (lt && lt->kind != TypeKind::Pointer)
-					report(e->loc, "assigning 'nullptr' to incompatible type (not a pointer)");
+					report(e->loc, "assigning to " + describe_type(lt) + " from incompatible type 'nullptr_t'");
 			}
+			// 0.4.1：一般赋值的类型相容（nullptr 由上块专属处理、命中不重复；未知类型与另族形态放行）
+			else if (!void_bin && !bad_ops && L && e->rhs && (!is_ternary_src(e->rhs) || ternary_has_void_arm(e->rhs)))
+			{
+				const CTypePtr lt = resolve_type(L);
+				const CTypePtr rt = resolve_type(e->rhs);
+				// P331：目标左值是 `void` 对象（`vp[1] = …`）——clang `incomplete type 'void' is not
+				//   assignable`，定在赋值运算符；`void` 左值没有对象可写，故不再叠相容句。
+				if (lt && lt->kind == TypeKind::Void)
+					report(e->loc, "incomplete type 'void' is not assignable");
+				else
+				{
+					const Compat cc = assign_compat(rt, lt, e->rhs, e->op != "=");
+					if (cc != Compat::Ok && cc != Compat::Skip)
+						report(e->loc, compat_assign_msg(lt, rt, cc));
+				}
+			}
+			// P332：`p += n` / `p -= n` 的左侧是不完整记录指针（定位在运算符起点 `loc`）
+			check_ptr_arith(e);
 			break;
 		}
 		case ExprKind::Unary:
 			// P254：++/-- 的操作数是可写位置（clang 与赋值同文，不说 "cannot increment"）
 			if (e->op == "++" || e->op == "--") check_write_target(e->lhs, e->loc);
+			// P302：`sizeof(T)` / `_Alignof(T)` 的类型操作数同样是类型引用点，须过跨模块裁定
+			if (e->type && (e->op == "sizeof" || e->op == "alignof")) enforce_type_visible(e->type, e->loc);
+			// P333：`sizeof` / `_Alignof` 施于不完整记录（clang 同文拒收，不再静默给 0）
+			check_sizeof(e);
+			// P332：`++` / `--` 的操作数是不完整记录指针（模式形定位在运算符起点 `loc`）
+			check_ptr_arith(e);
+			// P331：`++` / `--` 的操作数是 `void` 值（同上定位在运算符起点）
+			check_void_incdec(e);
+			// P335：`-`/`+`/`!`/`~` 作用于 void 值——clang `invalid argument type 'void' to unary expression`
+			//   定位在运算符起点（e->loc）；仅当操作数型为 Void 才报，sizeof/alignof/++/-- 不属本形。
+			if (e->op == "-" || e->op == "+" || e->op == "!" || e->op == "~")
+			{
+				CTypePtr ut = resolve_type(e->lhs);
+				if (ut && ut->kind == TypeKind::Void)
+					report(e->loc, "invalid argument type 'void' to unary expression");
+			}
+			// P335：`*` 解引用 void 值——clang `indirection requires pointer operand ('void' invalid)`
+			if (e->op == "*")
+			{
+				CTypePtr ut = resolve_type(e->lhs);
+				if (ut && ut->kind == TypeKind::Void)
+					report(e->loc, "indirection requires pointer operand ('void' invalid)");
+			}
 			break;
 		case ExprKind::Member:
 		{
@@ -1542,18 +2892,36 @@ private:
 			// P300 Co class：:: 静态成员/方法访问，基类名已由 var_type 解析为 Class
 			if (e->op == "::")
 			{
+				// P302：`Tag::static` 的类名也是类型引用点；同名多模块导出 → 裸名歧义拒收
+				if (e->lhs && e->lhs->kind == ExprKind::VarRef && reject_ambiguous_bare_type(e->lhs->name, e->loc)) break;
 				CTypePtr base = resolve_type(e->lhs);
 				if (!base || base->kind != TypeKind::Class)
+				{
+					// P303：限定基名 `alias.Tag` 的类型口径拒收（拼错/非 public/不是类）
+					if (e->lhs && e->lhs->kind == ExprKind::VarRef && report_bad_qualified_class(e->lhs)) break;
 					report(e->loc, "'::' requires a class name on the left side");
+				}
+				else check_class_static_scope(base->tag, e->name, e->loc);
 				break;
 			}
 			CTypePtr base = resolve_type(e->lhs);
 			if (base)
 			{
 				if (e->op == "." && !is_struct_like(base))
-					report(e->loc, "member reference base type is not a structure or union");
+					report(e->loc, "member reference base type " + describe_type(base) + " is not a structure or union");
 				else if (e->op == "->" && !is_ptr_or_array(base))
-					report(e->loc, "member reference base type is not a pointer to structure/union");
+					report(e->loc, std::string("member reference type ") + describe_type(base) + " is not a pointer" + (is_struct_like(base) ? "; did you mean to use '.'?" : ""));
+				else if (e->op == ".")
+					check_member_exists(base, e->name, e->loc); // P305：成员名存在性
+				else
+				{
+					// P305：`->` 先解一层再校核——解引用基不是记录时 clang 走「基类型非结构体」同文
+					//   （`void *v; v->x` / `int *p; p->x` 修前静默过）。
+					const CTypePtr rec = base->base;
+					if (!rec) { /* 未知 pointee：不报，交其他检查 */ }
+					else if (is_struct_like(rec)) check_member_exists(rec, e->name, e->loc);
+					else report(e->loc, "member reference base type " + describe_type(rec) + " is not a structure or union");
+				}
 			}
 			break;
 		}
@@ -1561,10 +2929,23 @@ private:
 		{
 			if (e->op == "[]")
 			{
-				CTypePtr a = resolve_type(e->lhs);
-				CTypePtr b = resolve_type(e->rhs);
-				if (a && !is_ptr_or_array(a) && b && !is_ptr_or_array(b))
-					report(e->loc, "subscript of expression which is not a pointer or array");
+				// P323：函数型基（`f[1]`/`fp[1]`）走专门文案；标量族文案仍是通用句（P328 待改）
+				check_subscript(e);
+				break;
+			}
+			// P331：`void` 操作数先手——clang 对含 `void` 的二元式只报 invalid operands 一句，
+			//   连指针族的两句（P317 相容 / P332 算术）都不叠。
+			if (check_void_binary(e)) break;
+			if (check_binary_operands(e)) break; // P334：结构非法短路，不再查 P332/P317
+			if (e->op == "-")
+			{
+				// P317：异 pointee 类型的指针差（文案与定位见 check_ptr_diff）——优先于 P332：
+				//   两侧都是指针且不相容时 clang 只报相容句（探针 p332al/am）。
+				if (!check_ptr_diff(e)) check_ptr_arith(e);
+			}
+			else if (e->op == "+")
+			{
+				check_ptr_arith(e); // P332：任一指针侧指向不完整记录
 			}
 			break;
 		}
@@ -1601,16 +2982,68 @@ private:
 							              " to function '" + e->name + "'");
 						}
 					}
+					// 0.4.1：实参类型相容。**不带 body 门禁**——extern 原型（如 winapi.co）同样要查；
+					//   个数超形参表时只比前 np 个（少/多参由上段 arity 检查负责），变参尾部不查。
+					//   CTS 全量逐条对 clang 同源核对后剩下的五类噪声一律放行（“零误伤”优先）：
+					//   ① 函数名被局部变量/形参遮蔽（`void test(void (*test)()) { test(10,a,b); }`）→ 实为间接调用；
+					//   ② 形参是函数指针族（`T (*)()` 无原型形与函数指针相容性另族句式）；
+					//   ③ 形参是 union/GCC `transparent_union`（未建模该属性，clang 允许整型直传）；
+					//   ④ 实参是三元式（分支指针不同容时 clang 结果类型为 void*，colang 未建模）；
+					//   ⑤ 实参类型是数组（老式 `f()` 无原型声明下 clang 不做原型比较）。
+					if (!f->params.empty() && !is_declared_local(e->name))
+					{
+						const std::size_t np = f->params.size();
+						const std::size_t nb = e->args.size() < np ? e->args.size() : np;
+						for (std::size_t i = 0; i < nb; ++i)
+						{
+							const ExprPtr &ag = e->args[i];
+							if (!ag || (is_ternary_src(ag) && !ternary_has_void_arm(ag))) continue;
+							const CTypePtr rt = resolve_type(ag);
+							// P322：数组源不再提前放行——compat_decay 退化成元素指针后，`g(int *p)` 传数组
+							//   仍判 Ok（u10g2），而 `g(long v)` 传数组要求报 int-conversion（clang 13:8）。
+							if (!rt) continue;
+							const CTypePtr pt = f->params[i].type;
+							if (!pt) continue;
+							if (pt->kind == TypeKind::Union || pt->kind == TypeKind::Function) continue;
+							if (pt->kind == TypeKind::Pointer && pt->base &&
+							    (pt->base->kind == TypeKind::Function || pt->base->kind == TypeKind::Union))
+								continue;
+							const Compat cc = assign_compat(rt, pt, ag);
+							if (cc == Compat::Ok || cc == Compat::Skip) continue;
+							const std::string msg = compat_arg_msg(pt, rt, cc);
+							if (f->params[i].loc.line)
+							{
+								const std::string nmsg = f->params[i].name.empty()
+									? std::string("passing argument to parameter here")
+									: "passing argument to parameter '" + f->params[i].name + "' here";
+								report_with_note(ag->loc, msg, f->params[i].loc, nmsg);
+							}
+							else
+								report(ag->loc, msg);
+						}
+					}
 				}
 			}
 			break;
 		}
 		case ExprKind::Cast:
 			enforce_type_visible(e->type, e->loc); // P217：转换/复合字面量目标类型跨模块可见性
+			// P335：cast 源为 void 值且目标非 void——clang `operand of type 'void' where arithmetic or pointer type is required`
+			//   定位在源表达式起点（e->lhs->loc）。`(void)x` 是合法的显式丢弃，不报。
+			{
+				if (!e->type || e->type->kind != TypeKind::Void)
+				{
+					CTypePtr src_t = resolve_type(e->lhs);
+					if (src_t && src_t->kind == TypeKind::Void)
+						report(e->lhs->loc, "operand of type 'void' where arithmetic or pointer type is required");
+				}
+			}
 			break;
 		// P300 Co class（0.4.0）
 		case ExprKind::New:
 		{
+			// P302：`new Tag()` 的类名同属类型引用点——同名多模块导出时裸名歧义拒收（须 `new mod.Tag()`）
+			if (reject_ambiguous_bare_type(e->name, e->loc)) break;
 			auto cit = classes_.find(e->name);
 			if (cit == classes_.end())
 			{
@@ -1628,6 +3061,32 @@ private:
 			if (!cur_class_)
 				report(e->loc, "'this' is only available inside a class method");
 			break;
+		case ExprKind::Generic:
+		{
+			// 0.4.1：C11 6.5.1.1 —— 关联列表内同一类型不得重复出现（default 不受限）
+			for (std::size_t i = 0; i < e->args.size(); ++i)
+			{
+				const ExprPtr &ai = e->args[i];
+				if (!ai || !ai->type) continue;
+				for (std::size_t j = 0; j < i; ++j)
+				{
+					const ExprPtr &aj = e->args[j];
+					if (!aj || !aj->type) continue;
+					if (has_char_leaf(ai->type) || has_char_leaf(aj->type)) continue;
+					if (!same_type_strict(ai->type, aj->type)) continue;
+					const std::string ta = describe_type(ai->type);
+					const std::string tj = describe_type(aj->type);
+					const std::string msg = "type " + ta +
+						" in generic association compatible with previously specified type " + tj;
+					if (ai->loc.line && aj->loc.line)
+						report_with_note(ai->loc, msg, aj->loc, "compatible type " + tj + " specified here");
+					else
+						report(ai->loc, msg);
+					break;
+				}
+			}
+			break;
+		}
 		default:
 			break;
 		}
@@ -1675,7 +3134,21 @@ private:
 			if (s->var_init) check_expr(s->var_init); // 初值先查（变量在自身初值内不可见）
 			// C23 模型 B：nullptr 仅隐转指针类型；初始化非指针变量是约束违例。
 			if (is_nullptr(s->var_init) && s->var_type && s->var_type->kind != TypeKind::Pointer)
-				report(s->var_init->loc, "initializing incompatible type (not a pointer) with 'nullptr'");
+				report(s->var_init->loc, "initializing " + describe_type(s->var_type) + " with an expression of incompatible type 'nullptr_t'");
+			// 0.4.1：一般初始化的类型相容（聚合初始化与数组目标交既有机器件；nullptr 已专属处理）
+			else if (s->var_init && s->var_init->kind != ExprKind::InitList && (!is_ternary_src(s->var_init) || ternary_has_void_arm(s->var_init)) &&
+			         s->var_type && s->var_type->kind != TypeKind::Array)
+			{
+				const CTypePtr rt = resolve_type(s->var_init);
+				const Compat cc = assign_compat(rt, s->var_type, s->var_init);
+				if (cc != Compat::Ok && cc != Compat::Skip)
+					// P331：void 源初始化定在变量名；其他相容族保留原初值定位。
+					report(cc == Compat::VoidValue && !s->var_ident_loc.file.empty() ? s->var_ident_loc : s->var_init->loc,
+					       compat_init_msg(s->var_type, rt, cc));
+			}
+			// P324：聚合初始化器元素位类型相容（局部；上链对 InitList 跳过，此处补上）
+			if (s->var_init && s->var_init->kind == ExprKind::InitList && s->var_type)
+				check_aggregate_init(s->var_type, s->var_init);
 			if (!scopes_.empty() && !s->var_name.empty())
 				scopes_.back()[s->var_name] = {s->var_type, s->loc};
 			enforce_type_visible(s->var_type, s->loc); // P217：局部声明类型跨模块可见性
@@ -1742,8 +3215,17 @@ private:
 				if (is_void)
 				{
 					CTypePtr t = resolve_type(s->expr);
+					// P331：clang 印函数名（`void function 'h' should not return a value`，探针 p331bq）
 					if (t && t->kind != TypeKind::Void)
-						report(s->loc, "void function should not return a value");
+						report(s->loc, "void function '" + cur_func_->name + "' should not return a value");
+				}
+				else if (cur_func_ && cur_func_->return_type)
+				{
+					// P335：非-void 函数 return void 值——clang `returning 'void' from a function with incompatible result type 'X'`
+					//   定位在返回表达式起点（s->expr->loc）。
+					CTypePtr t = resolve_type(s->expr);
+					if (t && t->kind == TypeKind::Void)
+						report(s->expr->loc, "returning 'void' from a function with incompatible result type " + describe_type(cur_func_->return_type));
 				}
 			}
 			else if (cur_func_ && !is_void)
@@ -1766,24 +3248,24 @@ private:
 		case StmtKind::If:
 		{
 			if (s->init_stmt) check_stmt(s->init_stmt, loop_d, switch_d);
-			if (s->expr) check_expr(s->expr);
+			if (s->expr) { check_cond_scalar(s); check_expr(s->expr); }
 			check_stmt(s->then_branch, loop_d, switch_d);
 			check_stmt(s->else_branch, loop_d, switch_d);
 			break;
 		}
 		case StmtKind::While:
-			if (s->expr) check_expr(s->expr);
+			if (s->expr) { check_cond_scalar(s); check_expr(s->expr); }
 			check_stmt(s->then_branch, loop_d + 1, switch_d);
 			break;
 		case StmtKind::DoWhile:
 			check_stmt(s->then_branch, loop_d + 1, switch_d);
-			if (s->expr) check_expr(s->expr);
+			if (s->expr) { check_cond_scalar(s); check_expr(s->expr); }
 			break;
 		case StmtKind::For:
 		{
 			// 同 Compound：不压独立作用域，for_init 声明的循环变量并入函数作用域。
 			if (s->for_init) check_stmt(s->for_init, loop_d, switch_d);
-			if (s->expr) check_expr(s->expr);
+			if (s->expr) { check_cond_scalar(s); check_expr(s->expr); }
 			check_stmt(s->then_branch, loop_d + 1, switch_d);
 			if (s->for_incr) check_expr(s->for_incr);
 			break;
@@ -1791,7 +3273,7 @@ private:
 		case StmtKind::Switch:
 			// C23 switch init-statement：先处理 init_stmt（在其中声明的变量对选择式可见）
 			if (s->init_stmt) check_stmt(s->init_stmt, loop_d, switch_d);
-			if (s->expr) check_expr(s->expr);
+			if (s->expr) { check_cond_integer(s); check_expr(s->expr); }
 			check_stmt(s->then_branch, loop_d, switch_d + 1);
 			break;
 		case StmtKind::Case:
@@ -1928,10 +3410,22 @@ private:
 	std::unordered_map<std::string, std::string> nodiscard_funcs_;
 	std::unordered_set<std::string> noreturn_funcs_;
 	std::unordered_map<std::string, const StructDef *> structs_;
+	// P305：tag → 真定义（只收 `is_definition`）。`structs_` 按插入序后写胜出，同名前置引用
+	//   空壳（成员表为空）可能盖掉真定义；成员名校核必须看真定义，否则会把合法成员报成不存在。
+	std::unordered_map<std::string, const StructDef *> real_struct_defs_;
+	// P302：public 标签 → 导出它的模块 key 集合（struct/union/enum 共用一张表；C 里 tag 是
+	//   独立名字空间，故不与 xmod_public_owners（函数/全局）混用）。owner ≥2 即「同名标签
+	//   被多个模块导出」，定义侧告警、宿主裸名引用侧报错——修前无任何检测，布局由后
+	//   import 者静默胜出（h4 族缺陷）。
+	std::unordered_map<std::string, std::unordered_set<std::string>> xmod_type_owners_;
 	// P217：enum 类型标签→定义（供跨模块类型可见性门禁）
 	std::unordered_map<std::string, const EnumDef *> enums_;
 	// P300 Co class（0.4.0）：类名→定义
 	std::unordered_map<std::string, const ClassDef *> classes_;
+	// P304：文件作用域 typedef 的导出面（全量，含非 public）。parse 期已是展开完毕的形状，
+	//   故这两张表只服务两处诊断口径：写错模块别名，以及「该名属于哪个模块但没导出」。
+	std::unordered_set<std::string> typedef_names_;                              // 裸名一键可查
+	std::unordered_map<std::string, std::unordered_set<std::string>> typedef_owner_; // 名→模块键集合
 	// P300：当前正在检查的类（非空表示在类方法体内，允许 this/裸成员名访问）
 	const ClassDef *cur_class_ = nullptr;
 	struct ScopeEntry { CTypePtr type; SourceLoc loc; };

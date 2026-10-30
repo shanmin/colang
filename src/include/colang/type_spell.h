@@ -107,7 +107,28 @@ inline std::string spell_type_at(const CType *t, bool sugar)
 		if (b && b->kind == TypeKind::Function && !t->is_atomic &&
 			!(sugar && !b->alias.empty()))
 			return spell_type_at(b->base.get(), sugar) + " (*)(" + spell_params(*b, sugar) + ")";
-		std::string s = spell_type_at(b, sugar) + " *" + qual_suf(t);
+		// P319：指向数组的指针同样要把 `*` 嵌进维度括号前——clang 印 `int (*)[4]`，
+		//   而下方通用拼接会得到 `int[4] *`（同行不同文）；C 语法上二者不等价（后者是指针数组）。
+		//   多维按声明序取内维（与 Array 分支同口径）；pointee 写作别名
+		//   （`typedef int ROW[4]; ROW *p;`）时 clang 保留别名形 `ROW *`，仍交通用拼接。
+		if (b && b->kind == TypeKind::Array && !t->is_atomic &&
+			!(sugar && !b->alias.empty()))
+		{
+			std::string dims;
+			const CType *elem = b;
+			for (; elem && elem->kind == TypeKind::Array; elem = elem->base.get())
+			{
+				if (sugar && elem != b && !elem->alias.empty()) break;
+				std::string dim = (elem->is_vla || elem->array_size == 0) ? std::string() :
+					std::to_string(elem->array_size);
+				dims += "[" + dim + "]";
+			}
+			return spell_type_at(elem, sugar) + " (*)" + dims;
+		}
+		// P319：clang 对多级指针不插空格（印 `int **`），而固定拼 " *" 会得到 `int * *`（同行不同文）
+		//   → base 拼写已以 `*` 结尾时直接续接（`int *const` 等尾非 `*` 者仍空隔开：`int *const *`）。
+		const std::string bs = spell_type_at(b, sugar);
+		std::string s = bs + (bs.empty() || bs.back() == '*' ? "" : " ") + "*" + qual_suf(t);
 		if (t->is_atomic) s = "_Atomic(" + s + ")"; // clang：`int *_Atomic` → `_Atomic(int *)`
 		return s;
 	}
@@ -121,7 +142,10 @@ inline std::string spell_type_at(const CType *t, bool sugar)
 	{
 	case TypeKind::Void: core = "void"; break;
 	case TypeKind::Bool: core = "_Bool"; break;
-	case TypeKind::Char: core = "char"; break;
+	// P319：`unsigned char` 与 Short/Int/Long 同构地由 core 自带符号词（clang 印 `unsigned char`，
+	//   修前恒印 `char` 而使两侧同文地拼出 `'char *' and 'char *'`）。
+	//   `signed char` 与 `char` 在 CType 里不可区分（同为 Char 且 is_unsigned=false），仍只能印 `char`。
+	case TypeKind::Char: core = t->is_unsigned ? "unsigned char" : "char"; break;
 	case TypeKind::Char8: core = "char8_t"; break;
 	case TypeKind::Char16: core = "char16_t"; break;
 	case TypeKind::Char32: core = "char32_t"; break;

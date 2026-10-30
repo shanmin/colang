@@ -23,6 +23,7 @@ Within 0.\*, **MINOR** bumps denote milestones (a key Co-layer capability). **PA
 | 0.3.1   | Windows GUI & `winapi.co`         | Released |
 | 0.3.2   | Linux native ELF toolchain        | Released |
 | 0.4.0   | `class`                           | Released |
+| 0.4.1   | Diagnostics conformance & winapi  | Released |
 
 Details for 1.\* / 2.\* / 3.\* will be finalized by the maintainer before 0.\* wraps up.
 
@@ -89,6 +90,14 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - Static class members accessed via the class name with double colon (`C::m()`).
 - Delivered beyond the original plan: member and parameter types opened up (`class` handles, `struct`/`union`/array embedded by value; parameters borrow, members are owned by the host); the `delete` statement for forced destruction and cycle breaking; correct release on `goto`/`break`/`continue` path terminations.
 - Follow-ups (long tail): inheritance and virtual functions; cross-module consumption of a `public class` from an `import`ed module; the class form under multi-obj (`--per-module`); automatic cycle breaking (currently done with `delete`).
+
+### 0.4.1 — Diagnostics conformance & winapi expansion
+
+- Diagnostics-conformance wave: compile-time errors/warnings and the diagnostic context realigned with clang and ISO C/C++, converging several silent-wrong-value/misjudgement sites (file-scope `bool`/integer constant folding now follows "nonzero is true").
+- Diagnostics: every error/warning now shows the offending line with +/-2 lines of surrounding source and a caret; `-fno-diag-context` disables it.
+- CLI and source-surface tightening: new `-l`/`--lib` to specify external libraries; `[[lib]]` and `class` definitions restricted to `.co` sources (rejected in `.c`/`.h`).
+- Co-layer robustness: fixed the degradation/crash when using a cross-module `public struct` by value inside an `import`ed module.
+- `winapi.co` continues to expand: up to roughly 356 prototypes / 45 struct-union layouts / 503 constants, adding the winsock (ws2_32) socket family, the crypt32 string-encoding family, and more.
 
 ## Planned
 

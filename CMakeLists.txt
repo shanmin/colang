@@ -70,9 +70,11 @@ if(MSVC)
   endforeach()
   string(REGEX MATCH "COLANG_VERSION_STRING +\"([^\"]+)\"" _m "${_colang_ver_h}")
   set(COLANG_VERSION_STRING "${CMAKE_MATCH_1}")
-  # read persisted "<version> <revision>" for the non-auto path seed. Use the
-  # recorded counter only when its version matches the current three-segment
-  # version; a front-version change resets the seed to 0 (mirrors the script).
+  # read persisted "<version> <revision>" for the non-auto path seed. The
+  # recorded counter is taken as-is unless the record CONFIRMS a front-version
+  # change (parseable version that differs from the current three segments ->
+  # seed 0, mirrors the script). A legacy/unreadable record never resets: the
+  # number is kept so the seed is never rewound by accident.
   set(COLANG_VER_REVISION "0")
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/revision.txt")
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/revision.txt" _rvtxt)
@@ -80,6 +82,13 @@ if(MSVC)
       set(_seed_ver "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
       if(_seed_ver STREQUAL COLANG_VERSION_STRING)
         set(COLANG_VER_REVISION "${CMAKE_MATCH_4}")
+      endif()
+    else()
+      # legacy / bare-number form: keep the recorded counter (version unknown,
+      # so no reset is ever inferred from it).
+      string(REGEX REPLACE "[^0-9]" "" _seed_n "${_rvtxt}")
+      if(NOT _seed_n STREQUAL "")
+        set(COLANG_VER_REVISION "${_seed_n}")
       endif()
     endif()
   endif()

@@ -6,14 +6,19 @@
 #   cmake -DSOURCE_DIR=.. -DBINARY_DIR=.. -DVER_MAJOR=.. -DVER_MINOR=..
 #         -DVER_PATCH=.. -DVER_STRING=.. -P cmake/increment_revision.cmake
 #
-# Semantics (P-design, user approved; revised 2026-10-24):
+# Semantics (P-design, user approved; revised 2026-10-24, reset narrowed 2026-10-28):
 #   - Bump by 1 ONLY when colang actually rebuilds/relinks (a no-op incremental
 #     build leaves the target up-to-date and this script never runs). Monotonic
 #     WITHIN one three-segment version (a plain rebuild / deleting build/ does NOT
 #     reset it).
-#   - When the front version (VER_STRING, e.g. 0.3.1) CHANGES, Revision auto-
-#     resets to 0 (the version.h edit itself triggers this pass, and the version
-#     recorded in revision.txt no longer matches).
+#   - Revision is written as 0 ONLY on a CONFIRMED three-segment version change:
+#     revision.txt carries a parseable "<ver> <rev>" and <ver> differs from
+#     VER_STRING (e.g. 0.4.0 vs 0.4.1). While the front three fields are
+#     unchanged the counter is never rewound, and a record that cannot confirm
+#     the version (legacy bare number, damaged file) NEVER resets either - it
+#     keeps counting, so a reset can never happen by accident (user rule
+#     2026-10-28: no reset while MAJOR.MINOR.PATCH is unchanged).
+#     A missing/unusable record has no history to preserve and starts at 0.
 #   - revision.txt persists "<version> <revision>" (checked into VCS).
 #   - Writes the counter back to cmake/revision.txt (checked into VCS), and
 #     regenerates the build-time header + PE resource with the NEW value so this
@@ -32,30 +37,38 @@ endif()
 
 # ---- read persisted "<version> <revision>" state ----
 set(_rev_file "${SOURCE_DIR}/cmake/revision.txt")
-set(_stored_ver "")
+set(_stored_ver "")   # "" = version unknown (record missing / legacy / damaged)
 set(_n "0")
+set(_have_n FALSE)      # TRUE once a counter value was recovered from the record
 if(EXISTS "${_rev_file}")
   file(READ "${_rev_file}" _rv)
   if(_rv MATCHES "([0-9]+)\\.([0-9]+)\\.([0-9]+)[ \r\n\t]+([0-9]+)")
     set(_stored_ver "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
     set(_n "${CMAKE_MATCH_4}")
+    set(_have_n TRUE)
   else()
-    # legacy / bare-number form: recover the number but treat the version as a
-    # mismatch so the counter resets on this first new-format pass.
+    # legacy / bare-number form: the counter is known but the version is not, so
+    # keep counting instead of resetting (a reset needs a CONFIRMED version
+    # change; never rewind on an unreadable record).
     string(REGEX REPLACE "[^0-9]" "" _try "${_rv}")
     if(NOT _try STREQUAL "")
       set(_n "${_try}")
+      set(_have_n TRUE)
     endif()
   endif()
 endif()
 
-# ---- version-change auto-reset; otherwise +1 on this real rebuild ----
-# Front three-segment version changed (or unrecorded) -> Revision resets to 0.
-# Same version -> monotonic +1 (rebuild / clearing build/ does NOT reset).
-if(NOT _stored_ver STREQUAL "${VER_STRING}")
-  set(_rev "0")
+# ---- advance the counter (reset ONLY on a confirmed version change) ----
+# Same three-segment version -> monotonic +1 (rebuild / clearing build/ never
+# resets). Confirmed version change -> 0. Unconfirmed record -> keep counting.
+if(NOT _have_n)
+  set(_rev "0")                          # no history at all: first recorded pass
+elseif(_stored_ver STREQUAL "")
+  math(EXPR _rev "${_n} + 1")            # version unknown: never rewind
+elseif(NOT _stored_ver STREQUAL "${VER_STRING}")
+  set(_rev "0")                          # confirmed MAJOR.MINOR.PATCH change
 else()
-  math(EXPR _rev "${_n} + 1")
+  math(EXPR _rev "${_n} + 1")            # front three fields unchanged
 endif()
 
 set(_full "${VER_STRING}.${_rev}")
@@ -73,7 +86,8 @@ function(_colang_write_if_changed path content)
   file(WRITE "${path}" "${content}")
 endfunction()
 
-# 1) persist "<version> <revision>" (0 on version change, else previous + 1)
+# 1) persist "<version> <revision>" (0 only on a confirmed version change,
+#    otherwise previous + 1 - see the decision block above)
 _colang_write_if_changed("${_rev_file}" "${VER_STRING} ${_rev}\n")
 
 # 2) regenerate the build-time revision header (included by version.h)

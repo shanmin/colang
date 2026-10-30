@@ -17,10 +17,12 @@ namespace colang
 // 语法分析：由 token 流构建 AST。接口为框架占位，实现时细化。
 // P233：seeds 非空（仅 .co）时，parse 先把这些「已导入模块的 public 标签」登记为
 //   裸标签类型种子（inert forward 引用），使主源 parse 期即可裸用跨模块标签。
+//   P304：typedef_seeds 同机制——public typedef 的**底层已解析类型**登记为裸名/限定名别名。
 //   默认空 = 现行为（.c / 无 import / 非种子路径逐字不变）。
 bool parse(const CompileOptions &opts, CompileState &state, std::vector<Error> &errors,
            const std::vector<ImportTagSeed> &seeds = {},
-           const std::vector<ImportConstSeed> &const_seeds = {});
+           const std::vector<ImportConstSeed> &const_seeds = {},
+           const std::vector<ImportTypedefSeed> &typedef_seeds = {});
 
 // P233：顶层 import 预扫——复用 parse_import_decl 语法、只提取顶层 import 声明，不做完整解析。
 //   供 driver 在「parse 主源之前」拿到 root_imports、先 load_imports 采集标签种子再正式 parse。

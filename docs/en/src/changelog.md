@@ -3,6 +3,13 @@
 This record lists major changes to the Co (colang) language/compiler by release version.
 Versioning policy: 0.* = development/test releases, 1.* = official releases, 2.* = bootstrap.
 
+## 0.4.1
+- Diagnostics-conformance wave: compile-time errors/warnings and the diagnostic context were realigned with clang and ISO C/C++, converging several silent-wrong-value/misjudgement sites (file-scope `bool`/integer constant folding now follows "nonzero is true").
+- Diagnostics: every error/warning now shows the offending line with +/-2 lines of surrounding source and a caret; `-fno-diag-context` disables it.
+- CLI and source-surface tightening: new `-l`/`--lib` to specify external libraries; `[[lib]]` and `class` definitions are restricted to `.co` sources (rejected in `.c`/`.h`).
+- Co-layer robustness: fixed the degradation/crash when using a cross-module `public struct` by value inside an `import`ed module.
+- `winapi.co` continues to expand: from 0.4.0's 323 prototypes / 39 struct-union layouts / 396 constants up to roughly 356 prototypes / 45 struct-union layouts / 503 constants, adding the winsock (ws2_32) socket family, the crypt32 string-encoding family, and more.
+
 ## 0.4.0
 - The `class` reference type (heap-only + automatic reference counting): instantiation via `new`, member access via `this`, instance methods and static members via `C::m()`; handles are released in reverse frame order when leaving scope, and `break`/`continue`/`goto` path terminations release them correctly.
 - Member and parameter types opened up: primitives, `class`, `struct`/`union`/arrays all work — a `struct`/`union`/array member is embedded by value (not reference counted, allocated and freed with its host); a class handle as a parameter **borrows** (ownership is not transferred), as a member it is **owned by the host** (assignment takes ownership, the destructor releases cascadingly).

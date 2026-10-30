@@ -20,6 +20,8 @@ One invocation handles **one** source file. When no action option is given, the 
 | `-I <dir>` | Add a header search directory; may also be written `-I<dir>` and repeated |
 | `--target <triple>` | Set the target triple (e.g. `x86_64-unknown-linux-gnu`); defaults to the host platform when omitted |
 | `--resource <file>` | Embed a PE resource into the executable; may be repeated. Accepts a `.rc` (compiled by the built-in resource compiler) or a precompiled `.res` (embedded as-is). Windows targets only |
+| `-l <name>`, `--lib <name>` | Pull external library `<name>` in at link time; may also be written `-l<name>` / `--lib=<name>` and repeated. The name is a bare link name (e.g. `-luser32`). The only way for a pure `.c` translation unit to name an external library |
+| `-fno-diag-context` | Do not print the source lines around diagnostics (by default the offending line ±2 lines are shown, with the column marked) |
 
 ## Output files and default names
 
@@ -36,7 +38,7 @@ When linking, the intermediate `.obj` is written to the system temporary directo
 `-v` prints something like:
 
 ```
-colang 0.4.0.29
+colang 0.4.1.25
 LLVM   23.1.0
 target x86_64-pc-windows-msvc
 model  LLP64 (windows) (long=4, void*=8, wchar_t=2)
@@ -92,6 +94,25 @@ colang ships its own linker, so turning sources into an executable needs **no ex
 
 > **Compatibility note**: what you distribute is your **compiled program (exe)**, not colang itself. No LLVM/clang tooling needs to accompany the program.
 
+## Naming an external library (`-l` / `--lib`)
+
+Calling an OS API or any other external library requires telling the linker which library to look for. A `.co` source file can state it with the `[[lib("X")]]` attribute (see the "Attributes" chapter); **a pure `.c` translation unit cannot write that attribute**, so it uses the command-line switch instead:
+
+```
+colang -luser32 app.c
+```
+
+- **Four equivalent spellings**: `-l <name>`, `-l<name>`, `--lib <name>`, `--lib=<name>`; the option may be repeated and **duplicate names are deduplicated**.
+- **The name is a bare link name**, the same convention as `[[lib("X")]]`: write `user32`, not `user32.lib`, `C:\libs\user32` or `user32.dll`; a `.lib` suffix is tolerated (it is never doubled into `.lib.lib`).
+- **Windows**: each name becomes `-defaultlib:user32.lib` on the linker command line — the very same link directive that the `[[lib]]` attribute produces, so the two mix without conflict; library search paths are located by the linker from the local SDK / VC directories, and a missing library reports `cannot open file 'xxx.lib'`.
+- **Linux**: each name becomes `-l<name>` inside the static link library group.
+
+Boundaries:
+
+- `--lib` affects the **link step only**; under `-c` it is ignored with a notice.
+- A name containing path separators, quotes, whitespace or a colon is rejected outright (no guessing a path from a library name).
+- It settles *which library to pull in*, not ownership of same-named symbols: when two libraries define the same symbol, their order decides which one is taken.
+
 ## PE resource embedding
 
 `--resource` embeds Windows resources (icons, version info, a manifest, ...) into the produced exe and may be repeated; for example `colang --resource app.rc app.co` (give the `.rc` through `--resource`, not as the positional source file). Each item takes one file:
@@ -132,6 +153,23 @@ The single `.obj` produced by `-c` is useful for inspecting the compile result. 
 ## Diagnostics and exit codes
 
 Diagnostics are printed to standard error in the form `file:line:column: error: message` (advisory ones as `warning`). There are only two exit codes: `0` on success, `1` on failure.
+
+Each diagnostic is followed by **the offending line plus two lines on either side**, with a `^` below the offending line pointing at the column:
+
+```
+app.c:4:9: error: use of undeclared identifier 'foo'
+ 2 | {
+ 3 |     int a = 1;
+ 4 |     a = foo + bar;
+   |         ^
+ 5 |     return a;
+ 6 | }
+```
+
+- **One snippet per line**: several diagnostics on the same source line share a single snippet instead of repeating it.
+- **Traced to the real origin**: when the error is inside a header `#include`d by a `.co` source, the snippet shows that header's own source and line number, not the corresponding position in the main source.
+- **Can be turned off**: `-fno-diag-context` falls back to one-line diagnostics, which keeps scripted output short.
+- When the position cannot be located in the file (for example at end of file), only the one-line diagnostic is printed.
 
 ## Source files
 

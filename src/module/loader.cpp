@@ -1,7 +1,7 @@
 // ============================================================
 // loader.cpp — P212 模块导入加载器实现
 //
-// 见 loader.h 头注释。仅处理 .co 消费、拓序前插合并到主 TU。
+// 见 loader.h 头注释。import 目标后缀白名单见 ADR-107（当前只消费 .co）、拓序前插合并到主 TU。
 // P233：拆成两阶段——load_imports（递归加载、采集标签种子、不合并）+
 //   merge_imports（拓序前插合并 + 回填 resolved_module_key）；load_and_merge_imports
 //   保留为二者组合的薄封装（主源 imports 由传入 TU 读取）。
@@ -56,6 +56,14 @@ std::string module_name_of(const std::filesystem::path &p)
 	return stem.empty() ? p.string() : stem;
 }
 
+// P304：规范化 key → 宿主可书写的模块限定名（无 `as Alias` 时的退路）。
+//   口径与 sema 的 alias_for_key 一致——种子里的 owner 必须就是用户写得出来的那个名字，
+//   否则诊断给出的候选（`a.MyInt`）会被 `unknown module alias` 反手拒收。
+std::string writable_alias_of_key(const std::string &key)
+{
+	return module_name_of(std::filesystem::path(key));
+}
+
 // 读文件；失败返回 false 并由调用方报错（避免 loader 依赖 main.cpp 里的 read_source）。
 bool read_module_text(const std::filesystem::path &p, std::string &out)
 {
@@ -67,7 +75,58 @@ bool read_module_text(const std::filesystem::path &p, std::string &out)
 	return true;
 }
 
-// 解析 import 路径 → 绝对路径 + 补 `.co` 后缀（N3：本版仅解析 `.co`、其它后缀直接失败）。
+// ADR-107：import **目标**后缀白名单分类。`.co`/`.CO` 放行（与 parser 的 is_co_source_file
+//   同口径）；`.bc` 已规划未实现；`.dll`/`.lib`/`.so` 为将来「链接期消费」留位；`.c`/`.h`
+//   永不接受；无后缀仍按现状补 `.co`。
+//   注：本白名单管的是「目标文件后缀」，与「谁可以写 import」（parser 门控、逐 token 判
+//   loc.file）正交，两层各自独立。
+enum class ImportTargetKind
+{
+	CoSource,        // .co / .CO：源码合并，当前唯一可用形态
+	BcModule,        // .bc：已规划、尚未实现
+	BinaryLib,       // .dll / .lib / .so：将来扩展位（只给符号、不给编译期声明）
+	CHeaderOrSource, // .c / .h：C 源/头，永不接受
+	NoSuffix,        // 无后缀：按现状补 .co
+	Unknown,         // 其它后缀
+};
+
+ImportTargetKind classify_import_target(const std::filesystem::path &p)
+{
+	std::string ext = p.extension().string();
+	if (ext.empty()) return ImportTargetKind::NoSuffix;
+	if (ext == ".co" || ext == ".CO") return ImportTargetKind::CoSource;
+	if (ext == ".bc") return ImportTargetKind::BcModule;
+	if (ext == ".dll" || ext == ".lib" || ext == ".so") return ImportTargetKind::BinaryLib;
+	if (ext == ".c" || ext == ".h") return ImportTargetKind::CHeaderOrSource;
+	return ImportTargetKind::Unknown;
+}
+
+// 不可导入 → 返回诊断文本；可导入 → 返回空串。raw 为 import 语句里写的原始文件名（诊断原样引用）。
+std::string import_target_error(ImportTargetKind kind, const std::string &raw)
+{
+	switch (kind)
+	{
+	case ImportTargetKind::CoSource:
+	case ImportTargetKind::NoSuffix:
+		return std::string();
+	case ImportTargetKind::BcModule:
+		return "import target '" + raw + "': .bc modules are planned but not implemented yet; "
+			"import a .co module instead";
+	case ImportTargetKind::BinaryLib:
+		return "import target '" + raw + "': binary library import (.dll/.lib/.so) is not supported yet; "
+			"only .co modules are importable (.bc planned)";
+	case ImportTargetKind::CHeaderOrSource:
+		return "import target '" + raw + "' must be a .co/.bc module; "
+			"C source files and headers cannot be imported (use #include)";
+	default:
+		return "import target '" + raw + "' must be a .co/.bc module (unsupported extension '" +
+			std::filesystem::path(raw).extension().string() + "')";
+	}
+}
+
+// 解析 import 路径 → 绝对路径 + 补 `.co` 后缀。
+// ADR-107：后缀合法性由 classify_import_target 在调用方先校验，本函数只解析**已通过白名单**的
+//   目标（`.co`/`.CO`，或无后缀经本函数补 `.co`），不再承担「其它后缀如何处理」的判定。
 // base_dir = 引用方文件所在目录（主源或某子模块）。
 std::filesystem::path resolve_module_path(const CompileOptions &opts,
                                           const std::string &base_dir,
@@ -83,15 +142,13 @@ std::filesystem::path resolve_module_path(const CompileOptions &opts,
 	{
 		abs = std::filesystem::path(base_dir) / p;
 	}
-	// 补 .co 后缀（若尚未带）
+	// 后缀处理：无后缀 → 补 `.co`（既有行为）；已带后缀时原样返回。
+	//   旧注释「本版仅解析 `.co`、其它后缀直接失败」与实现不符（该分支是空壳、非 `.co` 照样放行，
+	//   故 `.co` 主源 import `.c`/`.h` 模块曾能跑通）。ADR-107 落地后改为：非 `.co`/`.CO` 的显式
+	//   后缀在调用方（load_imports / load_recursive）即被白名单拒收，根本到不了这里。
 	if (abs.extension().string().empty())
 	{
 		abs += ".co";
-	}
-	else if (abs.extension().string() != ".co")
-	{
-		// 显式指定了非 .co 后缀：本版不支持（.bc/.dll 消费归 0.3.0）。
-		// 保留原路径、由 exists 检查报错。
 	}
 	// 回退检索库模块目录（include 等已入 include_dirs 的路径）：使 winapi.co 这类
 	// 库模块可按名导入、无需与调用方同目录。仅当上面「调用方目录相对 / 绝对」候选不存在
@@ -110,6 +167,20 @@ std::filesystem::path resolve_module_path(const CompileOptions &opts,
 	return abs;
 }
 
+// P301：种子采集的前向声明（定义在文件后部）。Loader::load_recursive 在子模块 parse 前需要它们；
+//   此处不带默认实参，避免与定义处的默认值重复。
+void harvest_tag_seeds(const std::unordered_map<std::string, TUPtr> &cache,
+                       std::vector<ImportTagSeed> &out,
+                       const std::vector<std::string> *only_keys);
+void harvest_const_seeds(const std::unordered_map<std::string, TUPtr> &cache,
+                         std::vector<ImportConstSeed> &out,
+                         const std::vector<std::string> *only_keys,
+                         const std::unordered_map<std::string, std::string> *alias_of_key);
+void harvest_typedef_seeds(const std::unordered_map<std::string, TUPtr> &cache,
+                           std::vector<ImportTypedefSeed> &out,
+                           const std::vector<std::string> *only_keys,
+                           const std::unordered_map<std::string, std::string> *alias_of_key);
+
 // 加载器状态：cache + DFS 栈 + postorder 输出。
 struct Loader
 {
@@ -127,6 +198,15 @@ struct Loader
 	std::vector<std::string> postorder;
 
 	Loader(const CompileOptions &o, std::vector<Error> &e) : main_opts(o), errs(e) {}
+
+	// ADR-107：目标后缀白名单校验。不通过则在 import 语句所在位置记一条诊断、返回 false。
+	bool check_import_target(const ImportDecl &imp)
+	{
+		const std::string msg = import_target_error(classify_import_target(imp.filename), imp.filename);
+		if (msg.empty()) return true;
+		errs.push_back(Error{imp.loc.file, Pos{imp.loc.line, imp.loc.column}, msg});
+		return false;
+	}
 
 	// 递归加载单个模块。abs_path 已解析、normalized_key 已算好。
 	// 返回 false 表示错误（not found / cycle / 子模块 preprocess+parse 失败）。
@@ -179,7 +259,7 @@ struct Loader
 		// 空文件按合法空翻译单元处理（与 C 一致、避免 source_text.empty 被 driver 拦）
 		if (text.empty()) text = "\n";
 
-		// 递归 preprocess + parse
+		// 预处理；随后走与主源同构的「预扫 → 加载依赖 → 采种 → 带种子 parse」三步
 		CompileOptions sub_opts;
 		sub_opts.source_path = abs_path.generic_string();
 		sub_opts.source_text = std::move(text);
@@ -194,41 +274,84 @@ struct Loader
 
 		CompileState sub_state;
 		if (!preprocess(sub_opts, sub_state, errs)) return false;
-		if (!parse(sub_opts, sub_state, errs)) return false;
-		if (!sub_state.ast) return false; // parse 应该已保证非空
 
-		TUPtr sub_tu = sub_state.ast;
+		// P301：子模块此前只有「裸 parse」一步，struct_tags_ 永远为空：`struct X` 在本模块块作用域
+		//   被 parser 改名为 X.__blkN（块内遮蔽规则），与导入来的 X 脱钩，按值使用落到 opaque
+		//   alloca（`Cannot allocate unsized type`，甚至 LLVM 崩溃）。改为与主源同构：
+		//   预扫顶层 import → 递归加载依赖并采集它们的 public 标签种子 → 带种子正式 parse。
+		std::vector<ImportDecl> sub_imports;
+		collect_imports(sub_state, sub_imports);
+
 		// 记录诊断展示名（环检测报路径、同 norm_key 一一对应）
 		display_map[norm_key] = abs_path.filename().generic_string();
 
-		// 占位入 cache + 栈
-		cache[norm_key] = sub_tu;
+		// 先占位入 cache + 栈：递归前必须可被回边检测命中（子 → 主 → 子）。
+		//   nullptr 表示「正在加载中」，完成时换成真 TU。
+		cache[norm_key] = nullptr;
 		stack.push_back(norm_key);
 		on_stack.insert(norm_key);
 
-		// 递归处理子模块自身的 imports
 		std::string sub_dir = abs_path.parent_path().generic_string();
 		bool ok = true;
-		// 路 B 阶段1a：为各子模块**自身** imports 回填 resolved_module_key（现仅主源回填）。
-		//   子 TU 的 imports 列表不被 merge_bundle 搬运、随 cache 保留到 sema，供限定访问按模块解析。
-		for (auto &imp : sub_tu->imports)
+		std::vector<std::string> dep_keys; // 本模块直接 import 的模块（种子只取这些，保持闭包粒度）
+		// P304：本模块自己的可书写限定名（key → `as Alias` 或 stem），供 typedef 种子的 owner 用。
+		std::unordered_map<std::string, std::string> alias_of_key;
+		// ADR-107：子模块自身的 import 同受目标后缀白名单约束（与主源同口径、无豁免）。
+		for (auto &imp : sub_imports)
 		{
+			if (!check_import_target(imp))
+			{
+				ok = false;
+				break;
+			}
 			auto child_abs = resolve_module_path(main_opts, sub_dir, imp.filename);
 			std::string child_key = normalize_key(child_abs);
-			imp.resolved_module_key = child_key;
 			if (!load_recursive(child_abs, child_key, imp.loc))
 			{
 				ok = false;
 				break;
 			}
+			dep_keys.push_back(child_key);
+			alias_of_key[child_key] =
+				imp.module_alias.empty() ? writable_alias_of_key(child_key) : imp.module_alias;
+		}
+
+		TUPtr sub_tu;
+		if (ok)
+		{
+			std::vector<ImportTagSeed> tag_seeds;
+			std::vector<ImportConstSeed> const_seeds;
+			std::vector<ImportTypedefSeed> typedef_seeds; // P304
+			harvest_tag_seeds(cache, tag_seeds, &dep_keys);
+			harvest_const_seeds(cache, const_seeds, &dep_keys, &alias_of_key);
+			harvest_typedef_seeds(cache, typedef_seeds, &dep_keys, &alias_of_key);
+			if (!parse(sub_opts, sub_state, errs, tag_seeds, const_seeds, typedef_seeds))
+				ok = false;
+			else
+				sub_tu = sub_state.ast;
+		}
+
+		// 路 B 阶段1a：为子模块**自身** imports 回填 resolved_module_key（在正式 AST 上按自身目录
+		//   重算，与 merge_imports 对主源的做法同口径）。子 TU 的 imports 不被 merge_bundle 搬运、
+		//   随 cache 保留到 sema，供限定访问按模块解析。
+		if (ok && sub_tu)
+		{
+			for (auto &imp : sub_tu->imports)
+				imp.resolved_module_key =
+					normalize_key(resolve_module_path(main_opts, sub_dir, imp.filename));
 		}
 
 		// 弹栈（无论成败、保持一致）
 		on_stack.erase(norm_key);
 		stack.pop_back();
 
-		if (!ok) return false;
+		if (!ok || !sub_tu)
+		{
+			cache.erase(norm_key); // 撤掉「加载中」占位，避免后续误判为已缓存
+			return false;
+		}
 
+		cache[norm_key] = sub_tu; // 加载中 → 已完成
 		// DFS 后序：本模块完成后 push 到 postorder
 		postorder.push_back(norm_key);
 		return true;
@@ -257,6 +380,9 @@ void merge_bundle(TranslationUnit &main_tu,
 		for (auto &e : sub.enums)   e.source_module_key   = *rit;
 		// P300 Co class（跨模块 import）：类项同样打归属标记（owner 模块键），供 codegen 分桶发射/宿主按需引用。
 		for (auto &c : sub.classes) c.source_module_key   = *rit;
+		// P304：文件作用域 typedef（含非 public）同样打归属标记——sema 的 `no public type`
+		//   需据 owner 判断「该名属于哪个模块」，而不是统归为「没有这个符号」。
+		for (auto &t : sub.typedefs) t.source_module_key   = *rit;
 		// 前插声明/定义（顺序不影响 codegen 符号解析、但保留子模块内部相对顺序：
 		//   每次前插整段到头部、多子模块连续前插会让「后加载」的（更靠 postorder 尾部）
 		//   排在「先加载」的之前——正是「依赖方在后」的逆序展开)。
@@ -276,6 +402,11 @@ void merge_bundle(TranslationUnit &main_tu,
 		main_tu.classes.insert(main_tu.classes.begin(),
 			std::make_move_iterator(sub.classes.begin()),
 			std::make_move_iterator(sub.classes.end()));
+		// P304：typedef 导出面拓序前插（与其它顶层项同序，main_tu 末尾仍是主源自身那份）。
+		//   parse 期的种子只带「直接依赖」那一层，这里补齐全量供 sema 判归属/可见性。
+		main_tu.typedefs.insert(main_tu.typedefs.begin(),
+			std::make_move_iterator(sub.typedefs.begin()),
+			std::make_move_iterator(sub.typedefs.end()));
 		// 顶层裸代码：拓序前插 → 子模块 body 排在主源 body 之前（B 方案「main 前置统一 emit」）
 		// --per-module 探针：move 前另记逐模块分段视图（拓序＝本遍历序：最深依赖在前）。
 		if (!sub.top_level_body.empty())
@@ -291,17 +422,18 @@ void merge_bundle(TranslationUnit &main_tu,
 	main_tu.imported_top_level_body_count = imported_stmt_prefix;
 }
 
-// 采集 public struct/enum 标签种子（供 P233 跨模块裸标签在 parse 主源前登记）。
-//   遍历各已加载子 TU（排除主源哨兵 null），对 is_public 且非空 tag 的 struct/union/enum 出种子。
+// 采集 public struct/enum 标签种子（供 P233 跨模块裸标签在 parse 前登记）。
+//   遍历已加载子 TU（排除主源哨兵 null），对 is_public 且非空 tag 的 struct/union/enum 出种子。
 //   去重：同名仅出一条（首个胜出；跨模块同名 public 标签罕见，冲突交 sema/parse 既有规则处理）。
+//   P301：only_keys 非空时只采这些模块（子模块用它自己直接 import 的依赖，保持闭包粒度）；
+//   为空时采全 cache（主源既有行为逐字不变）。
 void harvest_tag_seeds(const std::unordered_map<std::string, TUPtr> &cache,
-                       std::vector<ImportTagSeed> &out)
+                       std::vector<ImportTagSeed> &out,
+                       const std::vector<std::string> *only_keys = nullptr)
 {
 	std::unordered_set<std::string> seen;
-	for (const auto &kv : cache)
-	{
-		const TUPtr &tu = kv.second;
-		if (!tu) continue; // 主源哨兵
+	auto visit = [&](const TUPtr &tu) {
+		if (!tu) return; // 主源哨兵
 		for (const auto &s : tu->structs)
 		{
 			if (!s.is_public || s.tag.empty()) continue;
@@ -321,26 +453,114 @@ void harvest_tag_seeds(const std::unordered_map<std::string, TUPtr> &cache,
 			if (!seen.insert(c.tag).second) continue;
 			out.push_back(ImportTagSeed{c.tag, false, false, true});
 		}
+	};
+	if (only_keys)
+	{
+		for (const auto &k : *only_keys)
+		{
+			auto it = cache.find(k);
+			if (it != cache.end()) visit(it->second);
+		}
+		return;
 	}
+	for (const auto &kv : cache) visit(kv.second);
 }
 
 // P256：采集各已加载子模块的 public const int 全局值（parser 已在模块 parse 期折好入
 //   tu->const_globals），供主源 parse 期把 import 常量作 case 标签/常量表达式求值。
-//   去重：同名仅出一条（首个胜出；跨模块同名 public const 罕见，冲突交既有规则）。
+//   P306：去重口径改按 (owner, name)——裸名仍「同名仅一条」（首个胜出，值口径与旧逐字等价），
+//   限定名 `owner.NAME` 需要各来源各自在册（同名不同模块不得互相吞掉）。
+//   P301：only_keys 口径同 harvest_tag_seeds（子模块只采直接依赖）。
+//   P307：除 public const 外，还采 public enum 的常量（带 is_enum_const）——仅用于限定名
+//   `owner.NAME` 的常量表达式求值；裸名通道在 parser 侧按该标志跳过（P225：enum 不跨模块）。
 void harvest_const_seeds(const std::unordered_map<std::string, TUPtr> &cache,
-                         std::vector<ImportConstSeed> &out)
+                         std::vector<ImportConstSeed> &out,
+                         const std::vector<std::string> *only_keys = nullptr,
+                         const std::unordered_map<std::string, std::string> *alias_of_key = nullptr)
 {
-	std::unordered_set<std::string> seen;
-	for (const auto &kv : cache)
-	{
-		const TUPtr &tu = kv.second;
-		if (!tu) continue; // 主源哨兵
+	std::unordered_set<std::string> seen; // "owner\nname"
+	auto visit = [&](const TUPtr &tu, const std::string &owner) {
+		if (!tu) return;
 		for (const auto &cg : tu->const_globals)
 		{
-			if (!seen.insert(cg.first).second) continue;
-			out.push_back(ImportConstSeed{cg.first, cg.second});
+			if (!seen.insert(owner + "\n" + cg.first).second) continue;
+			out.push_back(ImportConstSeed{cg.first, cg.second, owner});
 		}
+		// P307：public enum 常量同表入册（const 在前，同键首个胜出 → 显式 `public const` 优先）。
+		for (const auto &ed : tu->enums)
+		{
+			if (!ed.is_public) continue;
+			for (const auto &ec : ed.constants)
+			{
+				if (!seen.insert(owner + "\n" + ec.name).second) continue;
+				out.push_back(ImportConstSeed{ec.name, ec.value, owner, true});
+			}
+		}
+	};
+	auto owner_of = [&](const std::string &k) {
+		if (alias_of_key)
+		{
+			auto it = alias_of_key->find(k);
+			if (it != alias_of_key->end() && !it->second.empty()) return it->second;
+		}
+		return writable_alias_of_key(k);
+	};
+	if (only_keys)
+	{
+		for (const auto &k : *only_keys)
+		{
+			auto it = cache.find(k);
+			if (it != cache.end()) visit(it->second, owner_of(k));
+		}
+		return;
 	}
+	for (const auto &kv : cache) visit(kv.second, owner_of(kv.first));
+}
+
+// P304：采集各已加载子模块的文件作用域 typedef（public 那份含已解析底层类型），供消费方
+//   parse 期把限定名 `a.MyInt`/裸名 `MyInt` 展开为底层类型。
+//   去重口径：按 (owner, name)——**不按 name 全局去重**（标签种子那道去重会把同名第二来源
+//   吞掉，而 typedef 的裸名歧义恰恰需要两个来源同时在册才能报出来）。
+//   owner 取消费方自己的可书写限定名（alias_of_key），缺省退文件 stem。
+//   非 public 同样出一条（type 留空）：仅让消费方把 `a.Hidden` 认成限定类型名。
+void harvest_typedef_seeds(const std::unordered_map<std::string, TUPtr> &cache,
+                           std::vector<ImportTypedefSeed> &out,
+                           const std::vector<std::string> *only_keys = nullptr,
+                           const std::unordered_map<std::string, std::string> *alias_of_key = nullptr)
+{
+	std::unordered_set<std::string> seen; // "owner\nname"
+	auto visit = [&](const TUPtr &tu, const std::string &owner) {
+		if (!tu) return;
+		for (const auto &t : tu->typedefs)
+		{
+			if (t.name.empty()) continue;
+			if (!seen.insert(owner + "\n" + t.name).second) continue;
+			ImportTypedefSeed s;
+			s.name = t.name;
+			s.type = t.is_public ? t.type : nullptr;
+			s.owner = owner;
+			s.loc = t.loc;
+			out.push_back(std::move(s));
+		}
+	};
+	auto owner_of = [&](const std::string &k) {
+		if (alias_of_key)
+		{
+			auto it = alias_of_key->find(k);
+			if (it != alias_of_key->end() && !it->second.empty()) return it->second;
+		}
+		return writable_alias_of_key(k);
+	};
+	if (only_keys)
+	{
+		for (const auto &k : *only_keys)
+		{
+			auto it = cache.find(k);
+			if (it != cache.end()) visit(it->second, owner_of(k));
+		}
+		return;
+	}
+	for (const auto &kv : cache) visit(kv.second, owner_of(kv.first));
 }
 
 }  // namespace
@@ -370,8 +590,17 @@ bool load_imports(const CompileOptions &opts, const std::vector<ImportDecl> &roo
 	loader.on_stack.insert(main_key);
 
 	bool ok = true;
+	// P304：主源自己的可书写限定名（key → `as Alias` 或 stem），供 typedef 种子的 owner 用。
+	std::unordered_map<std::string, std::string> alias_of_key;
 	for (const auto &imp : root_imports)
 	{
+		// ADR-107：目标后缀白名单——`.co`/`.CO` 放行；`.bc` 已规划；`.dll`/`.lib`/`.so` 扩展位；
+		//   `.c`/`.h` 及其它后缀一律拒收。
+		if (!loader.check_import_target(imp))
+		{
+			ok = false;
+			break;
+		}
 		auto child_abs = resolve_module_path(opts, main_dir, imp.filename);
 		std::string child_key = normalize_key(child_abs);
 		// resolved_module_key 的回填在 merge_imports 统一做（落在最终主源 imports 上）；
@@ -381,6 +610,8 @@ bool load_imports(const CompileOptions &opts, const std::vector<ImportDecl> &roo
 			ok = false;
 			break;
 		}
+		alias_of_key[child_key] =
+			imp.module_alias.empty() ? writable_alias_of_key(child_key) : imp.module_alias;
 	}
 
 	// 弹主源栈（保持一致、虽然此时已不影响结果）
@@ -395,7 +626,8 @@ bool load_imports(const CompileOptions &opts, const std::vector<ImportDecl> &roo
 	// 主源哨兵（null）不应进 bundle.cache；移走后清理。
 	bundle.cache.erase(main_key);
 	harvest_tag_seeds(bundle.cache, bundle.tag_seeds);
-	harvest_const_seeds(bundle.cache, bundle.const_seeds); // P256
+	harvest_const_seeds(bundle.cache, bundle.const_seeds, nullptr, &alias_of_key); // P256/P306
+	harvest_typedef_seeds(bundle.cache, bundle.typedef_seeds, nullptr, &alias_of_key); // P304
 	return true;
 }
 
@@ -408,6 +640,8 @@ bool merge_imports(const CompileOptions &opts, TranslationUnit &main_tu, ImportB
 	// 回填 main_tu.imports 各项 resolved_module_key（对主源目录确定性重算）。
 	//   注：主源 parse（带种子）产出的 imports 与预扫 root_imports 同源同序；此处以最终主源
 	//   imports 为准重算，确保 sema 可见集匹配用的 key 落在正式 AST 上。
+	//   ADR-107：后缀白名单已在 load_imports / load_recursive 阶段拒收并中止，能走到本函数的目标
+	//   必然已放行，故此处不再重复校验（避免两级诊断重复报同一错误）。
 	std::filesystem::path main_abs = std::filesystem::absolute(opts.source_path);
 	std::string main_dir = main_abs.parent_path().generic_string();
 	for (auto &imp : main_tu.imports)

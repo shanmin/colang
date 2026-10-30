@@ -38,6 +38,7 @@ public int screen_width()
 
 约束：
 
+- **只能写在 `.co`/`.CO` 源文件里**：`[[lib]]` 是 Co 新定义属性，`.c`/`.h` 及其它来源（含被 `.co` `#include` 的头文件）出现即报错 `'lib' attribute is only allowed in .co source files`——判定看**属性实际所在文件**，`.h` 不因被 `.co` 包含而放宽。因此「把外部库归属写在头文件里供多个 `.co` 共用」行不通，必须写在 `.co` 内。
 - **只能挂在声明上**：函数须是纯原型（无函数体），全局变量须是纯外部声明（无初始化式）。声称来自外部库却又在本模块写出定义，是矛盾，编译器拒绝。
 - **与 `public`、`static` 互斥**：`public` 是导出、`lib` 是导入，不能落在同一符号上；`static` 表示内部链接，也不可能由外部库供给。
 - **同名符号的库归属必须一致**：同一名字重复声明且库名相同是合法的；同名却标了两个不同的库，编译器报错（不做静默取舍）。
@@ -150,13 +151,13 @@ int WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow)
 | `[[deprecated]]` | 支持（诊断层，不进产物） | 与 C23 语义一致 |
 | `[[nodiscard]]` / `[[noreturn]]` | 首批语义已生效（告警与校验，与 clang 同形） | 与 C23 基本一致（类型级标注等边角见下） |
 | `[[maybe_unused]]` / `[[fallthrough]]` | 接受但不产生效果 | 与 C23 不同（C23 有实际语义） |
-| `[[lib("X")]]` | Co 新定义，C 标准无此属性 | Co 独有 |
+| `[[lib("X")]]` | Co 新定义，C 标准无此属性；且仅限 `.co`/`.CO` 源文件 | Co 独有 |
 | `[[subsystem("windows")]]` | Co 新定义，C 标准无此属性 | Co 独有 |
 | `<:` `::>` 替代拼写 | 不支持 | 与 C23 不同 |
 
 > **兼容性告知**：
-> 1. `[[lib("X")]]` 是 Co 自定义属性。把 `.co`/`.c` 交给真正的 clang/clangd 看时，它会按未知属性 `-Wunknown-attributes` 警告并忽略——**这是必然如此、不是缺陷**；外部工具不会校验库归属，只有 Co 编译器消费它。
-> 2. 从 C/C++ 迁移时，`#pragma comment(lib, "X")` 与 `__declspec(dllimport)` 本编译器**既不实现、也不模拟**，库归属一律须显式改写为 `[[lib("X")]]`。
+> 1. `[[lib("X")]]` 是 Co 自定义属性。把 `.co` 交给真正的 clang/clangd 看时，它会按未知属性 `-Wunknown-attributes` 警告并忽略——**这是必然如此、不是缺陷**；外部工具不会校验库归属，只有 Co 编译器消费它。
+> 2. 从 C/C++ 迁移时，`#pragma comment(lib, "X")` 与 `__declspec(dllimport)` 本编译器**既不实现、也不模拟**，库归属须显式改写为 `[[lib("X")]]`；而 `[[lib]]` **只能写在 `.co` 文件里**——纯 `.c` 档请改用命令行 `--lib <name>` 指定外部库（见「编译器命令行」章节），不必把声明搬进 `.co`。
 > 3. `[[deprecated]]` 是纯前端诊断，Co 与 clang 一样**不把它编进产物 IR**，因此不会传导到依赖该产物的下游模块。
 > 4. `[[subsystem("windows")]]` 同样是 Co 自定义属性：真 clang/clangd 会按未知属性警告并忽略（**必然如此、非缺陷**）；子系统切换只有 Co 编译器消费。
 

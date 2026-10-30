@@ -14,8 +14,27 @@ Modules exist to support organizing large projects and to avoid the duplicate-de
 
 - `public` is Co's **only visibility keyword** — there is no `private`, and no separate `export`. It serves two roles at once: marking the **module interface** (importable by other modules) and **dynamic-library export** (written to the DLL export table).
 - A definition without `public` is visible only inside its module; only a `public` definition is externally visible and importable.
-- `public` may modify top-level functions, global variables, and `struct` / `union` / `enum` types (cross-module type visibility has been available since 0.3.0/0.3.1); `public` on `class` and its members has been available since 0.4.0 (cross-module `import` consumption of a `public class` is still not opened).
+- `public` may modify top-level functions, global variables, and `struct` / `union` / `enum` types (cross-module type visibility has been available since 0.3.0/0.3.1), as well as **file-scope `typedef`** (`public typedef int MyInt;`, part of the export surface since 0.4.1.40; a non-`public` `typedef` is not exported); `public` on `class` and its members has been available since 0.4.0 (cross-module `import` consumption of a `public class` is still not opened).
 - Non-`public` imported symbols are forced to `InternalLinkage` during codegen — references within the same module resolve, but no externally-visible LLVM value is emitted.
+
+## Same-name tags: warning + qualified type names
+
+When two or more imported modules export a **same-named `public` tag** (`struct` / `union` / `enum` / `class`), a type reference becomes **ambiguous** — same-named types from different modules usually differ in layout, and binding the wrong one is a silent miscompile. Since **0.4.1** the rule has three stages:
+
+1. **Unconditional warning on the definition side**: `tag 'Leaf' is exported by multiple imported modules (leaf_a.Leaf, leaf_b.Leaf); unqualified references are an error, use a qualified name`. It does not care whether the layouts match, nor whether the name is actually used — same name is enough (compilation proceeds).
+2. **Bare names rejected on the use side**: a host bare-name reference to that tag (declaration / signature / member type / cast / `sizeof` / `_Alignof` / `typeof` / `new` / `Tag::static`) → `reference to 'Leaf' is ambiguous ...; use a qualified name`. **Not an error when the host defines a same-named type itself** (the local definition wins, same rule as functions/globals).
+3. **Qualified type names as the escape hatch**: write `a.Leaf` / `b.Leaf` (`a` is the `as` alias, or the filename stem without an alias) to bind each module's own definition:
+
+```co
+b.Leaf l;                 // qualified names work in type-name positions
+l.y = 7;
+sizeof(a.Leaf);           // 4 (a's definition)
+sizeof(b.Leaf);           // 16 (b's definition)
+```
+
+Internally the qualified name flows as a **module-identity-bearing tag key** (e.g. `a.Leaf`), so every existing tag-keyed path — member tables, completeness checks, size/alignment, layout — hits the right definition unchanged. It is therefore not merely a diagnostic but the binding mechanism that actually removes the miscompile.
+
+For the full syntax (including qualified enum constants `p.RED`, qualified class statics `c.Counter::total`, and qualified `typedef` `a.MyInt` — only `public typedef` is exported), see "Same-Name Tags" in the import chapter.
 
 ## Forms of a module
 
@@ -59,7 +78,7 @@ Deferred to later milestones:
 - The declaration-metadata carrier that lets `.obj` / `.dll` / `.so` become **importable** modules (note: *producing* a DLL and *consuming* a DLL-as-module are two different things — the former landed with the 0.3.2 carriers);
 - User-authored `__init__` customization.
 
-## Currently implemented boundary (0.3.2)
+## Currently implemented boundary (0.4.1)
 
 - **Module boundary**: one `.co` file = one module; module key = canonical absolute path; same-name files in different directories are distinguished by their paths.
 - **Independent compilation closures** (since 0.3.2): each module builds its own type/symbol tables and is analyzed on its own before merging; same-name different-layout `struct` types never hijack each other; `#include`-brought environment symbols do not enter the export surface (ambient cut-off).
@@ -68,5 +87,6 @@ Deferred to later milestones:
 - **Dynamic-library artifacts**: there is no `-shared` option, but the compiler switches between DLL and exe link modes automatically from the `-o` output extension. Naming the output `*.dll` produces an export-table-bearing dynamic library (an import library `*.lib` is generated alongside, verified on Windows).
 - **Multi-file programs**: compose several `.co` sources with `import` (available since 0.3.0). The single `.obj` from `-c` is useful for inspecting the compile result; linking several object files directly into an executable is still under development (see the Command Line chapter).
 - **Top-level execution model**: see the "import (Module Import)" chapter; this batch covers only `.co` consumption.
-- **Cross-module type references**: a `public struct` / `union` / `enum` imported from a module is usable as a value type (member access, address-of for passing, and `sizeof` all work); the consumer may also use the tag **with the keyword omitted** (`Point p;`, since 0.3.1).
+- **Cross-module type references**: a `public struct` / `union` / `enum` imported from a module is usable as a value type (member access, address-of for passing, and `sizeof` all work); the consumer may also use the tag **with the keyword omitted** (`Point p;`, since 0.3.1). **Main source and imported modules behave identically** (since 0.4.1): instantiating a directly imported type by value inside a submodule works too, where previously only pointers and file-scope fields were supported.
+- **Same-name tag adjudication** (since 0.4.1): two or more modules exporting a same-named `public` tag → an **unconditional warning** on the definition side; a host **bare-name reference is an error** (switch to the qualified type name `mod.Tag`); **qualified type names** work in declarations, the `struct` keyword form, casts, `sizeof`/`_Alignof`/`typeof`, and `new`, with `struct`/`union`/`enum`/`class` handled alike. The old behaviour (later import wins; the other layout's fields folded onto slot 0) is retired.
 - **Cross-module compile-time constants**: a `public const int` from an imported module is usable in the consumer as a read-only value, an array dimension, or a `switch` `case` label (since 0.3.1; the `WM_*` series in `winapi.co` is exactly this use).

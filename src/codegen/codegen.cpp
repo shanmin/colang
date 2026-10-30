@@ -141,6 +141,36 @@ struct CodeGenImpl
 	std::unordered_map<std::string, CTypePtr> var_types_;
 	// 全局变量名 -> CTypePtr
 	std::unordered_map<std::string, CTypePtr> global_types_;
+	// P306：全局变量名 -> 源级定义（初始化器折叠时回查 const 全局的初值表达式）。
+	//   同名首个胜出、主源定义优先（P212 分桶下导入模块的同名 static 不得遮住主源）。
+	std::unordered_map<std::string, const GlobalVar*> global_defs_;
+	// P306：const 全局引用折叠的递归深度护栏（`const int A = B; const int B = A;` 类互引不致爆栈）
+	int qconst_fold_depth_ = 0;
+	// P308：codegen 期硬错的粘性标志（「全局初值静默折 0」族改判拒收后由此上抛）。
+	//   generate() 必须据此早退 false——main 在 compile() 返回 true 时只打印诊断、不改退出码，
+	//   不早退就会带着已产出的错值继续（甚至链接成可执行文件）。
+	bool gen_hard_error_ = false;
+	// P310：聚合初始化器（InitList 分支）的子元素折叠几乎都不回传 out_folded（十余处子递归按
+	//   「槽位填常量」直取返回值），聚合根 folded 恒 true → 挂在 !folded 上的 P308 主判据永不触发
+	//   （`int a[2] = {M,1}` 类静默 0）。不改聚合根 folded 语义（否则 synth_carrier 路径会把整个聚合
+	//   推上运行期 store，行为变更），改为成员位传递：InitList 分支内的折叠落到末尾 fallback 时置
+	//   agg_unfolded_，主判据按 (!folded || agg_unfolded_) 取或。
+	bool agg_ctx_ = false;        // 当前处于 InitList 复合初始化器分支内（RAII 维护）
+	bool agg_unfolded_ = false;   // 聚合成员位置出现过折不动的子元素
+	struct AggCtxGuard
+	{
+		bool &slot_;
+		bool saved;
+		explicit AggCtxGuard(bool &s) : slot_(s), saved(s) { s = true; }
+		AggCtxGuard(const AggCtxGuard &) = delete;
+		AggCtxGuard &operator=(const AggCtxGuard &) = delete;
+		~AggCtxGuard() { slot_ = saved; }
+	};
+	// P307：`alias.NAME` → public enum 常量值（首次使用时由已合并主 TU 的 enums 建表）。
+	//   文件作用域/静态初始化器不走 sema，`b.DIM` 到 codegen 仍是 Member 节点，旧路径落
+	//   fallback 折 0（静默错值、无诊断）；此处按 import 限定名回查 public enum 常量补真值。
+	std::unordered_map<std::string, intmax_t> qual_enum_vals_;
+	bool qual_enum_ready_ = false;
 	// 函数名 -> 返回类型 CTypePtr（_Generic 类型推断用）
 	std::unordered_map<std::string, CTypePtr> func_types_;
 	// 函数名 -> 完整函数类型 CTypePtr（Function{base=返回, params, variadic}），供 _Generic 函数名衰减为函数指针时匹配（00219 foo→fptr）
@@ -178,6 +208,8 @@ struct CodeGenImpl
 	std::unordered_map<std::string, const FuncDecl *> canon_; // 规范声明表（升格自 gen_tu 局部、跨桶共享）
 	// 路 B 阶段2-c：当前桶的 TU 指针（供分桶裸名→符号解析查本桶自有定义）；非分桶不使用。
 	const TranslationUnit *cur_tu_ = nullptr;
+	// P306：合并后主 TU 视图（限定访问 `m.K` 按 import 限定名回查目标全局；见 const_global_ref_init）。
+	const TranslationUnit *tu_view_ = nullptr;
 	std::unordered_map<std::string, std::string> gdef_bucket_; // 全局变量名 → 定义桶 key（仅分桶模式填）
 	std::vector<std::string> imported_init_names_; // 拓序排列的各导入桶 __init__ 函数名（仅分桶模式填）
 	// 顶层非恒定运行的 pending store 条目（P219；自 gen_tu 局部升格供分桶复用）
@@ -208,6 +240,18 @@ struct CodeGenImpl
 		cur_bucket_key_ = key;
 		globals_.clear();
 		annexk_handler_gv_ = nullptr;
+	}
+
+	// P302：导入模块的限定名（与 sema 同口径：`as ModAlias` 优先，否则文件名 stem 原文）。
+	static std::string import_alias_of(const ImportDecl &d)
+	{
+		if (!d.module_alias.empty()) return d.module_alias;
+		std::string base = d.resolved_module_key;
+		const auto slash = base.find_last_of("/\\");
+		if (slash != std::string::npos) base = base.substr(slash + 1);
+		const auto dot = base.find_last_of('.');
+		if (dot != std::string::npos) base = base.substr(0, dot);
+		return base;
 	}
 
 	// 实体是否属于当前桶（非分桶模式恒真＝现状全部摊单桶）。
@@ -303,7 +347,10 @@ struct CodeGenImpl
 	// 路 B 阶段1b-iii：限定访问目标全局变量取址（他桶定义→本造 External 声明，合并后由链接器归并）。
 	llvm::Value *qualified_global_addr(const ExprPtr &e)
 	{
-		const GlobalVar *g = e->q_global;
+		// P306：文件作用域初值不经 sema 的 check_expr，`p.K` 的 q_global 此处恒空——按 import
+		//   限定名回查补上（与值折叠同一口径），否则 `&p.K` 全局初值落 null、解引用 AV。
+		const GlobalVar *g = e->q_global ? e->q_global : qualified_global_by_alias(e);
+		if (!g) return nullptr;
 		const std::string sym = global_symbol(*g);
 		if (llvm::GlobalVariable *gv = module->getGlobalVariable(sym))
 			return gv;
@@ -414,6 +461,17 @@ struct CodeGenImpl
 		if (t->kind == TypeKind::Struct || t->kind == TypeKind::Union)
 			return get_struct_type(t->tag);
 		return to_llvm_type(t);
+	}
+
+	// P330：`void` pointee 的地址步长按 GNU 语义 = **1 字节**（与 `char` 同宽）。
+	//   `to_llvm_alloca_type(Void)` 给的是 LLVM `void`（unsized）：喂 GEP 即
+	//   `GEP into unsized type!`（合法 C 被误拒），喂 load/store 即编译期 0xC0000005。
+	//   指针差的宽度面已由 P318 单列（elem_sz=1），本条把 GEP / load / store 三面补齐，同口径。
+	llvm::Type *pointee_llvm_type(const CTypePtr &t)
+	{
+		if (!t) return llvm::Type::getInt32Ty(ctx);
+		if (t->kind == TypeKind::Void) return llvm::Type::getInt8Ty(ctx);
+		return to_llvm_alloca_type(t);
 	}
 
 	// —— 对齐计算（C23 _Alignas 全链路）——
@@ -959,6 +1017,18 @@ struct CodeGenImpl
 			for (const auto &sd : tu.structs)
 				if (!sd.tag.empty() && sd.is_definition && in_cur_bucket(sd.source_module_key))
 					struct_defs_[sd.tag] = &sd;
+			// P302：模块限定类型名 `mod.Tag` 的别名键——宿主写 `a.Leaf` 时按此键取该模块的
+			//   那份布局，消灭「成员未命中→GEP 0 号槽」的静默错编译（h4 族另一半）。
+			//   别名口径与 sema 同：`as ModAlias` 优先，否则文件 stem 原文。
+			for (const auto &d : tu.imports)
+			{
+				if (d.resolved_module_key.empty()) continue;
+				const std::string alias = import_alias_of(d);
+				for (const auto &sd : tu.structs)
+					if (!sd.tag.empty() && sd.is_definition && sd.is_public &&
+						sd.source_module_key == d.resolved_module_key)
+						struct_defs_[alias + "." + sd.tag] = &sd;
+			}
 		}
 		else
 		{
@@ -1026,6 +1096,12 @@ struct CodeGenImpl
 		{
 			if (!gv.type || gv.type->kind == TypeKind::Void) continue;
 			if (!global_types_.count(gv.name)) global_types_[gv.name] = gv.type;
+			// P306：初始化器折叠按名回查全局定义（const 引用取其初值）；主源定义优先、其余首个胜出。
+			auto dit = global_defs_.find(gv.name);
+			if (dit == global_defs_.end())
+				global_defs_[gv.name] = &gv;
+			else if (!dit->second->source_module_key.empty() && gv.source_module_key.empty())
+				global_defs_[gv.name] = &gv;
 		}
 		// 第零遍：发射全局变量
 		for (const auto &gv : tu.globals)
@@ -1079,7 +1155,31 @@ struct CodeGenImpl
 			if (gv.init)
 			{
 				bool folded = true;
+				agg_unfolded_ = false; // P310：聚合成员位为粘性标志，折叠前清零（仅服务本初始化器）
 				llvm::Constant *c = fold_global_init(gv.init, ty, &folded);
+				// P308：无运行期载体（纯 C 档 / `.co` 无顶层裸句且非 DLL/WinMain）却折不动，
+				//   且初始化器确实「加载」了有定义的非 const 全局 —— C §6.7.9p4 要求静态存储期
+				//   初值为常量表达式，clang 实测报 `initializer element is not a compile-time
+				//   constant`（定位到被引用变量）。旧路径静默折 0、cc=0、零诊断（P306 补 const 链
+				//   后剩下的另一半）。类型门限整数/浮点/指针：P309 已把「地址常量算术」（`arr + 1`、`&x + 1`、
+				//   `&arr[0] + 2`）折成真地址，指针目标不再存在「合法却折不动」的族，故门禁放宽到
+				//   isPointerTy()——`int *p = o;`（o 为普通全局指针）与 clang 同拒，clang 接受的一律不命中。
+				// P310：判据扩到 agg_unfolded_（聚合成员位置折不动时聚合根 folded 仍 true），类型门改
+				//   gate_type_ok 按叶子递归判（数组/struct/union 壳的 LLVM 类型此前恒不过门）；仍由
+				//   init_loads_nonconst_global 兜底真判据——只有「加载有定义非 const 全局」才报，门宽只产漏。
+				// P311：同一入口再收「指针 → 整型显式转换」一族（cast_is_ptr_to_int）——它本身就不是
+				//   常量表达式（clang 对任何 ptr→int 都不给值），折不动落 fallback 故 !folded 已成立，
+				//   整型目标 gate_type_ok 天然入门，无需改主判据结构。
+				if ((!folded || agg_unfolded_) && !synth_carrier && gate_type_ok(ty, 0))
+				{
+					const Expr *hit = nullptr;
+					if (init_loads_nonconst_global(gv.init, 0, &hit) && hit)
+					{
+						errs.push_back(Error{hit->loc.file, Pos{hit->loc.line, hit->loc.column},
+							"initializer element is not a compile-time constant"});
+						gen_hard_error_ = true;
+					}
+				}
 				// P219 A 方案：仅 .co 新面（有顶层裸指令）时，标量/指针初值不可折叠
 				//   不再静默折成 null，改占位 0 + 记待运行期 store（合成 main 头部按序写回）。
 				//   纯 C 档（无顶层裸句）沿用旧折叠行为，CTS/.c 零影响。
@@ -1367,6 +1467,7 @@ struct CodeGenImpl
 	// ON: 填充 gdef_bucket_、依 loader DFS 拓序迭代导入桶、最后主桶。
 	void gen_tu(const TranslationUnit &tu)
 	{
+		tu_view_ = &tu; // P306：初始化器折叠回查用
 		if (!per_module_)
 		{
 			// 单桶模式（零回归）：全部实体入默认 module。in_cur_bucket 恒真。
@@ -1508,7 +1609,8 @@ struct CodeGenImpl
 			if (!root) return nullptr;
 			CTypePtr at = get_expr_ctype(p->lhs);
 			if (!at || !at->base) return nullptr;
-			llvm::Type *ety = to_llvm_alloca_type(at->base);
+			// P330：`void` pointee 步长 1 字节（GNU），旧路 unsized `void` 喂 getTypeAllocSize 即崩溃
+			llvm::Type *ety = pointee_llvm_type(at->base);
 			if (!ety) return nullptr;
 			intmax_t idx;
 			if (!fold_int_const(p->rhs, idx)) return nullptr;
@@ -1518,11 +1620,273 @@ struct CodeGenImpl
 		return nullptr;
 	}
 
+	// P312：判定「纯静态对象路径」——链上只允许 `.` 成员访问与 **Array 类型基**的下标，根为具名对象。
+	//   数组名退化（C §6.3.2.1）在初始化器里是地址常量（`oo.buf`、`oa[1].buf`、`g2[1]`、`oo.m[1]`），
+	//   但箭头形 / 解引用形 / 指针下标都要先**加载**指针值，不构成常量地址（clang 拒收），
+	//   故此处必须回 false，否则会误把指针变量**自身存储**当对象基址折出静默错值。
+	bool static_lvalue_chain(const ExprPtr &q, int depth)
+	{
+		if (!q || depth > 8) return false;   // 深度护栏：链式成员/下标不无界展开
+		ExprPtr p = q;
+		while (p && p->kind == ExprKind::Cast) p = p->lhs;   // 重解读 cast 不改地址
+		if (!p) return false;
+		if (p->kind == ExprKind::VarRef) return !p->name.empty();   // 根：解析不到全局/静态对象时由调用方回退
+		if (p->kind == ExprKind::Member)
+		{
+			if (p->op != ".") return false;   // `->` / `::` 需加载或跨类作用域
+			CTypePtr bt = get_expr_ctype(p->lhs);
+			if (!bt || (bt->kind != TypeKind::Struct && bt->kind != TypeKind::Union)) return false;
+			return static_lvalue_chain(p->lhs, depth + 1);
+		}
+		if (p->kind == ExprKind::Binary && p->op == "[]")
+		{
+			CTypePtr bt = get_expr_ctype(p->lhs);
+			if (!bt || bt->kind != TypeKind::Array) return false;   // 指针下标要先加载指针值
+			return static_lvalue_chain(p->lhs, depth + 1);
+		}
+		return false;
+	}
+
+	// P309：把「地址常量 ± 整型常量」拆成地址侧与常量侧（C §6.5.6 指针算术）。
+	//   接受 `arr + 1`、`1 + arr`、`&x - 1`、`&arr[0] + 2` 及链式 `arr + 1 + 1`；
+	//   两侧都折得动整型常量时不算地址算术（交整型路径），`1 - arr` 亦不算（减法不交换）。
+	bool addr_arith_split(const ExprPtr &p, ExprPtr &out_base, intmax_t &out_n, bool &out_sub)
+	{
+		if (!p || p->kind != ExprKind::Binary) return false;
+		if (p->op != "+" && p->op != "-") return false;
+		intmax_t a = 0, b = 0;
+		const bool lhs_int = fold_int_const(p->lhs, a);
+		const bool rhs_int = fold_int_const(p->rhs, b);
+		if (p->op == "+" && lhs_int && !rhs_int) { out_base = p->rhs; out_n = a; out_sub = false; return true; }
+		if (rhs_int) { out_base = p->lhs; out_n = b; out_sub = (p->op == "-"); return true; }
+		return false;
+	}
+
+	// P309：指针算术的**元素步进宽度**（字节）。`arr + 1` 的 1 是「一个元素」而非「一字节」，
+	//   故步进必须由指针侧类型推出：数组名退化 → 元素宽度；`&T` → T 的宽度（`&arr + 1` 跳过整数组）；
+	//   字符串字面量 → 按前缀 1/2/4；链式 → 沿用内层基址。标量/指针裸名是「加载」不是地址常量、
+	//   函数名步进无定义，均回 0 不折（交回调用方走 P308 拒收判定）。
+	// P314：剥 Cast 时须先记下**最外层「指针型 Cast」的目标 pointee 宽**并优先采用——
+	//   `(char *)arr + 1` 的 1 是「一个 char」而非「arr 的一个元素」，旧口径只看基址形态
+	//   会退化成步 4（探针 r12：clang 折 gep(i8,@arr,1)，colang 折 gep(i8,@arr,4) → 静默错地址）。
+	intmax_t addr_step_bytes(const ExprPtr &q)
+	{
+		if (!q) return 0;
+		ExprPtr p = q;
+		const llvm::DataLayout &DL = module->getDataLayout();
+		auto bytes_of = [&](const CTypePtr &t) -> intmax_t
+		{
+			if (!t || t->kind == TypeKind::Function || t->kind == TypeKind::Void) return 0;
+			llvm::Type *lt = to_llvm_alloca_type(t);
+			if (!lt) return 0;
+			return static_cast<intmax_t>(DL.getTypeAllocSize(lt).getFixedValue());
+		};
+		intmax_t cast_w = 0;
+		while (p && p->kind == ExprKind::Cast)
+		{
+			// void 指针按 GNU 语义步 1（探针 r12b：clang -std=c23 对 `(void *)arr + 1`
+			//   零诊断接受并折 gep(i8, ptr @arr, 1)，旧口径 bytes_of(void) 回 0 即整式不折）。
+			if (!cast_w && p->type && p->type->kind == TypeKind::Pointer && p->type->base)
+				cast_w = p->type->base->kind == TypeKind::Void ? 1 : bytes_of(p->type->base);
+			p = p->lhs;   // 重解读 cast 不改地址
+		}
+		if (cast_w > 0) return cast_w;
+		if (!p) return 0;
+		if (p->kind == ExprKind::Unary && p->op == "&") return bytes_of(get_expr_ctype(p->lhs));
+		if (p->kind == ExprKind::StringLiteral) return co_str_lit_width(p->str_val);
+		if (p->kind == ExprKind::Binary && (p->op == "+" || p->op == "-"))
+		{
+			ExprPtr inner; intmax_t n = 0; bool sub = false;
+			if (!addr_arith_split(p, inner, n, sub)) return 0;
+			return addr_step_bytes(inner);
+		}
+		if (p->kind == ExprKind::VarRef)
+		{
+			CTypePtr t;
+			auto git = global_types_.find(p->name);
+			if (git != global_types_.end()) t = git->second;
+			else { auto vit = var_types_.find(p->name); if (vit != var_types_.end()) t = vit->second; }
+			if (t && t->kind == TypeKind::Array && t->base) return bytes_of(t->base); // 数组名退化
+			return 0;
+		}
+		// P312：成员数组退化（`oo.buf`）与下标退化（`oo.m[1]`、`g2[1]`）——步进取该数组的**元素宽**
+		//   （`oo.buf + 1` 步 1、`oo.m[1] + 1` 步 4、`oo.m + 1` 步一整行 12），与 VarRef 数组名同口径。
+		if (p->kind == ExprKind::Member || (p->kind == ExprKind::Binary && p->op == "[]"))
+		{
+			if (!static_lvalue_chain(p, 0)) return 0;
+			CTypePtr t = get_expr_ctype(p);
+			if (t && t->kind == TypeKind::Array && t->base) return bytes_of(t->base);
+			return 0;
+		}
+		return 0;
+	}
+
+	// P313：把「地址常量表达式」拆成 (根全局对象, 相对根的字节偏移)，供同对象指针差求元素数。
+	//   基址形态判据与 fold_addr_of_global 同源（`&对象`、数组名退化的裸/成员/下标形、地址算术链），
+	//   步进宽度复用 addr_step_bytes（含 P314 的「有效 pointee」口径），不另开一套宽度。
+	//   给不出「根+偏移」的形态（字符串字面量基、复合字面量基、跨模块限定全局、箭头/解引用链）
+	//   一律回 false：宁漏不错，绝不把「另一个对象」当同根相减。
+	bool addr_root_bytes(const ExprPtr &e, llvm::GlobalVariable *&out_root,
+		intmax_t &out_bytes, int depth)
+	{
+		if (!e || depth > 8) return false;   // 深度护栏：链式算术不无界展开
+		ExprPtr p = e;
+		while (p && p->kind == ExprKind::Cast)
+		{
+			// P313 边界：只剥「指针型 Cast」（重解读不改地址）。整型 Cast 包指针（`(long)arr`）
+			//   本身就不是常量表达式（C §6.6；探针 r8 j7：clang 报 11:27），照剥就会把
+			//   「两个整型值相减」当成同对象指针差误收，且元素数与运行期字节差不一致 → 一律回 false。
+			//   注：整型 Cast 包**整个差**（`(long)(arr - arr)`）不经过此处，交 fold_int_const 的
+			//   Cast 分支（被转侧已是整型，clang 接受得 0，见 tests/p323）。
+			if (!p->type || (p->type->kind != TypeKind::Pointer && p->type->kind != TypeKind::Array))
+				return false;
+			p = p->lhs;
+		}
+		if (!p) return false;
+		intmax_t off = 0;
+		// ① 取址形：&x / &arr[i] / &g.field（可嵌套），偏移由 lvalue 链逐级累加
+		if (p->kind == ExprKind::Unary && p->op == "&")
+		{
+			// P315：链中含加载（`->`/`*`/指针下标）就不是常量地址；不校验就会把
+			//   `&op->buf[1] - &op->buf[0]` 当成「同根 @op 的差」误折成 1（clang 两侧都拒收）。
+			if (!static_lvalue_chain(p->lhs, 0)) return false;
+			llvm::GlobalVariable *root = resolve_lvalue_root_offset(p->lhs, off);
+			if (!root) return false;
+			out_root = root; out_bytes = off; return true;
+		}
+		// ② 数组名退化形：裸名查声明表，成员/下标形须是纯静态对象链且结果为 Array
+		if (p->kind == ExprKind::VarRef || p->kind == ExprKind::Member ||
+			(p->kind == ExprKind::Binary && p->op == "[]"))
+		{
+			if (!static_lvalue_chain(p, 0)) return false;   // 箭头/解引用/指针下标：要先加载指针值
+			if (p->kind == ExprKind::VarRef)
+			{
+				CTypePtr t;
+				auto git = global_types_.find(p->name);
+				if (git != global_types_.end()) t = git->second;
+				else { auto vit = var_types_.find(p->name); if (vit != var_types_.end()) t = vit->second; }
+				if (!t || t->kind != TypeKind::Array) return false;   // 标量/指针裸名是加载，不是地址
+			}
+			else
+			{
+				CTypePtr t = get_expr_ctype(p);
+				if (!t || t->kind != TypeKind::Array) return false;
+			}
+			llvm::GlobalVariable *root = resolve_lvalue_root_offset(p, off);
+			if (!root) return false;
+			out_root = root; out_bytes = off; return true;
+		}
+		// ③ 地址算术形：内层根 + 位移×步进宽（`arr + 2`、`(char*)arr + 4`、`&x - 1`）
+		if (p->kind == ExprKind::Binary && (p->op == "+" || p->op == "-"))
+		{
+			ExprPtr inner; intmax_t n = 0; bool sub = false;
+			if (!addr_arith_split(p, inner, n, sub)) return false;
+			const intmax_t step = addr_step_bytes(inner);
+			if (step <= 0) return false;
+			if (!addr_root_bytes(inner, out_root, out_bytes, depth + 1)) return false;
+			out_bytes += (sub ? -n : n) * step;
+			return true;
+		}
+		return false;
+	}
+
+	// P313：同对象指针差折叠（C §6.5.6p9：两指针相减得「元素个数」而非字节数）。
+	//   clang -std=c23 真值（探针 r11）：`&arr[1] - &arr[0]` = 1、`g2[1] - g2[0]` = 3、
+	//   `arr - (arr + 2)` = -2、`&oo.buf[3] - &oo.buf[0]` = 3；跨对象/异类型差不给常量
+	//   （探针 r11b 报 initializer element is not a compile-time constant）→ 回 false 维持
+	//   「宁漏不错」、不新增诊断。宽度与 P314 同源：两侧有效 pointee 宽不一致就不相除。
+	bool fold_ptr_diff(const ExprPtr &e, intmax_t &out)
+	{
+		llvm::GlobalVariable *rl = nullptr, *rr = nullptr;
+		intmax_t bl = 0, br = 0;
+		if (!addr_root_bytes(e->lhs, rl, bl, 0)) return false;
+		if (!addr_root_bytes(e->rhs, rr, br, 0)) return false;
+		if (rl != rr) return false;                        // 跨对象差：不是常量地址运算
+		const intmax_t sl = addr_step_bytes(e->lhs);
+		const intmax_t sr = addr_step_bytes(e->rhs);
+		if (sl <= 0) return false;
+		if (sr > 0 && sr != sl) return false;              // 两侧 pointee 宽不同（异类型混算）→ 不折
+		const intmax_t d = bl - br;
+		if (d % sl != 0) return false;                     // 落不到元素边界 → 不折（不误产生截断值）
+		out = d / sl;
+		return true;
+	}
+
+	// P315：判定「取址链中是否含需要加载的一层」——`->`（要先取指针值）、`*`（解引用）、
+	//   对**指针类型**的下标均属加载；纯对象路径（`.` 成员、Array 基下标、具名根）不是。
+	//   判据与 static_lvalue_chain 同源（二者必须一致，否则「折不动」与「不报错」会同时成立而
+	//   静默得 0）。取址本身不是加载，故 clang 接受 `&oo.buf[1]`、`&g2[1][0]`、`&op`（对指针
+	//   变量自身取址）；但 `&op->buf[1]`、`&(*op).in.y`、`&cp[1]`、`&op[1].y` 一律拒收（探针 v1）。
+	//   形态不认识（字符串字面量、复合字面量、调用等）一律回 false：宁漏不错，绝不新增误拒。
+	bool addr_chain_requires_load(const ExprPtr &q, int depth)
+	{
+		if (!q || depth > 8) return false;   // 深度护栏：与 static_lvalue_chain 同量级
+		ExprPtr p = q;
+		while (p && p->kind == ExprKind::Cast) p = p->lhs;   // 重解读 cast 不改地址
+		if (!p) return false;
+		if (p->kind == ExprKind::VarRef) return false;   // 根：名字即地址
+		if (p->kind == ExprKind::Member)
+		{
+			if (p->op == "->") return true;              // 箭头：先加载指针值
+			if (p->op != ".") return false;              // `::` 跨模块限定，交旧路径
+			return addr_chain_requires_load(p->lhs, depth + 1);
+		}
+		if (p->kind == ExprKind::Binary && p->op == "[]")
+		{
+			CTypePtr bt = get_expr_ctype(p->lhs);
+			if (bt && bt->kind == TypeKind::Pointer) return true;   // 指针下标：先加载指针值
+			return addr_chain_requires_load(p->lhs, depth + 1);
+		}
+		if (p->kind == ExprKind::Unary)
+		{
+			if (p->op == "*") return true;               // 解引用：先加载
+			if (p->op == "&") return addr_chain_requires_load(p->lhs, depth + 1);
+			return false;
+		}
+		if (p->kind == ExprKind::Binary && (p->op == "+" || p->op == "-"))
+		{
+			ExprPtr inner; intmax_t n = 0; bool sub = false;
+			if (!addr_arith_split(p, inner, n, sub)) return false;
+			return addr_chain_requires_load(inner, depth + 1);
+		}
+		return false;
+	}
+
+	// P309：地址常量算术折叠主入口。旧路径只认「裸数组名退化」与 `&对象`，`arr + 1` 一类
+	//   带常量位移的合法 C 地址常量折不动 → 落 ConstantPointerNull、cc=0、运行期解引用 AV
+	//   （探针 q6/r1）。基址解析：嵌套算术递归；字符串字面量借 fold_global_init（需 pty）；
+	//   其余交 fold_addr_of_global。位移按**字节**发 i8 GEP（与 P227 子对象取址同口径）。
+	llvm::Constant *fold_addr_arith(const ExprPtr &e, llvm::Type *pty, int depth)
+	{
+		if (!e || depth > 8) return nullptr;   // 深度护栏：链式算术不会无界展开
+		ExprPtr p = e;
+		while (p && p->kind == ExprKind::Cast) p = p->lhs;
+		ExprPtr base_e; intmax_t n = 0; bool sub = false;
+		if (!addr_arith_split(p, base_e, n, sub)) return nullptr;
+		// P314：步进宽必须在**剥基址侧 Cast 之前**取（addr_step_bytes 内已按「有效 pointee」优先），
+		//   剥壳只服务基址解析。旧顺序先剥后推 → `(char *)arr + 1` 的宽退化成了 arr 的元素宽 4。
+		const intmax_t step = addr_step_bytes(base_e);
+		while (base_e && base_e->kind == ExprKind::Cast) base_e = base_e->lhs;
+		if (step <= 0) return nullptr;
+		llvm::Constant *base = nullptr;
+		if (base_e->kind == ExprKind::Binary && base_e->op != "[]")
+			base = fold_addr_arith(base_e, pty, depth + 1);   // 链式算术（`arr + 1 + 1`）
+		else if (base_e->kind == ExprKind::StringLiteral && pty && pty->isPointerTy())
+			base = fold_global_init(base_e, pty);   // 字符串字面量基址（`"abc" + 1`，clang 接受）
+		else base = fold_addr_of_global(base_e, pty);   // P312：`[]` 基走退化地址（`g2[1] + 1`）
+		if (!base) return nullptr;
+		const intmax_t bytes = n * step * (sub ? -1 : 1);
+		if (bytes == 0) return base;
+		llvm::Constant *idx = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx),
+			static_cast<uint64_t>(bytes), false);
+		return llvm::ConstantExpr::getGetElementPtr(llvm::Type::getInt8Ty(ctx), base, {idx});
+	}
+
 	// 将 “&已声明全局对象”（含 struct 成员 .p=&x、数组名退化为指针）折叠为该全局的
 	// 地址常量。无法静态解析（前向引用、成员/下标取址、复合字面量等）返回 nullptr，
 	// 交由调用方继续处理（不误折成 null）。修复 c-testsuite 00045/00049：旧路径缺此项，
 	// `int *p = &x;` 落到 ConstantPointerNull → 运行时 *p 解引用地址 0 崩溃。
-	llvm::Constant *fold_addr_of_global(const ExprPtr &e)
+	llvm::Constant *fold_addr_of_global(const ExprPtr &e, llvm::Type *pty = nullptr)
 	{
 		if (!e) return nullptr;
 		ExprPtr p = e;
@@ -1535,11 +1899,45 @@ struct CodeGenImpl
 			p = p->lhs;
 			while (p && p->kind == ExprKind::Cast) p = p->lhs;
 		}
+		// P309：地址常量算术（`arr + 1` / `1 + arr` / `&x - 1` / 链式）。
+		if (!has_amp && p && p->kind == ExprKind::Binary && (p->op == "+" || p->op == "-"))
+			return fold_addr_arith(p, pty, 0);
 		// 子对象地址（&arr[ci] / &g.field，可嵌套）：偏移编译期常量 → i8 字节 GEP 常量。
 		// 仅 has_amp（取址形态）走此路；裸数组名退化仍由下方 VarRef 分支处理。
+		// P315：取址链必须先是「纯静态对象链」。`&op->buf[1]`、`&(*op).buf[1]`、`&cp[1]` 一类
+		//   链中含加载的形并不构成常量地址（clang 拒收），而 resolve_lvalue_root_offset **不校验
+		//   Member 的 op**（`.` 与 `->` 一视同仁），会把**指针变量自身的存储**当对象基址叠成员
+		//   偏移，产出 `gep(i8, ptr @op, 13)` 这种毫无意义的错地址（探针 v1b）。
+		//   链不合格即不折，交回调用方走 P315 拒收判定——与下方 !has_amp 退化分支（P312）同口径。
+		//   限定根（`&m.K`）仍由 qualified_global_addr 接住（`::` 在两个 helper 里均不误伤）。
 		if (has_amp && p && (p->kind == ExprKind::Member ||
 			(p->kind == ExprKind::Binary && p->op == "[]")))
 		{
+			intmax_t off = 0;
+			llvm::GlobalVariable *root =
+				static_lvalue_chain(p, 0) ? resolve_lvalue_root_offset(p, off) : nullptr;
+			if (root)
+			{
+				llvm::Constant *idx = llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx),
+					static_cast<uint64_t>(off), false);
+				return llvm::ConstantExpr::getGetElementPtr(llvm::Type::getInt8Ty(ctx), root, {idx});
+			}
+			// P306：`&m.K`（根是导入模块的全局、本文件无同名变量）——取目标全局地址常量
+			//   （文件作用域初值处 sema 未绑定 q_global，旧路径直接落 null → 运行期 AV）。
+			if (llvm::Value *qv = qualified_global_addr(p)) return llvm::cast<llvm::Constant>(qv);
+			return nullptr;   // 链上出现非常量/未知 → 交回调用方（旧行为）
+		}
+		// P312：数组名退化的**成员形与下标形**（`oo.buf`、`oa[1].buf`、`oo.m[1]`、`g2[1]`、`uu.c`）。
+		//   C §6.3.2.1：初始化器里的数组名（含经成员/下标得到的数组）同样退化为「指向首元素」
+		//   的地址常量，clang 接受并折成 GEP；此前只能折「裸全局数组名」（下方 VarRef 分支），
+		//   成员/下标形折不动 → 落 ConstantPointerNull 静默错值，或因 P308 拒收面**误拒合法 C**。
+		//   仅收纯静态对象链（static_lvalue_chain），且结果类型必须是 Array（否则是标量加载）。
+		if (!has_amp && p && (p->kind == ExprKind::Member ||
+			(p->kind == ExprKind::Binary && p->op == "[]")))
+		{
+			if (!static_lvalue_chain(p, 0)) return nullptr;   // 箭头/解引用/指针下标：不是常量地址
+			CTypePtr t = get_expr_ctype(p);
+			if (!t || t->kind != TypeKind::Array) return nullptr;
 			intmax_t off = 0;
 			if (llvm::GlobalVariable *root = resolve_lvalue_root_offset(p, off))
 			{
@@ -1547,7 +1945,10 @@ struct CodeGenImpl
 					static_cast<uint64_t>(off), false);
 				return llvm::ConstantExpr::getGetElementPtr(llvm::Type::getInt8Ty(ctx), root, {idx});
 			}
-			return nullptr;   // 链上出现非常量/未知 → 交回调用方（旧行为）
+			// 根不可解析（前向引用、跨模块限定全局等）→ 不误折，交回调用方（旧行为）。
+			//   注：不得在此直接回 qualified_global_addr(p)——它给的是**根对象**地址，
+			//   不含本链的成员/下标偏移，返回即静默错值。
+			return nullptr;
 		}
 		if (!p || p->kind != ExprKind::VarRef) return nullptr;
 		const std::string nm = p->name;
@@ -1639,7 +2040,8 @@ struct CodeGenImpl
 			if (!fold_null_offset(p->lhs, base)) return false;
 			CTypePtr at = get_expr_ctype(p->lhs);
 			if (!at || !at->base) return false;
-			llvm::Type *ety = to_llvm_alloca_type(at->base);
+			// P330：同上——void pointee 步长 1 字节
+			llvm::Type *ety = pointee_llvm_type(at->base);
 			if (!ety) return false;
 			intmax_t idx;
 			if (!fold_int_const(p->rhs, idx)) return false;
@@ -1657,6 +2059,19 @@ struct CodeGenImpl
 	bool fold_int_const(const ExprPtr &e, intmax_t &out)
 	{
 		if (!e) return false;
+		// P306：const 全局引用（裸名 `K` / 限定 `m.K`）按「const 全局即编译期常量」口径折其初值，
+		//   使 `int g = K + 1;` / `static int s = K * 2;` 这类复合常量表达式不再落 fallback 折 0
+		//   （钩子与 fold_global_init 同一口径，共用递归深度护栏）。
+		if (qconst_fold_depth_ < 16)
+		{
+			if (const ExprPtr *init = const_global_ref_init(e))
+			{
+				++qconst_fold_depth_;
+				bool ok = fold_int_const(*init, out);
+				--qconst_fold_depth_;
+				return ok;
+			}
+		}
 		switch (e->kind)
 		{
 		case ExprKind::IntLiteral:
@@ -1664,6 +2079,11 @@ struct CodeGenImpl
 			out = static_cast<intmax_t>(e->int_val); return true;
 		case ExprKind::Cast:
 		{
+			// P321：指针→整型显式转换（`(long)&f` / `(long)arr`）不构成常量表达式（P311 口径，
+			//   clang 对任何 ptr→int 都不给值）。P311 落码时无需显式拒绝——指针型在旧 `VarRef`
+			//   兜底下解析不出、自然折不动；P321 补出函数/数组真型后它会折成地址整数，令
+			//   `long q = (long)&f;` 从拒收退回静默折叠（探针 u7:9 丢诊断）→ 必须显式短路。
+			if (cast_is_ptr_to_int(e)) return false;
 			if (!fold_int_const(e->lhs, out)) return false;
 			// C 值转换（§6.3.1.3）：整型→整型 cast 须按目标位宽截断后按目标符号性重解读
 			// （gcc/clang 实现定义 = mod 2^N）。旧版对 cast 直接透传，全局初始化折叠丢符号：
@@ -1708,6 +2128,10 @@ struct CodeGenImpl
 				{
 					if (e->type)
 					{
+						// P321：函数型 sizeof 是 GNU 扩展，clang 实测给 **1**（不得按指针宽 8）。
+						if (e->type->kind == TypeKind::Function) { out = 1; return true; }
+						// P330：`sizeof(void)` 同 GNU 口径 = 1（unsized `void` 喂 getTypeStoreSize 即崩溃）
+						if (e->type->kind == TypeKind::Void) { out = 1; return true; }
 						out = static_cast<intmax_t>(DL.getTypeStoreSize(to_llvm_alloca_type(e->type)));
 						return true;
 					}
@@ -1715,6 +2139,17 @@ struct CodeGenImpl
 					{
 						CTypePtr et = sizeof_operand_ctype(e->lhs);
 						if (et && et->kind == TypeKind::Array && type_has_vla_dim(et)) return false;
+						// P321：函数名已能解析出真型时显式给 1。
+						if (et && et->kind == TypeKind::Function) { out = 1; return true; }
+						// P330：`sizeof(vp[1])` 的 void 表达式同 GNU 口径 = 1。
+						if (et && et->kind == TypeKind::Void) { out = 1; return true; }
+						// P321 时序补丁：CodegenTypeEnv::func_type 查的 func_cftypes_ 由本文件「声明所有
+						//   函数」循环填充，而全局初值折叠（fold_global_init→此处）发生在它**之前**，故
+						//   `long v = sizeof(f) + 1;` 在文件域解析不出类型、落 Int32 折 4（真值 1）。
+						//   canon_ 已在折叠前建好 → 名字命中规范函数表即按函数型给 1；et 非空说明已解析
+						//   出变量/表达式型，不打扰（同名全局变量优先，与 resolve_expr_type 同序）。
+						if (!et && e->lhs->kind == ExprKind::VarRef && canon_.count(e->lhs->name))
+						{ out = 1; return true; }
 						llvm::Type *ty = et ? to_llvm_alloca_type(et) : llvm::Type::getInt32Ty(ctx);
 						out = static_cast<intmax_t>(DL.getTypeStoreSize(ty));
 						return true;
@@ -1739,7 +2174,15 @@ struct CodeGenImpl
 			// 数组下标基址形态（如 (T*)0->arr[i]）：整型折叠不认 []，须委托 offsetof 空基址累加。
 			if (e->op == "[]") return fold_offsetof_int(e, out);
 			intmax_t l, r;
-			if (!fold_int_const(e->lhs, l) || !fold_int_const(e->rhs, r)) return false;
+			if (!fold_int_const(e->lhs, l) || !fold_int_const(e->rhs, r))
+			{
+				// P313：两侧都不是整型常量时再试「指针差」（地址常量 - 地址常量，C §6.5.6p9）。
+				//   旧路径整式回 false → 文件作用域标量 fallback 静默折 0，并诱发 P308 拒收面
+				//   误拒合法 C（`g2[1] - g2[0]`，与 P312 同构：补折即自愈，不动拒收判据）。
+				//   只认 `-`：`+` 无指针加法，`(long)(arr + 1)` 一类仍须回 false 交 P311 拒收。
+				if (e->op == "-") return fold_ptr_diff(e, out);
+				return false;
+			}
 			const std::string &o = e->op;
 			if (o == "+") out = l + r; else if (o == "-") out = l - r;
 			else if (o == "*") out = l * r;
@@ -1761,6 +2204,9 @@ struct CodeGenImpl
 			return c ? fold_int_const(e->args.size() > 0 ? e->args[0] : nullptr, out)
 				: fold_int_const(e->args.size() > 1 ? e->args[1] : nullptr, out);
 		}
+		case ExprKind::Member: // P307：限定枚举常量 `b.DIM`（初始化器不走 sema，故此处按别名回查）
+			if (const_qual_enum_value(e, out)) return true;
+			return fold_offsetof_int(e, out); // 其余 Member 形态仍走 offsetof 空基址，与旧 default 逐字等价
 		default:
 			return fold_offsetof_int(e, out);   // 成员/下标等 offsetof 空基址形态（非该形态回 nullptr→仍 false）
 		}
@@ -2330,11 +2776,397 @@ struct CodeGenImpl
 		return llvm::ConstantStruct::get(sty, elems);
 	}
 
+	// P306：文件作用域初始化器不走 sema 的 check_expr（既有「全局初值只查相容」口径），
+	//   故 `p.K` 的 q_global 在全局初值处恒空。此处按 import 限定名（`as` 别名，缺省取模块
+	//   文件 stem、与 P304 种子 owner 同口径）回查该模块的 public 同名全局，补上折叠目标。
+	const GlobalVar *qualified_global_by_alias(const ExprPtr &e)
+	{
+		if (!e || e->kind != ExprKind::Member || e->op != ".") return nullptr;
+		if (!e->lhs || e->lhs->kind != ExprKind::VarRef) return nullptr;
+		const std::string &alias = e->lhs->name;
+		if (alias.empty() || e->name.empty() || !tu_view_) return nullptr;
+		if (vars_.count(alias)) return nullptr; // 同名局部变量遮蔽（C §6.2.1）：不是模块限定名
+		const std::string key = module_key_of_alias(alias);
+		if (key.empty()) return nullptr;
+		for (const auto &g : tu_view_->globals)
+			if (g.is_public && g.source_module_key == key && g.name == e->name) return &g;
+		return nullptr;
+	}
+
+	// P307：import 限定名（`as` 别名，缺省取模块文件 stem、与 P304/P306 种子 owner 同口径）
+	//   → 规范化模块 key。回空 = 该限定名不在册。
+	std::string module_key_of_alias(const std::string &alias) const
+	{
+		if (alias.empty() || !tu_view_) return std::string();
+		for (const auto &imp : tu_view_->imports)
+		{
+			const std::string q = imp.module_alias.empty()
+				? std::filesystem::path(imp.resolved_module_key).stem().string()
+				: imp.module_alias;
+			if (q == alias) return imp.resolved_module_key;
+		}
+		return std::string();
+	}
+
+	// P307：`alias.NAME` → public enum 常量值（首次使用时按已合并主 TU 建表；同键首个胜出）。
+	//   与 parser 侧 const_qual_table 同口径：只认 public、别名与文件 stem 同权。
+	const std::unordered_map<std::string, intmax_t> &qual_enum_table()
+	{
+		if (!qual_enum_ready_)
+		{
+			qual_enum_ready_ = true;
+			if (tu_view_)
+			{
+				std::unordered_map<std::string, std::string> alias_of; // 模块 key -> 可书写限定名
+				for (const auto &imp : tu_view_->imports)
+				{
+					if (imp.resolved_module_key.empty()) continue;
+					const std::string q = imp.module_alias.empty()
+						? std::filesystem::path(imp.resolved_module_key).stem().string()
+						: imp.module_alias;
+					if (q.empty() || alias_of.count(imp.resolved_module_key)) continue;
+					alias_of[imp.resolved_module_key] = q;
+				}
+				for (const auto &ed : tu_view_->enums)
+				{
+					if (!ed.is_public || ed.source_module_key.empty()) continue;
+					auto ait = alias_of.find(ed.source_module_key);
+					if (ait == alias_of.end()) continue;
+					for (const auto &ec : ed.constants)
+					{
+						const std::string key = ait->second + "." + ec.name;
+						if (!qual_enum_vals_.count(key)) qual_enum_vals_[key] = ec.value;
+					}
+				}
+			}
+		}
+		return qual_enum_vals_;
+	}
+
+	// P307：限定枚举常量取值（`b.DIM`）。遮蔽判定与限定全局同口径：首段是本函数里的
+	//   同名变量时不是模块限定名（C §6.2.1）。
+	bool const_qual_enum_value(const ExprPtr &e, intmax_t &out)
+	{
+		if (!e || e->kind != ExprKind::Member || e->op != ".") return false;
+		if (!e->lhs || e->lhs->kind != ExprKind::VarRef) return false;
+		const std::string &alias = e->lhs->name;
+		if (alias.empty() || e->name.empty()) return false;
+		if (vars_.count(alias)) return false; // 同名变量遮蔽：不是模块限定名
+		const auto &tbl = qual_enum_table();
+		auto it = tbl.find(alias + "." + e->name);
+		if (it == tbl.end()) return false;
+		out = it->second;
+		return true;
+	}
+
+	// P306：初始化器里的 const 全局引用取其初值表达式（裸名走 global_defs_，限定访问走 q_global）。
+	//   非 const 对象不是常量表达式（C §6.6p7），不在此折——维持原 fallback 行为。
+	const ExprPtr *const_global_ref_init(const ExprPtr &e)
+	{
+		if (!e) return nullptr;
+		const GlobalVar *g = nullptr;
+		if (e->kind == ExprKind::VarRef)
+		{
+			if (e->name.empty()) return nullptr;
+			if (vars_.count(e->name)) return nullptr; // 同名局部变量遮蔽（C §6.2.1）：不是全局
+			auto it = global_defs_.find(e->name);
+			if (it != global_defs_.end()) g = it->second;
+		}
+		else if (e->kind == ExprKind::Member)
+			g = e->q_global ? e->q_global : qualified_global_by_alias(e);
+		if (!g || !g->init || g->is_extern) return nullptr;
+		if (!g->type || !g->type->is_const) return nullptr;
+		return &g->init;
+	}
+
+	// P308：被引用的全局是否「有定义、非 const、且按标量加载」。
+	//   extern 纯声明（无定义）本批不报（保守：宁漏不错，clang 对此亦报错，见 ADR 边界）；
+	//   数组/struct/union/函数名不是标量加载而是地址（退化）常量，clang 实测零诊断
+	//   （`int *p = arr;`、`int *p = arr + 1;`、`int (*f)() = add6;`、`sizeof arr` 全合法）。
+	bool is_loaded_nonconst_global(const GlobalVar *g)
+	{
+		if (!g || g->is_extern || !g->init || !g->type) return false;
+		if (g->type->is_const) return false; // const 全局已由 const_global_ref_init 折真值（P306）
+		switch (g->type->kind)
+		{
+		case TypeKind::Array:
+		case TypeKind::Struct:
+		case TypeKind::Union:
+		case TypeKind::Function:
+		case TypeKind::Void:
+			return false; // 名字即地址、不构成加载
+		default:
+			return true;
+		}
+	}
+
+	// P310：「有定义、非 const、数组/struct/union」全局——名字本身是地址常量（is_loaded 已排除、
+	//   退化合法 `int *p = arr;` clang 零诊断），但一旦处于被加载语境（解引用/下标/标量成员访问，
+	//   即 under_deref）就是运行期加载：`*arr`、`arr[0]`、`*(&s.a)` clang 实测（r6）全报。
+	bool is_aggregate_nonconst_global(const GlobalVar *g)
+	{
+		if (!g || g->is_extern || !g->init || !g->type) return false;
+		if (g->type->is_const) return false;
+		switch (g->type->kind)
+		{
+		case TypeKind::Array:
+		case TypeKind::Struct:
+		case TypeKind::Union:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	// P310：拒收门禁的类型判据——按叶子递归。聚合初值的 LLVM 类型（`int a[2]` → [2 x i32]、
+	//   struct 全局 → LLVM struct、union → 具名壳包 [N x i8]）在旧的平坦谓词下恒不过门，
+	//   「聚合成员位置」拒收面从未进入判定。任一叶子为标量/指针即入门；真判据仍由
+	//   init_loads_nonconst_global 兜底，门宽只会产漏不会误报。
+	bool gate_type_ok(llvm::Type *t, int depth)
+	{
+		if (!t || depth > 8) return false;
+		if (t->isIntegerTy() || t->isFloatingPointTy() || t->isPointerTy()) return true;
+		if (auto *aty = llvm::dyn_cast<llvm::ArrayType>(t))
+			return gate_type_ok(aty->getElementType(), depth + 1);
+		if (auto *sty = llvm::dyn_cast<llvm::StructType>(t))
+		{
+			if (sty->isOpaque()) return false;
+			for (unsigned i = 0; i < sty->getNumElements(); ++i)
+				if (gate_type_ok(sty->getElementType(i), depth + 1)) return true;
+			return false;
+		}
+		return false;
+	}
+
+	// P310：子树是否「提到」有定义的非 const 全局（不区分加载/取址形态），仅服务最外层解引用：
+	//   `*X` 要读运行期内存，X 的任意成分来自有定义非 const 全局即非常量（r6 实测 `*(&M)`、`*arr`、
+	//   `*(arr+1)`、`*(&arr[0])`、`*(&s.a)` clang 全报且诊断定位于 `*`）；`*(&K)`（const）按「宁漏不错」不报。
+	bool init_refs_nonconst_global(const ExprPtr &e, int depth)
+	{
+		if (!e || depth > 16) return false;
+		if (e->kind == ExprKind::VarRef)
+		{
+			if (e->name.empty() || vars_.count(e->name)) return false; // 局部遮蔽（§6.2.1）
+			auto it = global_defs_.find(e->name);
+			if (it == global_defs_.end()) return false;
+			const GlobalVar *g = it->second;
+			return g && !g->is_extern && g->init && g->type && !g->type->is_const;
+		}
+		if (e->kind == ExprKind::Member)
+		{
+			const GlobalVar *g = e->q_global ? e->q_global : qualified_global_by_alias(e);
+			if (g && !g->is_extern && g->init && g->type && !g->type->is_const) return true;
+		}
+		if (init_refs_nonconst_global(e->lhs, depth + 1)) return true;
+		if (init_refs_nonconst_global(e->rhs, depth + 1)) return true;
+		for (const auto &ae : e->args)
+			if (init_refs_nonconst_global(ae, depth + 1)) return true;
+		return false;
+	}
+
+	// P311：显式 Cast 是否「指针 → 整型」（C 里一律不构成常量表达式）。
+	//   clang 的常量求值器对任何 ptr→int 转换都不给值，哪怕基址是地址常量：r8 实测
+	//   `(long)(arr+1)`/`(long)arr`/`(long)&M`/`(int)&M`/`(long)(&arr[1])` 全报，定位在 Cast 的
+	//   `(`（parser.cpp 建 Cast 节点时 `e->loc = peek().loc` 正是 `(`，同行同列）。
+	//   被转侧按 AST 类型判：Pointer / Array（名退化）/ Function 均视同指针；剥内层 Cast 链
+	//   使 `(int)(long)arr` 亦能命中。不得误拒：Cast 到指针（`(char *)arr + 1`，P309 已折真
+	//   地址）、无 Cast 的同对象指针差（`arr - arr`，clang 接受得 0）、整型/浮点→整型转换。
+	bool cast_is_ptr_to_int(const ExprPtr &e)
+	{
+		if (!e || e->kind != ExprKind::Cast || !e->type) return false;
+		llvm::Type *tt = to_llvm_type(e->type);
+		if (!tt || !tt->isIntegerTy()) return false;
+		ExprPtr q = e->lhs;
+		while (q && q->kind == ExprKind::Cast) q = q->lhs; // 链式 cast 取最内层被转表达式
+		if (!q) return false;
+		if (q->kind == ExprKind::Unary && (q->op == "sizeof" || q->op == "alignof")) return false; // 不求值、结果已是整型
+		CTypePtr qt = get_expr_ctype(q);
+		if (!qt)
+		{
+			// 函数名的 CType 不在 var_types_/global_types_（CodegenTypeEnv::var_type 只查变量），
+			//   退回按 canon_（函数归并表、折叠前已填）认函数名：`(long)add9` clang 同样报（r9 行11）。
+			if (q->kind == ExprKind::VarRef && !q->name.empty() && canon_.count(q->name)) return true;
+			return false;
+		}
+		return qt->kind == TypeKind::Pointer || qt->kind == TypeKind::Array ||
+			qt->kind == TypeKind::Function;
+	}
+
+	// P308：初始化器是否「加载」了有定义的非 const 全局（C §6.7.9p4 拒收判据的必要条件）。
+	//   clang -std=c23 真值：`int g = M;`、`int g = M + 1;`、`double d = M;` 均报
+	//   `initializer element is not a compile-time constant`，定位到被引用的 `M` 而非声明处；
+	//   而 `&M` 取址、`sizeof`、数组名/函数名（地址退化）都不是加载，clang 全部接受。
+	//   判据与折叠器同源——仅在 fold_global_init 回 `!folded` 后调用，绝不在 sema 复刻
+	//   常量性判定（文件作用域初值本就不走 sema 的 check_expr，见 P306/P307 口径；
+	//   本仓已有「判定器与折叠器口径分裂」踩坑记录）。
+	//   覆盖形态（P310 收口后）：Cast 剥壳、Unary 非取址、Unary `*` 最外层解引用（命中定在 `*`，
+	//   r6 同行同列）、Binary 双路 + `[]` 下标（lhs 按被加载语境递归）、Ternary 三路、InitList
+	//   逐子元素（聚合成员位置，r5）、VarRef 裸名（global_defs_ 回查 + vars_ 遮蔽排除；under_deref
+	//   下数组/struct/union 名也算加载）、Member{.,->} 成员访问（q_global / 按别名回查 + 同文件
+	//   标量成员递归基；成员结果退化地址的形态不报，r7）。其余形态（调用等）保守不回，避免误伤合法 C。
+	//   under_deref：外层已处于解引用/下标/标量成员语境——数组名/结构体名在这些语境下就是真加载。
+	bool init_loads_nonconst_global(const ExprPtr &e, int depth, const Expr **out_hit, bool under_deref = false)
+	{
+		if (!e || depth > 16) return false; // 深度护栏（与 qconst_fold_depth_ 同量级）
+		switch (e->kind)
+		{
+		case ExprKind::Cast:
+			// P311：指针→整型的显式转换本身就不是常量表达式（命中定在 Cast 节点，与 clang 同行同列）
+			if (cast_is_ptr_to_int(e))
+			{
+				if (out_hit) *out_hit = e.get();
+				return true;
+			}
+			return init_loads_nonconst_global(e->lhs, depth + 1, out_hit, under_deref);
+		case ExprKind::Unary:
+			if (e->op == "sizeof" || e->op == "alignof") return false;   // 不求值操作数（fold_int_const 内亦先行折成尺寸）
+			// P315：取址本身不是加载，但**取址链中含需要加载的一层**（`->` / `*` / 指针下标）
+			//   就不是常量地址：`&op->buf[1]`、`&(*op).in.y`、`&cp[1]`、`&op[1].y` clang 一律拒收
+			//   （探针 v1 十一形）。命中定在 `&` 节点（clang 亦落 `&` 所在列，v1 12:12）。
+			//   纯对象链（`&oo.buf[1]`、`&g2[1][0]`、`&oa[1].buf`）与「对指针变量自身取址」（`&op`）
+			//   照旧不报（探针 v2 十二形零诊断）；旧口径对 `&` 一刀切早退是本条误收的半因。
+			if (e->op == "&")
+			{
+				if (!addr_chain_requires_load(e->lhs, 0)) return false;
+				if (out_hit) *out_hit = e.get();
+				return true;
+			}
+			// P310：最外层解引用 = 加载。r6 实测 `*(&M)`/`*o`/`*arr`/`*(arr+1)`/`*(&arr[0])`/`*(&s.a)`
+			//   clang 全报且诊断定位于 `*`（第 10 列），故操作数子树只要提到有定义非 const 全局
+			//   就在 `*` 处报；`sizeof(*o)` 已在上方早退（不求值）。
+			if (e->op == "*")
+			{
+				if (!init_refs_nonconst_global(e->lhs, depth + 1)) return false;
+				if (out_hit) *out_hit = e.get();
+				return true;
+			}
+			return init_loads_nonconst_global(e->lhs, depth + 1, out_hit, under_deref);
+		case ExprKind::Binary:
+			// P310：下标 = 子对象加载（`arr[0]` clang 实测报，P308 原口径明列排除、本批收口）；
+			//   下标侧 rhs 不递归（诊断落对象侧；`1[arr]` 镜像形态按「宁漏不错」不报）。
+			if (e->op == "[]")
+				return init_loads_nonconst_global(e->lhs, depth + 1, out_hit, true);
+			// P316：**跨对象指针差**（`other - arr`、`&oo.in.x - &arr[0]`、`&M - &N`、`ex - arr`、
+			//   `arr + 1 - other`、`(long)(other - arr)`）——两侧都是可解析的地址常量但**根不同**，
+			//   就不是常量表达式（C §6.5.9p9 只在同一数组对象内合法；探针 w1/w1b/w1d/w1e/w1g 里 clang
+			//   逐条报 `initializer element is not a compile-time constant`，**定位一律在整个初值表达式的起点**）。
+			//   旧路 fold_ptr_diff 判「不同根即不折」后落 null fallback → 静默 `global i32 0`、零诊断。
+			//   判据与折叠器**同源**（同根者早已折出真值、`folded=true` 根本走不到本入口）：
+			//   ① 两侧均须 `addr_root_bytes` 成功——任一侧构不成地址常量（指针变量之差、取址链含加载、
+			//      字符串基址等）即交回原有加载判定，宁漏不错、绝不新增误拒；
+			//   ② 两侧**有效 pointee 宽须相等且 >0**——宽不同时 clang 报的是「not pointers to compatible
+			//      types」（类型相容、定在 `-` 运算符列，探针 w1f 五形），属 sema 面另登 **P317**；此处若
+			//      抢报常量性文案，就与 clang 同行不同文且列也偏，故显式不报；
+			//   ③ 命中定在**最左操作数**：parser `parse_binary` 把 Binary 的 loc 记成「运算符之后的
+			//      token」，直接用本节点 loc 会落到表达式中后，故沿 `+`/`-` 的 lhs 链下潜到最左节点
+			//      （其 loc 即初值表达式起点，与 clang 同行同列）。
+			if (e->op == "-")
+			{
+				llvm::GlobalVariable *rl = nullptr, *rr = nullptr;
+				intmax_t bl = 0, br = 0;
+				if (addr_root_bytes(e->lhs, rl, bl, 0) && addr_root_bytes(e->rhs, rr, br, 0) &&
+					rl && rr && rl != rr)
+				{
+					const intmax_t sl = addr_step_bytes(e->lhs);
+					if (sl > 0 && sl == addr_step_bytes(e->rhs))
+					{
+						const Expr *hit_e = e->lhs.get();
+						while (hit_e && hit_e->kind == ExprKind::Binary &&
+							(hit_e->op == "+" || hit_e->op == "-"))
+							hit_e = hit_e->lhs.get();
+						if (out_hit) *out_hit = hit_e ? hit_e : e->lhs.get();
+						return true;
+					}
+				}
+			}
+			if (init_loads_nonconst_global(e->lhs, depth + 1, out_hit, under_deref)) return true;
+			return init_loads_nonconst_global(e->rhs, depth + 1, out_hit, under_deref);
+		case ExprKind::Ternary:
+			if (init_loads_nonconst_global(e->lhs, depth + 1, out_hit, under_deref)) return true;
+			if (e->args.size() > 0 && init_loads_nonconst_global(e->args[0], depth + 1, out_hit, under_deref))
+				return true;
+			return e->args.size() > 1 && init_loads_nonconst_global(e->args[1], depth + 1, out_hit, under_deref);
+		case ExprKind::InitList:
+			// P310：聚合成员位置（`{M,1}`、`{{M},1}`、`[0]=M`、`.in.x=M` 等设计符形态的值表达式
+			//   均在 args）。逐项顺序扫描，首个命中即报（r5 实测 clang 也只报首条）。
+			for (const auto &ae : e->args)
+				if (init_loads_nonconst_global(ae, depth + 1, out_hit, under_deref)) return true;
+			return false;
+		case ExprKind::VarRef:
+		{
+			if (e->name.empty()) return false;
+			if (vars_.count(e->name)) return false; // 同名局部变量遮蔽（C §6.2.1）：不是全局
+			auto it = global_defs_.find(e->name);
+			if (it == global_defs_.end()) return false;
+			// P310：被加载语境下的数组/struct/union 名也是真加载（`arr[0]`、`*arr` 经 `*` 分支、
+			//   `*(&s.a)` 等）；裸名仍按旧 P308 口径——名字即地址、退化合法（`int *p = arr;` 零诊断）。
+			if (!is_loaded_nonconst_global(it->second) &&
+				!(under_deref && is_aggregate_nonconst_global(it->second)))
+				return false;
+			if (out_hit) *out_hit = e.get();
+			return true;
+		}
+		case ExprKind::Member:
+		{
+			// P310：`->` 与 `.` 同列 Member 形态（ast.h：op="."/"->"）；`::`（类静态）不在此报。
+			if (e->op != "." && e->op != "->") return false;
+			const GlobalVar *g = e->q_global ? e->q_global : qualified_global_by_alias(e);
+			if (is_loaded_nonconst_global(g))
+			{
+				if (out_hit) *out_hit = e.get();
+				return true;
+			}
+			// P310：同文件成员访问（`oo.y`/`oo.in.x`/`op->in.x` clang 实测 r7 全报）。成员选择结果
+			//   为数组/struct/union/函数名时是地址退化常量（`char *p = s.buf;` 合法、§6.3.2.1），
+			//   不递归；标量结果（或类型解不出时保守继续，基侧仍有 under_deref 门）才递归基表达式；
+			//   外层已在被加载语境时无条件递归（`*(s.buf)` 等经 `*` 分支自会命中）。
+			if (!e->lhs) return false;
+			if (!under_deref && e->op == ".")
+			{
+				CTypePtr mt = get_expr_ctype(e);
+				if (mt && (mt->kind == TypeKind::Array || mt->kind == TypeKind::Struct ||
+					mt->kind == TypeKind::Union || mt->kind == TypeKind::Function ||
+					mt->kind == TypeKind::Void))
+				{
+					// P315：退化地址本身不是加载，但**链中需要先加载**（`(*op).buf`、`op->in`、
+					//   `cp[1].x` 一类）就不是常量地址，clang 同样拒收（探针 v1 18:12）；旧口径
+					//   对「结果为 Array/Struct/Union」一刀切早退，是这一形漏报的半因。命中定在
+					//   本 Member 节点（即整个初始化表达式起点，与 clang 同行同列）。
+					if (addr_chain_requires_load(e, 0))
+					{
+						if (out_hit) *out_hit = e.get();
+						return true;
+					}
+					return false; // 纯对象链的退化地址（`oo.buf`），不是加载
+				}
+			}
+			return init_loads_nonconst_global(e->lhs, depth + 1, out_hit, true);
+		}
+		default:
+			return false;
+		}
+	}
+
 	// 将初始化表达式折叠为 LLVM 常量（全局变量初始化器用）
 	llvm::Constant *fold_global_init(const ExprPtr &e, llvm::Type *ty, bool *out_folded = nullptr)
 	{
 		if (out_folded) *out_folded = true; // P219：默认视为可折叠，仅于末尾 fallback 置 false
 		if (!e) return llvm::Constant::getNullValue(ty);
+		// P306：初始化器中的 const 全局引用——本文件裸名 `K` 或限定访问 `m.K`（q_global）。
+		//   旧路径两者都不认、直接落末尾 fallback 折成 0：`const int K = 7;` 下 `int g = K;`
+		//   与 `int g = p.K;` 运行期都得 0（静默错值，无任何诊断）。P225/P256 已定「const 全局
+		//   即编译期常量」口径（裸名在 parse 期即可作 case 标签/数组维度），此处把同一口径补齐到
+		//   全局/静态初始化器：改取目标已解析初值递归折叠；折不动时仍按原 P219 口径 fallback。
+		if (qconst_fold_depth_ < 16)
+		{
+			if (const ExprPtr *init = const_global_ref_init(e))
+			{
+				++qconst_fold_depth_;
+				llvm::Constant *c = fold_global_init(*init, ty, out_folded);
+				--qconst_fold_depth_;
+				return c;
+			}
+		}
 		// union 目标（具名 struct 包 [N x i8]）：标量/花括号均归首成员
 		if (ty->isStructTy())
 		{
@@ -2344,8 +3176,47 @@ struct CodeGenImpl
 				std::string tag = std::string(llvm::StringRef(sty->getName()).drop_front(7)); // 去 "struct."
 				auto sd = struct_defs_.find(tag);
 				if (sd != struct_defs_.end() && sd->second->is_union)
+				{
+					// P310：fold_union_slot 同样不回传 out_folded（载荷折叠落 fallback 即静默 0），
+					//   与 InitList 分支同态护住（`union U u = {M};` 成员位置拒收）。
+					AggCtxGuard agg_guard(agg_ctx_);
 					return fold_union_slot(sty, e);
+				}
 			}
+		}
+		// P336：文件作用域 _Bool(i1) 初值按 C 6.3.1.2「非零即真」折叠——修「指针/地址常量、
+		//   浮点常量、偶数整型」现静默折 0（运行期对偶见 P327 convert_value）。分支入口以 ty 精确
+		//   等于 i1 为门，非 bool 全局零影响；地址折叠排除显式 ptr→int cast，保 P308/P311/P321 拒收面
+		//   零回退（`bool g=(int)(intptr_t)arr`、`bool g=rv` 仍落末尾 fallback → out_folded=false → 拒收）。
+		if (ty == llvm::Type::getInt1Ty(ctx))
+		{
+			intmax_t bv;
+			if (fold_int_const(e, bv)) // 整型/char/枚举/显式(bool)cast，及整型 0（null）；!=0 取代按位截断
+				return llvm::ConstantInt::get(ty, bv != 0);
+			// 浮点常量（剥一元 ±/Cast，同下方通用浮点形）→ !=0（NaN 对 !=0.0 为真，视真，合 P327）
+			{
+				const Expr *fe = e.get();
+				bool neg = false;
+				while (fe)
+				{
+					if (fe->kind == ExprKind::Cast) { fe = fe->lhs.get(); continue; }
+					if (fe->kind == ExprKind::Unary && fe->op == "-") { neg = !neg; fe = fe->lhs.get(); continue; }
+					if (fe->kind == ExprKind::Unary && fe->op == "+") { fe = fe->lhs.get(); continue; }
+					break;
+				}
+				if (fe && fe->kind == ExprKind::FloatLiteral)
+					return llvm::ConstantInt::get(ty, (neg ? -fe->float_val : fe->float_val) != 0.0);
+			}
+			// 地址常量（数组名退化/&全局/&函数/地址算术/复合字面量/字符串）→ 非空即真；显式 ptr→int 排除。
+			if (!cast_is_ptr_to_int(e))
+			{
+				auto *pty = llvm::PointerType::get(ctx, 0);
+				if (llvm::Constant *a = fold_addr_of_global(e, pty))
+					return llvm::ConstantInt::get(ty, !llvm::isa<llvm::ConstantPointerNull>(a));
+				if (fold_compound_literal_addr(e)) return llvm::ConstantInt::get(ty, 1);
+				if (e->kind == ExprKind::StringLiteral) return llvm::ConstantInt::get(ty, 1);
+			}
+			// 全不中（读运行期变量等）不落 return → 交回下方通用路径与末尾 fallback（out_folded=false 不变）。
 		}
 		// 标量整型/浮点：接受整型常量表达式（含 Binary/Unary/Cast/Ternary，如 `1+1`）
 		if (ty->isIntegerTy() || ty->isFloatTy() || ty->isDoubleTy())
@@ -2418,6 +3289,8 @@ struct CodeGenImpl
 		// 复合初始化器 {e1, e2, ...} -> Array/Struct（支持指定初始化器）
 		if (e->kind == ExprKind::InitList)
 		{
+			// P310：本分支内子元素折叠落末尾 fallback 时置 agg_unfolded_（子递归多不回传 out_folded）
+			AggCtxGuard agg_guard(agg_ctx_);
 			if (ty->isArrayTy())
 			{
 				auto *aty = llvm::cast<llvm::ArrayType>(ty);
@@ -2802,8 +3675,8 @@ struct CodeGenImpl
 			}
 			// &复合字面量 (T){...} → 物化为静态存储全局对象，返回其地址（00149/00150）
 			if (llvm::Constant *c = fold_compound_literal_addr(e)) return c;
-			// &全局对象 / 数组名退化 → 地址常量（优先于下方整型常量→指针路径）
-			if (llvm::Constant *c = fold_addr_of_global(e)) return c;
+			// &全局对象 / 数组名退化 / 地址常量算术（P309）→ 地址常量（优先于下方整型常量→指针路径）
+			if (llvm::Constant *c = fold_addr_of_global(e, ty)) return c;
 			// 缺陷 #28：整数常量（含经 Cast 包裹）初始化指针型全局时，旧代码一律落到
 			// ConstantPointerNull，使 (void(*)(int))1 / (void(*)(int))-1 被错误折成 null。
 			// 按 C 语义应为「整型常量 → 指针常量」：0 → null，其余 → IntToPtr 常量。
@@ -2829,9 +3702,11 @@ struct CodeGenImpl
 				return llvm::ConstantExpr::getIntToPtr(ci, llvm::cast<llvm::PointerType>(ty));
 			}
 			if (out_folded) *out_folded = false; // P219：指针初值不可折叠（如函数调用）→ 交运行期 store
+			if (agg_ctx_) agg_unfolded_ = true;  // P310：聚合成员位置折不动（聚合根 folded 不回传）
 			return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ty));
 		}
 		if (out_folded) *out_folded = false; // P219：标量初值不可折叠（如函数调用/读运行时变量）→ 交运行期 store
+		if (agg_ctx_) agg_unfolded_ = true;  // P310：聚合成员位置折不动（聚合根 folded 不回传）
 		return llvm::Constant::getNullValue(ty);
 	}
 
@@ -3348,6 +4223,16 @@ struct CodeGenImpl
 			for (const auto &cd : tu.classes)
 				if (!cd.tag.empty() && in_cur_bucket(cd.source_module_key))
 					class_defs_[cd.tag] = &cd;
+			// P302：限定类名 `alias.Tag` 的别名键（与 sema 同口径）——宿主 `a.Counter` 在声明/
+			//   转换/new 处命中该模块的那份 class 定义；实体与符号名仍按 owner 定义（cd.tag）发射。
+			for (const auto &d : tu.imports)
+			{
+				if (d.resolved_module_key.empty()) continue;
+				const std::string alias = import_alias_of(d);
+				for (const auto &cd : tu.classes)
+					if (!cd.tag.empty() && cd.is_public && cd.source_module_key == d.resolved_module_key)
+						class_defs_[alias + "." + cd.tag] = &cd;
+			}
 		}
 		else
 		{
@@ -4172,6 +5057,21 @@ struct CodeGenImpl
 			// 已终止块的延续由 gen_stmt 入口统一处理（见上方 after.term 护栏）。
 			if (s->expr)
 			{
+				// P331：按 clang 默认扩展口径接受 void 函数中的 `return <void 表达式>;`
+				//   （`void h(void){ return vp[1]; }` / `return (void)0;` 均 cc=0）——表达式照求值、
+				//   值丢弃、发 `ret void`；否则会喂出 verifier
+				//   `Found return instr that returns non-void in Function of void return type!`。
+				if (F->getReturnType()->isVoidTy())
+				{
+					const CTypePtr et = get_expr_ctype(s->expr);
+					if (et && et->kind == TypeKind::Void)
+					{
+						gen_expr(s->expr);
+						release_rc_frames_emit(0);
+						builder.CreateRetVoid();
+						break;
+					}
+				}
 				llvm::Value *rv = gen_expr(s->expr);
 				llvm::Type *rt = F->getReturnType();
 				// 返回値隐式转换到函数返回类型（C §6.8.7.5）；聚合/void 不转
@@ -4748,7 +5648,15 @@ struct CodeGenImpl
 		llvm::Type *from = v->getType();
 		if (from == target) return v;
 		if (from->isPointerTy() && !target->isPointerTy())
+		{
+			// P327：指针 → _Bool(i1) 按 C 6.3.1.2「非空即真」，与 gen_cond 同源发 icmp ne null。
+			//   原 ptrtoint to i1 只留指针最低位 → 偶数地址判 false、奇数地址判 true（静默错值）。
+			//   指针 → 其他整型（long/uint 等）维持既有 ptrtoint。
+			if (target == llvm::Type::getInt1Ty(ctx))
+				return builder.CreateICmpNE(v, llvm::ConstantPointerNull::get(
+					llvm::cast<llvm::PointerType>(from)));
 			return builder.CreatePtrToInt(v, target);
+		}
 		if (!from->isPointerTy() && target->isPointerTy())
 			return builder.CreateIntToPtr(v, target);
 		if (from->isFloatingPointTy() && target->isFloatingPointTy())
@@ -4758,7 +5666,14 @@ struct CodeGenImpl
 			return builder.CreateFPExt(v, target);
 		}
 		if (from->isFloatingPointTy() && target->isIntegerTy())
+		{
+			// P327：浮点 → _Bool(i1) 按「值不等于 0」，与 gen_cond 同源发 fcmp une 0.0（NaN 视真）。
+			//   原 fptosi to i1 对 |值|>=1 越界产 poison、对 (0,1) 小数截成 0（如 bool b=1e-9 漏判）。
+			//   浮点 → 其他整型维持既有 fptosi。
+			if (target == llvm::Type::getInt1Ty(ctx))
+				return builder.CreateFCmpUNE(v, llvm::ConstantFP::get(from, 0.0));
 			return builder.CreateFPToSI(v, target);
+		}
 		if (from->isIntegerTy() && target->isFloatingPointTy())
 		{
 			// i1（比较/布尔结果）转 FP 须按无符号 0/1：sitofp i1 true(有符号 1-bit = -1) 会得 -1.0，
@@ -5885,6 +6800,14 @@ struct CodeGenImpl
 			llvm::Value *addr = gen_subscript_addr(lhs_t, ptr, idx);
 			if (rt_row)
 				return addr;   // 行指针（数组退化为指向首元素）
+			// P330：`void *vp; vp[1]`——元素是 `void`，取不出值也不得读内存：`load void` 在
+			//   LLVM 侧无尺寸可依（`CreateLoad(void)` 即编译期 0xC0000005），而 `vp[1];` 语句形
+			//   是 GNU 合法形（clang 只发 -Wunused-value），故返回零占位、绝不 load（`vp` 为 null
+			//   时读一次即运行期 AV）。「void 值被当值使用」的另一族文案（invalid operands /
+			//   initializing … 'void' / not assignable）→ 拆登 P331。
+			if (lhs_t && (lhs_t->kind == TypeKind::Array || lhs_t->kind == TypeKind::Pointer) &&
+				lhs_t->base && lhs_t->base->kind == TypeKind::Void)
+				return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
 			// 数组/结构体元素不 load，返回地址（数组退化为指针）
 			llvm::Type *elem_ty = llvm::Type::getInt32Ty(ctx);
 			if (lhs_t && (lhs_t->kind == TypeKind::Array || lhs_t->kind == TypeKind::Pointer))
@@ -5942,8 +6865,17 @@ struct CodeGenImpl
 				// 步长须与 GEP/下标一致，用元素类型的 getTypeAllocSize（含 padding struct 的显式尾补）
 				if (lt && (lt->kind == TypeKind::Pointer || lt->kind == TypeKind::Array) && lt->base)
 				{
-					llvm::Type *ety = to_llvm_alloca_type(lt->base);
-					elem_sz = (unsigned)module->getDataLayout().getTypeAllocSize(ety);
+					// P318：`void` 无尺寸可求——`to_llvm_alloca_type(void)` 给不出合法的 sized 型，
+					//   直接把它交给 `getTypeAllocSize` 即 0xC0000005（探针 x1.c/y2.c/w6.c：clang cc=0）。
+					//   GNU 扩展对 `void *` 相减按**字节**（步长 1），故 void 与「求不出元素型」一律置 1：
+					//   下面的 `elem_sz > 1` 自然不触发，不发 SDiv（等价于不除）。
+					if (lt->base->kind == TypeKind::Void)
+						elem_sz = 1;
+					else
+					{
+						llvm::Type *ety = to_llvm_alloca_type(lt->base);
+						elem_sz = ety ? (unsigned)module->getDataLayout().getTypeAllocSize(ety) : 1;
+					}
 				}
 				if (elem_sz > 1)
 					diff = builder.CreateSDiv(diff, llvm::ConstantInt::get(i64ty, elem_sz));
@@ -5969,7 +6901,9 @@ struct CodeGenImpl
 				llvm::Value *neg = builder.CreateSub(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0), idx_val);
 				idx_val = neg;
 			}
-			llvm::Type *ety = elem_ct ? to_llvm_alloca_type(elem_ct) : llvm::Type::getInt32Ty(ctx);
+			// P330：`void *vp; vp + 1` 按 GNU 步长 1 字节（与 P314 的 `(void *)arr + 1`、P318 的
+			//   `void * - void *` 同一口径）；旧路把 unsized `void` 喂 GEP → 误拒合法 C。
+			llvm::Type *ety = pointee_llvm_type(elem_ct);
 			return builder.CreateGEP(ety, ptr_val, to_index(idx_val));
 		}
 		// 指针参与（比较等）：沿用旧宽度基路径，保持既有 IR
@@ -6055,6 +6989,9 @@ struct CodeGenImpl
 				// struct/union/array 的解引用: 返回地址（不 load）
 				if (pt->base->kind == TypeKind::Struct || pt->base->kind == TypeKind::Union || pt->base->kind == TypeKind::Array)
 					return ptr;
+				// P330：`*vp`（void pointee）同 `vp[1]`——无值可取、不得 load（`load void` 编译期崩溃）。
+				if (pt->base->kind == TypeKind::Void)
+					return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
 				load_ty = to_llvm_alloca_type(pt->base);
 			}
 			return builder.CreateLoad(load_ty, ptr);
@@ -6064,6 +7001,13 @@ struct CodeGenImpl
 			const auto &DL = module->getDataLayout();
 			if (e->type) // sizeof(type)
 			{
+				// P321：函数型 sizeof 是 GNU 扩展，clang 实测给 **1**。
+				if (e->type->kind == TypeKind::Function)
+					return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 1);
+				// P330：`sizeof(void)` 同为 GNU 扩展、真值 1（与 parser 的 const_sizeof_type 同值）；
+				//   unsized `void` 喂 getTypeStoreSize 即编译期崩溃。
+				if (e->type->kind == TypeKind::Void)
+					return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 1);
 				llvm::Type *ty = to_llvm_alloca_type(e->type);
 				return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
 					static_cast<uint64_t>(DL.getTypeStoreSize(ty)));
@@ -6071,6 +7015,12 @@ struct CodeGenImpl
 			else if (e->lhs) // sizeof(expr)
 			{
 				CTypePtr et = sizeof_operand_ctype(e->lhs);
+				// P321：同上——函数名已能解析出真型，不得按指针宽 8。
+				if (et && et->kind == TypeKind::Function)
+					return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 1);
+				// P330：`sizeof(vp[1])`（void 表达式）同 GNU 口径 = 1。
+				if (et && et->kind == TypeKind::Void)
+					return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 1);
 				// VLA 的 sizeof 是运行期表达式（§6.5.3.4p2：结果为元素个数乘元素大小）。
 				// 旧路径 to_llvm_alloca_type 得 [0 x elem] → 返 0。
 				if (et && et->kind == TypeKind::Array && type_has_vla_dim(et))
@@ -6114,7 +7064,7 @@ struct CodeGenImpl
 				llvm::Value *one = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 1);
 				if (e->op == "--")
 					one = builder.CreateSub(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0), one);
-				llvm::Type *ety = ct->base ? to_llvm_alloca_type(ct->base) : llvm::Type::getInt32Ty(ctx);
+				llvm::Type *ety = pointee_llvm_type(ct->base);   // P330：void pointee 步长 1
 				pnv = builder.CreateGEP(ety, pold, to_index(one));
 				builder.CreateStore(pnv, addr);
 			}
@@ -6342,7 +7292,7 @@ struct CodeGenImpl
 				llvm::Value *idx = to_i32(rhs);
 				if (base_op == "-")
 					idx = builder.CreateSub(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0), idx);
-				llvm::Type *ety = (lhs_ct->base) ? to_llvm_alloca_type(lhs_ct->base) : llvm::Type::getInt32Ty(ctx);
+				llvm::Type *ety = pointee_llvm_type(lhs_ct->base);   // P330：`vp += 1` 步长 1
 				rhs = builder.CreateGEP(ety, lhs_val, to_index(idx));
 			}
 			else
@@ -6407,8 +7357,13 @@ struct CodeGenImpl
 		//   *(long long*)&(double 变量) 的 store 须按 long long/i64，不得退回 alloca 的声明类型 double
 		//   （否则整数常量被 SIToFP、毁掉 IEEE 位模式——CTS 0099 NaN 族标量位拼装）。聚合类型
 		//   （struct/union/array/func，多已由前面 memcpy/早返回处理）与 C 类型不可用时回退 alloca/global。
-		llvm::Type *stor_ty = nullptr;
+		// P330：`void` 左值（`*vp = x` / `vp[1] = x`）不可赋值（clang `incomplete type 'void'
+		//   is not assignable`，文案归 P331）；这里只保证不把 i32/ptr 存进 unsized 槽
+		//   （那是 IR verifier 级写错），值原样返回、不落内存。
 		CTypePtr lhs_st = get_expr_ctype(e->lhs);
+		if (lhs_st && lhs_st->kind == TypeKind::Void)
+			return rhs;
+		llvm::Type *stor_ty = nullptr;
 		if (lhs_st && lhs_st->kind != TypeKind::Struct && lhs_st->kind != TypeKind::Union &&
 			lhs_st->kind != TypeKind::Array && lhs_st->kind != TypeKind::Function)
 			stor_ty = to_llvm_alloca_type(lhs_st);
@@ -6722,6 +7677,15 @@ struct CodeGenImpl
 		{
 			auto fit = self->func_types_.find(n);
 			if (fit != self->func_types_.end()) return fit->second;
+			return nullptr;
+		}
+		// P320：函数名 → 完整 Function 型（供共享解析器的 `&函数名`）。func_cftypes_ 由 canon_
+		//   「定义优先」归并后填充；键为源名，跨模块 dunder 合成名不在表内 → 返回空、
+		//   照旧退 `void *`（不改变那些形的现有行为）。
+		CTypePtr func_type(const std::string &n)
+		{
+			auto fit = self->func_cftypes_.find(n);
+			if (fit != self->func_cftypes_.end()) return fit->second;
 			return nullptr;
 		}
 		// 目标数据模型的 long 位宽（供共享解析器整型提升取正确宽度）。
@@ -7258,7 +8222,7 @@ struct CodeGenImpl
 		}
 		llvm::Type *elem_ty = llvm::Type::getInt32Ty(ctx);
 		if (lhs_t && (lhs_t->kind == TypeKind::Array || lhs_t->kind == TypeKind::Pointer))
-			elem_ty = to_llvm_alloca_type(lhs_t->base);
+			elem_ty = pointee_llvm_type(lhs_t->base);   // P330：void pointee 步长 1（旧路 unsized GEP）
 		return builder.CreateGEP(elem_ty, ptr, idx);
 	}
 };
@@ -7406,6 +8370,11 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 			(sp.compare(sp.size() - 3, 3, ".co") == 0 || sp.compare(sp.size() - 3, 3, ".CO") == 0);
 	}
 	cg.gen_tu(*state.ast);
+
+	// P308：全局初值「加载非 const 全局」类硬错已在 gen_tu 内记入 errs（并置粘性标志）。
+	//   此处必须早退：main 只在 compile() 返回 false 时才据诊断改退出码，否则诊断虽已打印、
+	//   仍会带着静默折成的 0 继续发射/链接（clang 在此处直接终止翻译）。
+	if (cg.gen_hard_error_) return false;
 
 	// P229：回传入口子系统标志（供链接层依 -subsystem/-entry 分岔）。
 	state.windows_subsystem = cg.windows_subsystem_;

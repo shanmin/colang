@@ -34,6 +34,10 @@ struct CompileOptions
 	std::string output;           // -o 指定的输出路径（可空）
 	std::vector<std::string> res_files;    // --resource 预编译 .res（Windows 链接期嵌入 .rsrc；可多个）
 	std::vector<std::string> include_dirs; // -I 头文件搜索目录（按顺序）
+	// --lib/-l：交给链接步的外部库（裸链接名，与 [[lib("X")]] 同口径；按首现序去重）。
+	//   纯 .c 档无法写 [[lib]]，这是指定外部库的唯一入口：Windows 侧补 .lib 后作 -defaultlib
+	//   传给 lld COFF（与 .drectve 的 /DEFAULTLIB 同效），Linux 侧作 -l<name> 入静态链接组。
+	std::vector<std::string> link_libs;
 
 	// —— 目标平台 / 数据模型（单一真值源，见 target.h）——
 	std::string target_triple;    // --target 原始串（空=宿主默认）；main 解析填充

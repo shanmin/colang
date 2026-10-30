@@ -58,7 +58,7 @@ bool compile(const CompileOptions &opts, CompileState &state, std::vector<Error>
 			ImportBundle bundle;
 			if (!load_imports(opts, root_imports, bundle, errors))
 				return false;
-			if (!parse(opts, state, errors, bundle.tag_seeds, bundle.const_seeds))
+			if (!parse(opts, state, errors, bundle.tag_seeds, bundle.const_seeds, bundle.typedef_seeds))
 				return false;
 			if (!merge_imports(opts, *state.ast, bundle))
 				return false;

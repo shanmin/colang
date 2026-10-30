@@ -13,9 +13,11 @@
 //   - 子系统/入口：默认（Console + mainCRTStartup）由 libcmt 内嵌 .drectve 自动提供；
 //     P229 依 windows_subsystem/use_winmain 显式传 -subsystem:windows / -entry:WinMainCRTStartup。
 //   - [dll] `-o *.dll`：传 -dll -entry:_DllMainCRTStartup，导出表来自 public 符号的 .drectve /EXPORT:。
+//   - 外部库：--lib/-l 逐项作 -defaultlib:<name>.lib（与 .drectve 的 /DEFAULTLIB 同一指令）。
 //   链接库搜索路径交 lld 自身（%LIB% + Windows SDK/VC 注册表自动发现）。
 //
 // [ELF / Linux] P2xx 最小闭环：ld.lld -static，喂 crt1.o/crti.o + objs + -lc + crtn.o。
+//   --lib/-l 逐项作 -l<name> 放进 --start-group。
 //   crt/libc.a 由 find_crt_dir() 按 env → Debian 多架构 → /usr/lib64 → /usr/lib 定位；缺件给清晰诊断。
 // ============================================================
 
@@ -155,6 +157,7 @@ std::string find_gcc_lib_dir()
 bool link_exe(const std::vector<std::string> &objs, const std::string &out_path,
               bool windows_subsystem, bool use_winmain,
               const std::vector<std::string> &res_files,
+              const std::vector<std::string> &libs,
               std::vector<Error> &errors)
 {
 	// 组装 lld 参数向量（首元素为程序名占位，lld COFF 驱动忽略之）。
@@ -193,6 +196,11 @@ bool link_exe(const std::vector<std::string> &objs, const std::string &out_path,
 	argv.emplace_back("-defaultlib:libcmt");
 	argv.emplace_back("-defaultlib:oldnames");
 	argv.emplace_back("-defaultlib:legacy_stdio_definitions");
+	// --lib/-l：命令行指定的外部库。lld COFF 把命令行 -defaultlib 与 .obj 内 .drectve 段的
+	//   /DEFAULTLIB 视为同一指令，故纯 .c 档（无法写 [[lib]]）用它拉库；名字为裸链接名，
+	//   缺 .lib 后缀时补全（已带 .lib 则原样，不叠成 .lib.lib）。
+	for (const auto &l : libs)
+		argv.push_back("-defaultlib:" + (ends_with_ci(l, ".lib") ? l : l + ".lib"));
 	argv.emplace_back("-stack:16777216");
 	argv.emplace_back("-nologo");
 
@@ -220,7 +228,7 @@ bool link_exe(const std::vector<std::string> &objs, const std::string &out_path,
 }
 
 bool link_elf(const std::vector<std::string> &, const std::string &,
-              std::vector<Error> &errors)
+              const std::vector<std::string> &, std::vector<Error> &errors)
 {
 	push_link_error("colang",
 	                "ELF linking is not available in this (Windows/COFF-only) build",
@@ -234,7 +242,8 @@ bool link_elf(const std::vector<std::string> &, const std::string &,
 #else  // !_WIN32
 
 bool link_exe(const std::vector<std::string> &, const std::string &, bool, bool,
-              const std::vector<std::string> &, std::vector<Error> &errors)
+              const std::vector<std::string> &, const std::vector<std::string> &,
+              std::vector<Error> &errors)
 {
 	push_link_error("colang",
 	                "COFF linking is not available in this (Linux/ELF-only) build",
@@ -243,6 +252,7 @@ bool link_exe(const std::vector<std::string> &, const std::string &, bool, bool,
 }
 
 bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
+              const std::vector<std::string> &libs,
               std::vector<Error> &errors)
 {
 	const std::string file = objs.empty() ? out_path : objs.front();
@@ -289,6 +299,10 @@ bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
 	argv.emplace_back("--start-group");
 	argv.emplace_back("-lc");
 	argv.emplace_back("-lm");
+	// --lib/-l：命令行指定的外部库（裸链接名 → -l<name>）。放在 --start-group 内，
+	//   与其他库同组解析相互引用。
+	for (const auto &l : libs)
+		argv.push_back("-l" + l);
 	if (!gcc_dir.empty())
 	{
 		argv.emplace_back("-lgcc");

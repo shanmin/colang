@@ -38,6 +38,7 @@ public int screen_width()
 
 Constraints:
 
+- **`.co`/`.CO` source files only**: `[[lib]]` is a Co-defined attribute, so any other origin — a `.c`/`.h` file, including a header `#include`d by a `.co` — is rejected with `'lib' attribute is only allowed in .co source files`. The check looks at **the file the attribute actually appears in**; a `.h` is not relaxed just because a `.co` includes it. Putting library ownership in a shared header for several `.co` files to consume therefore does not work — it must be written inside the `.co`.
 - **Only on declarations**: a function must be a pure prototype (no body), and a global variable must be a pure external declaration (no initializer). Claiming a symbol comes from an external library while also writing its definition in this module is a contradiction, which the compiler rejects.
 - **Mutually exclusive with `public` and `static`**: `public` is export, `lib` is import — they cannot fall on the same symbol; `static` means internal linkage, which an external library cannot supply.
 - **Same-name symbols must agree on their library**: re-declaring the same name with the same library is legal; giving the same name two different libraries is an error (no silent choice is made).
@@ -150,13 +151,13 @@ The preprocessor directive `__has_c_attribute(name)` returns `1` or `0` and can 
 | `[[deprecated]]` | supported (diagnostic layer, not in the artifact) | matches C23 semantics |
 | `[[nodiscard]]` / `[[noreturn]]` | first batch of semantics in effect (warnings and verification, clang-shaped) | largely matches C23 (type-level marking etc. see below) |
 | `[[maybe_unused]]` / `[[fallthrough]]` | accepted but no effect | differs from C23 (C23 has real semantics) |
-| `[[lib("X")]]` | newly defined by Co; no such attribute in the C standard | Co-specific |
+| `[[lib("X")]]` | newly defined by Co; no such attribute in the C standard; and `.co`/`.CO` source files only | Co-specific |
 | `[[subsystem("windows")]]` | newly defined by Co; no such attribute in the C standard | Co-specific |
 | `<:` `::>` alternative spelling | not supported | differs from C23 |
 
 > **Compatibility note**:
-> 1. `[[lib("X")]]` is a Co-defined attribute. When a real clang/clangd reads `.co`/`.c` files, it warns `-Wunknown-attributes` and ignores it — **this is necessarily so, not a defect**; external tools will not validate library ownership, only the Co compiler consumes it.
-> 2. When migrating from C/C++, `#pragma comment(lib, "X")` and `__declspec(dllimport)` are **neither implemented nor simulated** by this compiler; library ownership must always be rewritten explicitly as `[[lib("X")]]`.
+> 1. `[[lib("X")]]` is a Co-defined attribute. When a real clang/clangd reads `.co` files, it warns `-Wunknown-attributes` and ignores it — **this is necessarily so, not a defect**; external tools will not validate library ownership, only the Co compiler consumes it.
+> 2. When migrating from C/C++, `#pragma comment(lib, "X")` and `__declspec(dllimport)` are **neither implemented nor simulated** by this compiler; library ownership must always be rewritten explicitly as `[[lib("X")]]`. And `[[lib]]` **can only be written in `.co` files** — a pure `.c` translation unit names its external libraries on the command line with `--lib <name>` instead (see the "Command Line" chapter), with no need to move declarations into a `.co`.
 > 3. `[[deprecated]]` is a front-end diagnostic only; like clang, Co **does not encode it into the artifact's IR**, so it does not propagate to downstream modules that consume the artifact.
 > 4. `[[subsystem("windows")]]` is likewise a Co-defined attribute: a real clang/clangd warns and ignores it as an unknown attribute (**necessarily so, not a defect**); only the Co compiler consumes the subsystem switch.
 

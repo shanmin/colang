@@ -24,19 +24,24 @@ namespace colang
 //   use_winmain=true → 传 -entry:WinMainCRTStartup（覆盖 .drectve 的 mainCRTStartup）。
 // PE 资源（档②）：res_files 为用户自备的预编译 .res 路径，直接喂 lld COFF（原生转 .rsrc 段嵌入）；
 //   exe/dll 通用；空则不嵌入。非 Windows 构建（link_exe stub）忽略此参。
+// --lib/-l（libs）：命令行指定的外部库名（裸链接名，与 [[lib("X")]] 同口径）；Windows 侧逐项补 .lib
+//   后作为 -defaultlib:<name> 入参——与 .drectve 段的 /DEFAULTLIB 是同一链接指令，纯 .c 档靠它拉库。
 // 成功返回 true；失败把 lld 的诊断追加到 errors 并返回 false。
 bool link_exe(const std::vector<std::string> &objs, const std::string &out_path,
               bool windows_subsystem, bool use_winmain,
               const std::vector<std::string> &res_files,
+              const std::vector<std::string> &libs,
               std::vector<Error> &errors);
 
 // 把 objs（ELF .o 路径）静态链接为 out_path（Linux 原生，P2xx 最小闭环）。
 // 进程内 lld::elf：ld.lld -static，喂 crt1.o/crti.o + objs + -lc + crtn.o，
 // crt/libc.a 由内部发现器按 env(COLANG_CRT_DIR/COLANG_LINUX_SYSROOT) → Debian 多架构
 // → /usr/lib64 → /usr/lib 优先级定位；缺件给清晰诊断。
+// --lib/-l（libs）：逐项作 -l<name> 放进 --start-group，与 -lc/-lm/-lgcc 同组解析相互引用。
 // 成功返回 true；失败把 lld 诊断追加到 errors 并返回 false。
 // 非 Windows 构建为真实实现；Windows 构建（仅编入 lldCOFF）返回诊断的 stub。
 bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
+              const std::vector<std::string> &libs,
               std::vector<Error> &errors);
 
 }  // namespace colang

@@ -39,10 +39,31 @@ struct ImportTagSeed
 
 // P256：加载阶段采集的 public const int 值种子。供 parser 在「parse 主源时」把
 //   被导入模块的 public const int 作 case 标签/常量表达式求值（镜像 ImportTagSeed 前置机制）。
+//   P306：`owner` = 消费方可书写限定名（`as` 别名优先、否则文件 stem）——供 `p.K` 这类限定访问
+//   按 `owner.NAME` 索引；裸名口径照旧只看 `name`。
+//   P307：`is_enum_const` = 该条目来自 `public enum` 的常量。此类种子**只进限定表**（`b.DIM` 可在
+//   常量上下文求值），不进裸名通道——「enum 常量不跨模块」是 P225 的既有裁定（Win32 宏常量
+//   走 `public const` 而非 enum），若让裸名 `DIM` 也命中就是静默扩语言面，须另行定向。
 struct ImportConstSeed
 {
 	std::string name;
 	std::int64_t value;
+	std::string owner;
+	bool is_enum_const = false; // P307：来自 public enum（只供限定名求值，不开裸名）
+};
+
+// P304：加载阶段采集的文件作用域 typedef 种子。与前两类不同，public 的那份必须携带**完整
+//   已解析类型**（`CTypePtr`）——typedef 的对外语义就是「底层类型」，仅靠名字无法展开；
+//   `owner` 是可书写限定名（`as` 别名优先、否则文件 stem），供限定展开与同名多来源的歧义裁定。
+//   同名**不去重**（与标签种子不同）：裸名歧义必须在 parse 期就能报出来。
+//   非 public typedef 也会出一条种子，但 `type` 为空——只为了让消费方把 `a.Hidden` 认成
+//   限定类型名（从而由 sema 报 `no public type`），而不是报成语法错。
+struct ImportTypedefSeed
+{
+	std::string name;
+	CTypePtr type; // 空 = 非 public（仅送名字、不可展开）
+	std::string owner;
+	SourceLoc loc{};
 };
 
 // P233：两阶段 import 加载的中间载体。load 阶段填充（已加子 TU + 拓序 + 标签种子），
@@ -50,7 +71,8 @@ struct ImportConstSeed
 struct ImportBundle
 {
 	std::vector<ImportTagSeed> tag_seeds;
-	std::vector<ImportConstSeed> const_seeds;     // P256：各模块 public const int 采集值
+	std::vector<ImportConstSeed> const_seeds;     // P256：各模块 public const int 采集值（P307 亦含 public enum 常量，限限定名可用）
+	std::vector<ImportTypedefSeed> typedef_seeds; // P304：各模块 public typedef（含底层类型）
 	std::unordered_map<std::string, TUPtr> cache; // 规范化 key -> 子模块 TU
 	std::vector<std::string> postorder;           // DFS 后序（不含主源）
 };

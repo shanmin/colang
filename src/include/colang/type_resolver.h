@@ -169,6 +169,8 @@ inline CTypePtr stdbit_unsigned_ty(unsigned W)
 //         —— 按结构体 tag 查成员 field 的类型，未找到返回 nullptr
 //     CTypePtr func_return(const std::string &name);
 //         —— 查函数返回类型，未找到返回 nullptr
+//     CTypePtr func_type(const std::string &name);
+//         —— 查函数**完整原型**（Function{base=返回型, params, is_variadic}），未找到返回 nullptr
 //   各消费方（codegen/sema/parser）以自身符号表实现 Env，实现单一算法复用。
 // ============================================================
 
@@ -179,7 +181,16 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 	if (!e) return nullptr;
 	if (e->kind == ExprKind::VarRef)
 	{
-		return env.var_type(e->name);
+		CTypePtr vt = env.var_type(e->name);
+		if (vt) return vt;
+		// P321：函数名不是变量，var_type 查不到时曾返回空，代价是**所有**依赖表达式类型的
+		//   检查在此一律早退——`int (*p)(int) = f;`（赋值面）、`f - g`（差面）、`f[1]`（下标面）
+		//   全漏报，且 parser 的 infer_auto_type 兜底把函数名当 int，令 `auto p = &f;` 被推成
+		//   `int *` 而**误拒合法 C**（P320 回归面）。
+		//   → 补查完整原型，返回**未 decay** 的 Function 型；衰减交各消费方的既有机制
+		//     （sema 的 compat_decay、codegen 的 gc_lvalue_convert），而 sizeof/typeof 语境
+		//     本属 §6.3.2.1 的退化例外，取到函数型本身正是所需。
+		return env.func_type(e->name);
 	}
 	// 复合字面量 (type){...}：类型由 parser 直接写入 InitList::type；
 	// 缺失此项会让成员访问/取址解析拿不到基础类型，进而按空 tag 造出 opaque struct
@@ -221,13 +232,26 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		// &expr → Pointer{type_of_expr}
 		CTypePtr vt = resolve_expr_type(e->lhs, env);
 		if (vt) return make_pointer(vt);
+		// P320：函数名不是变量，`var_type` 查不到 → 曾一律兜底成 `void *`，代价是
+		//   `&f - arr` 的诊断印 `'void *'`（clang 印 `'int (*)(void)'`）、`&f - &g`（异原型）两侧同退
+		//   `void *` 被判相容而**漏报**、`int (*p)(void) = &g;` 被「函数指针 ↔ `void *` 静默放行」吃掉，
+		//   且 `(*&f)()` 在 codegen 解引用 void pointee 时编译期崩溃（与 P318 同机理）。
+		//   → 函数名按完整原型解析，`void *` 兜底只留给真正推不出型的形。
+		if (e->lhs && e->lhs->kind == ExprKind::VarRef)
+		{
+			CTypePtr ft = env.func_type(e->lhs->name);
+			if (ft) return make_pointer(ft);
+		}
 		return make_pointer(make_type(TypeKind::Void));
 	}
 	if (e->kind == ExprKind::Binary && e->op == "[]")
 	{
 		CTypePtr at = resolve_expr_type(e->lhs, env);
 		if (at && at->kind == TypeKind::Array) return at->base;
-		if (at && at->kind == TypeKind::Pointer) return at->base;
+		// P323：指向函数的指针不可下标（C 6.5.2.1）——已由 sema 的 check_subscript 拒收，
+		//   结果型按「未知」返回，避免下游再按函数型报一次 int-conversion 级联。
+		if (at && at->kind == TypeKind::Pointer)
+			return (at->base && at->base->kind == TypeKind::Function) ? nullptr : at->base;
 		return nullptr;
 	}
 	if (e->kind == ExprKind::Cast)
@@ -263,6 +287,15 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		// （float/double 数组经指针算术解引用读出垃圾位模式、CTS G 族；int 恰为 i32 故幸免）。
 		bool l_ptr = lt && (lt->kind == TypeKind::Pointer || lt->kind == TypeKind::Array);
 		bool r_ptr = rt && (rt->kind == TypeKind::Pointer || rt->kind == TypeKind::Array);
+		// P322：裸函数名（Function 指示符）在算术里按 `&f` 衰减为函数指针。
+		//   `&f - g` / `f - arr` 都是 ptr−ptr 差（结果 ptrdiff），若只看 Pointer/Array，
+		//   它们会落进下面的「ptr ± int → ptr」分支把结果定型成 `int (*)(void)`，
+		//   外层赋值据此把合法结构误报成 int-conversion（探针 t3c:3 / t3d:4；
+		//   clang 对两行只报差面不相容，不再报 int-conversion）。
+		//   仅用于「双侧都衰减」这一个判定，不改下面 ptr ± int 的既有行为。
+		const bool l_dec = l_ptr || (lt && lt->kind == TypeKind::Function);
+		const bool r_dec = r_ptr || (rt && rt->kind == TypeKind::Function);
+		if ((bop == "+" || bop == "-") && l_dec && r_dec) return nullptr; // ptr−ptr → ptrdiff
 		if (l_ptr || r_ptr) {
 			if ((bop == "+" || bop == "-") && l_ptr != r_ptr) {
 				const CTypePtr &pt = l_ptr ? lt : rt;         // 指针操作数
@@ -300,14 +333,17 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		if (e->args.empty()) return nullptr;
 		return resolve_expr_type(e->args.back(), env);
 	}
-	// 三元表达式（§6.5.15）：两臂同 tag 的 struct/union → 该类型；同型指针 → 该指针；
-	//   其余仅在两臂类型兼容时采纳首臂，否则维持旧 nullptr 行为（最小 blast radius）。
+	// 三元表达式（§6.5.15）：任一臂为 void → 结果 void（C 6.5.15p5）；两臂同 tag 的 struct/union → 该类型；
+	//   同型指针 → 该指针；其余仅在两臂类型兼容时采纳首臂，否则维持旧 nullptr 行为（最小 blast radius）。
 	if (e->kind == ExprKind::Ternary)
 	{
 		CTypePtr a = e->args.size() > 0 ? resolve_expr_type(e->args[0], env) : nullptr;
 		CTypePtr b = e->args.size() > 1 ? resolve_expr_type(e->args[1], env) : nullptr;
 		if (!a) return b;
 		if (!b) return a;
+		// P335：C 6.5.15p5「if either the second or third operand has type void, the result has type void」
+		if (a->kind == TypeKind::Void || b->kind == TypeKind::Void)
+			return make_type(TypeKind::Void);
 		if (a->kind == TypeKind::Struct || a->kind == TypeKind::Union)
 			return (a->kind == b->kind && !a->tag.empty() && a->tag == b->tag) ? a : nullptr;
 		if (types_compatible(a, b)) return a;

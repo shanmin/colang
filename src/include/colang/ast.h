@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "colang/common.h"
@@ -216,6 +217,11 @@ struct Expr
 	ExprPtr lhs;
 	ExprPtr rhs;
 	std::string op; // 运算符拼写
+	// P317：二元**运算符 token 自身**的 loc。clang 的部分二元诊断（指针差的类型相容）
+	//   定在运算符列，而 `loc` 存的是 rhs 侧起点（见 parser::parse_binary）→ 二者分开保存。
+	// P328：`[]` 下标（同为 Binary）填**该层 `[` 的 loc**——clang 的「不可下标」诊断定在
+	//   `[` 列，而 `loc` 存的是整条基址最左起点。其余节点保持默认（零值）。
+	SourceLoc op_loc;
 	bool postfix = false; // Unary ++/-- 后缀标志
 
 	// 指定初始化器（C99）
@@ -276,6 +282,7 @@ struct Stmt
 	// Decl（局部变量）
 	CTypePtr var_type;
 	std::string var_name;
+	SourceLoc var_ident_loc; // P331：声明符标识符位置；与声明起点 loc 分离，供 void 源初始化诊断。
 	ExprPtr var_init;
 	bool is_static = false;  // 局部 static
 	bool is_extern = false;  // 块作用域 extern 声明（引用文件作用域对象）
@@ -322,6 +329,10 @@ struct DeclAttributes
 	// P229 Co 层新属性：[[subsystem("windows")]] → 链接子系统切 Windows GUI（无控制台）。
 	//   仅入口函数（WinMain/main）标注有效；由 codegen 汇聚后经 CompileState 交链接层。
 	bool subsystem_windows = false;
+	// 0.4.1 a2-follow：本列表中出现过的属性名拼写+定位（含 :: 限定链全名）。
+	//   供「类型语境」拒收逐名对齐 clang：`'X' attribute cannot be applied to types`；
+	//   空列表 [[::]] 无条目 → 合法零诊断（C23 §6.7.11p3）。
+	std::vector<std::pair<SourceLoc, std::string>> spellings;
 };
 
 // ============================================================
@@ -500,6 +511,20 @@ struct ImportDecl
 // ============================================================
 // 翻译单元
 // ============================================================
+// P304：文件作用域 typedef 的跨模块导出面。
+//   colang 的 typedef 本是 parser 私有表的纯 parse 期概念（使用点即展开为底层类型），
+//   AST 里不留别名；跨模块要用它，就必须把「已解析的底层类型」本身运过模块边界。
+//   本表**全量**记录文件作用域 typedef（含非 public）——种子只挑 public 的出给消费方 parser，
+//   全量这份供 sema 在 `no public type` 处判「该名属于哪个模块」。
+struct TypedefExport
+{
+	std::string name;
+	CTypePtr type;              // 已展开的底层类型（含 _Alignas/GNU aligned）
+	bool is_public = false;
+	std::string source_module_key; // parser 产空；loader merge 时回填规范化 key
+	SourceLoc loc{};
+};
+
 struct TranslationUnit
 {
 	std::vector<FuncDecl> funcs;
@@ -511,6 +536,8 @@ struct TranslationUnit
 	std::vector<StructDef> structs;
 	std::vector<EnumDef> enums;
 	std::vector<ClassDef> classes;  // P300 Co class（0.4.0）
+	// P304：文件作用域 typedef 导出面（见上方 TypedefExport）。块作用域 typedef 不入表。
+	std::vector<TypedefExport> typedefs;
 	// P3+: union decls (folded into structs with is_union flag)
 	// P211 Co 层入口模型：文件作用域的裸语句序列（printf/if/for/return/...）
 	//   按源码顺序保留，codegen 在合成 main 中依序发射。

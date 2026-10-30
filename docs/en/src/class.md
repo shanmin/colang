@@ -29,6 +29,19 @@
 
 (This section describes only the externally observable semantics and behavior of class. Its internal implementation mechanism is outside the scope of this document.)
 
+### `.co` source files only
+
+class is a type form introduced by Co — C has neither this keyword nor the corresponding semantics — so `class` can only be defined in `.co`/`.CO` source files. A class written in `.c` or `.h` is rejected:
+
+```
+$ colang app.c
+app.c:1:1: error: 'class' is only allowed in .co source files
+```
+
+What counts is **the file the `class` keyword actually comes from**: a `.h` pulled in by `#include` from a `.co` source gets no exemption — a class definition in that header is still rejected, and the diagnostic points at the header's own name and line number.
+
+(No cascade: the whole `class … { … }` block is skipped in one go, so one definition yields exactly one diagnostic.)
+
 ### Boundary with struct
 
 class is Co's **reference type** (data + behavior), in contrast to struct (a value type, pure data, C-compatible):
