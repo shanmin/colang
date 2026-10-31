@@ -29,6 +29,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
@@ -84,6 +85,10 @@ struct CodeGenImpl
 	std::vector<Error> &errs;
 	// 目标 / 数据模型（由 generate() 从 opts.target 注入）：驱动三元组与 long/wchar_t 的 LLVM 类型宽度。
 	TargetInfo target_;
+	// P352：Windows x64 目标标志——按值 struct/union 形参/返回改用 first-class 聚合类型，
+	//   交由 LLVM X86 win64 后端按 Microsoft x64 ABI 归类降法（≤8B 进通用寄存器 / >8B 隐藏指针）。
+	//   非 win64（Linux/32 位）逐字维持旧「一律降 ptr」行为，plct 00204 SysV memcpy 路径零改动。
+	bool win64_abi_ = false;
 	// 局部符号表：变量名 -> alloca/GlobalVariable 指针
 	std::unordered_map<std::string, llvm::Value*> vars_;
 	// 全局符号表
@@ -94,6 +99,8 @@ struct CodeGenImpl
 		llvm::BasicBlock *break_target;
 		llvm::BasicBlock *continue_target; // nullptr for switch
 		std::size_t rc_depth = 0;          // P300：入口 RC 帧深度，break/continue 释放至此（补 §5.5）
+		std::size_t vla_depth = 0;         // P348：入口 VLA 帧深度，break 回退栈至此
+		std::size_t vla_continue_depth = 0; // P348：continue 回退栈至此（switch 内取其外层循环的深度）
 	};
 	std::vector<LoopContext> loop_stack_;
 
@@ -101,6 +108,8 @@ struct CodeGenImpl
 	std::unordered_map<std::string, llvm::BasicBlock*> label_blocks_;
 	// P300：标签处的 RC 帧深度，供 goto 向后跳越块作用域时按目标深度释放
 	std::unordered_map<std::string, std::size_t> label_rc_depth_;
+	// P348：标签处的 VLA 帧深度，语义同 label_rc_depth_
+	std::unordered_map<std::string, std::size_t> label_vla_depth_;
 	// switch case/default 标签→BB（P172：case 视作 label，支持嵌在循环体内的 case，如 Tom Duff）
 	std::unordered_map<const Stmt *, llvm::BasicBlock *> case_label_bb_;
 	struct PendingGoto { std::string label; llvm::BasicBlock *from_bb; };
@@ -117,6 +126,9 @@ struct CodeGenImpl
 	// 引用计数帧：与块作用域同层推进，出域按帧由内向外、声明逆序 release
 	struct RcSlot { llvm::Value *slot_addr; std::string class_name; };
 	std::vector<std::vector<RcSlot>> rc_frames_;
+	// VLA 栈回退帧（P348）：与块作用域同层推进，每层存该层第一个 VLA 声明点的
+	//   llvm.stacksave 结果（该层无 VLA 时为 nullptr）；出域/跳出按帧由内向外 stackrestore。
+	std::vector<llvm::Value *> vla_frames_;
 	// P300 形参借用（0.4.0 收尾）：class 句柄形参的 alloca 槽集合——重绑定时不 retain 新值/不 release 原借用对象。
 	std::unordered_set<llvm::Value*> borrowed_slots_;
 	// 当前类方法上下文（this 绑定 / 裸成员名解析）
@@ -367,6 +379,8 @@ struct CodeGenImpl
 		module = std::make_unique<llvm::Module>(mod_name, ctx);
 		llvm::Triple triple(target_.triple);
 		module->setTargetTriple(triple);
+		// P352：win64 目标判定（与下方 DataLayout 选择、make_module 同源口径）。
+		win64_abi_ = triple.isArch64Bit() && triple.isOSWindows();
 		// 设置 DataLayout（x86_64 Windows，指针 8B，int 4B）
 		std::string dl_str;
 		if (triple.isArch64Bit() && triple.isOSWindows())
@@ -508,12 +522,72 @@ struct CodeGenImpl
 		return a;
 	}
 
-	// struct/union 成员的有效对齐：max(类型有效对齐, 成员 _Alignas)
-	unsigned member_effective_align(const StructMember &m)
+	// struct/union 成员的有效对齐：max(类型有效对齐, 成员 _Alignas)。
+	// P337：packed（成员级或宿主级）在无显式对齐时压至 1；显式对齐一律胜出（与 parser 的
+	//   const_member_align 同口径，否则 sizeof/offsetof 与 IR 布局自相矛盾）。
+	// P338：`#pragma pack` cap 是「对齐上限」——无显式对齐时取 min(自然, cap)；显式对齐胜出。
+	unsigned member_effective_align(const StructMember &m, const StructDef *host)
 	{
 		unsigned a = m.type ? type_effective_align(m.type) : 1;
 		if (m.align > a) a = m.align;
-		return a < 1 ? 1 : a;
+		if (a < 1) a = 1;
+		if (m.packed || (host && host->packed))
+		{
+			unsigned expl = m.align;
+			const unsigned te = type_declared_align(m.type);
+			if (te > expl) expl = te;
+			if (expl == 0) a = 1;
+			else if (expl > a) a = expl;
+		}
+		else if (host && host->pack_cap > 0)
+		{
+			unsigned expl = m.align;
+			const unsigned te = type_declared_align(m.type);
+			if (te > expl) expl = te;
+			if (expl == 0)
+			{
+				if (host->pack_cap < a) a = host->pack_cap; // min(自然, cap)
+			}
+			else if (expl > a)
+			{
+				a = expl; // 显式声明对齐胜出，cap 不降
+			}
+		}
+		return a;
+	}
+
+	// 类型的「显式声明对齐」（与 parser 的 const_declared_align 同口径）：只取声明里写出来的
+	//   那一份（类型节点 _Alignas / 记录类型的 GNU __attribute__((aligned))），不含由成员
+	//   自然对齐推得的对齐——packed 压不动前者（clang 实测 Ha），但必压后者（实测 E）。
+	unsigned type_declared_align(const CTypePtr &t)
+	{
+		if (!t) return 0;
+		unsigned a = t->align;
+		if (t->kind == TypeKind::Array)
+		{
+			unsigned e = type_declared_align(t->base);
+			if (e > a) a = e;
+			return a;
+		}
+		if (t->kind == TypeKind::Struct || t->kind == TypeKind::Union)
+		{
+			auto it = struct_defs_.find(t->tag);
+			if (it != struct_defs_.end() && it->second && it->second->align > a) a = it->second->align;
+		}
+		return a;
+	}
+
+	// P339：packed 是否对本记录生效（与 parser 的 packing_host 同口径）：类型级或任一字段级；
+	//   `#pragma pack` cap 同上。含位域记录同样生效——codegen 的位域段按「存储单元」建模，
+	//   packed/cap 只压单元的放置对齐（单元宽度不变）。
+	const StructDef *packing_host(const StructDef &s)
+	{
+		bool any = s.packed || s.pack_cap > 0;
+		for (const auto &m : s.members)
+		{
+			if (m.packed) any = true;
+		}
+		return any ? &s : nullptr;
 	}
 
 	// 对象落位对齐：max(自然对齐(llvm 类型), 类型有效对齐, 声明 _Alignas)
@@ -569,10 +643,22 @@ struct CodeGenImpl
 		auto *st = llvm::StructType::create(ctx, tname);
 		struct_types_[tag] = st;
 		const auto &DL = module->getDataLayout();
+		// P337：本记录是否按 packed 布局。置位后：① 必走手工逐字节布局（LLVM 自动布局会按
+		//   自然对齐插垫）；② LLVM StructType 以 isPacked 建型——packed struct 的 ABI 对齐恒 1、
+		//   尺寸恒等于字段之和（不加隐式尾垫），否则 `{i8,i32,i8}` 的 5 字节会被撑成 8。
+		//   对齐仍另登于 struct_align_（覆盖 packed+aligned(N) 的 V8 形态）。
+		const StructDef *ph = packing_host(*sd);
+		const bool st_packed = (ph != nullptr);
 
 		if (sd->is_union)
 		{
-			// union: [max store size x i8]；对齐取成员有效对齐最大值
+			// union：{ <首成员类型>, [M x i8] }——首成员承载真实 LLVM 类型，尾部补齐到有效对齐
+			//   后的 N 字节（首成员本身够大时单元素，含「首成员=字符数组」退化为原 [N x i8]）。
+			//   旧表征 { [N x i8] } 只能用常量**字节**装填，全局初始化遇非空指针（重定位）只能
+			//   落全零；改后首成员通道可直接给出 @sym 形式的重定位常量。成员偏移恒为 0，
+			//   运行期 GEP 在 opaque pointer 下无感。
+			//   对齐仍按成员有效对齐最大值登记于 struct_align_：新表征的 ABI align 可能被首成员
+			//   拉低（如首成员 i8、其余 i64），由 obj_align/type_effective_align 取 max 兜住。
 			uint64_t max_sz = 0;
 			unsigned al = 1;
 			for (const auto &m : sd->members)
@@ -580,14 +666,32 @@ struct CodeGenImpl
 				llvm::Type *mt = to_llvm_alloca_type(m.type);
 				uint64_t sz = DL.getTypeStoreSize(mt);
 				if (sz > max_sz) max_sz = sz;
-				unsigned ea = member_effective_align(m);
+				unsigned ea = member_effective_align(m, ph);
 				if (ea > al) al = ea;
 			}
 			if (sd->align > al) al = sd->align; // GNU __attribute__((aligned)) 于 union 类型
 			if (max_sz == 0) max_sz = 1;
 			max_sz = ((max_sz + al - 1) / al) * al; // 尾部补到有效对齐（数组步长/对象对齐一致）
 			struct_align_[tag] = al;
-			st->setBody(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), max_sz), false);
+			llvm::Type *i8 = llvm::Type::getInt8Ty(ctx);
+			llvm::Type *fty = sd->members.empty() ? nullptr : to_llvm_alloca_type(sd->members[0].type);
+			// 首成员类型不可定长（跨模块导入类型里的匿名聚合只在本桶登记为 opaque struct）时
+			//   回退旧表征 [N x i8]：否则 union 自身变成 unsized，全局变量零初值直接违反
+			//   verifier「Global variable initializer must be sized」（tests/p215_winapi.co 的
+			//   `union LARGE_INTEGER` 就是这一形态）。
+			if (!fty || !fty->isSized())
+			{
+				st->setBody(llvm::ArrayType::get(i8, max_sz), st_packed);
+				return st;
+			}
+			const uint64_t fsz = DL.getTypeStoreSize(fty);
+			// 注意：setBody(Type*) 是「单元素」重载，直接喂 StructType* 会套成 { { fty, tail } }
+			//   双层聚合（实测导致 union 常量形状不匹配、全体退零）。多元素必须显式走
+			//   ArrayRef<Type*> 重载。
+			if (fsz >= max_sz)
+				st->setBody(fty, st_packed);
+			else
+				st->setBody(llvm::ArrayRef<llvm::Type *>{fty, llvm::ArrayType::get(i8, max_sz - fsz)}, st_packed);
 			return st;
 		}
 
@@ -608,6 +712,7 @@ struct CodeGenImpl
 			}
 		}
 		if (sd->align > 0) needs_manual = true; // 类型级 aligned：需尾部补到该对齐，走手工布局
+		if (ph) needs_manual = true; // P337：packed 需逐字节手工布局（LLVM 自动布局按自然对齐插垫）
 
 		if (needs_manual && !has_bitfield)
 		{
@@ -619,7 +724,7 @@ struct CodeGenImpl
 			for (const auto &m : sd->members)
 			{
 				llvm::Type *mt = to_llvm_alloca_type(m.type);
-				unsigned ea = member_effective_align(m);
+				unsigned ea = member_effective_align(m, ph);
 				if (ea < 1) ea = 1;
 				if (ea > sal) sal = ea;
 				uint64_t aligned = ((off + ea - 1) / ea) * ea;
@@ -638,78 +743,121 @@ struct CodeGenImpl
 			uint64_t total = ((off + sal - 1) / sal) * sal;
 			if (total > off)
 				fields.push_back(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), total - off));
-			st->setBody(fields, false);
+			st->setBody(fields, st_packed);
 			struct_align_[tag] = sal;
 			struct_pos_map_[tag] = std::move(pos_map);
 			return st;
 		}
 
-		// ===== 自动布局路径（普通 struct / 含位域 / alignas+位域回退）=====
+		// ===== 位域单元布局 / 普通记录的自动布局路径 =====
+		//   P339：位域按「存储单元」建模，与 parser 的 record_layout 逐条同构：
+		//   ① 单元宽度 = 声明类型宽度（`int:4` 仍占 4 字节），packed/cap 只压单元的**放置对齐**
+		//      （min(自然, cap)；packed 恒 1），不缩单元；
+		//   ② 零宽 `:0` 只截断当前单元、自身不占空间（前导 `:0` 完全无操作）；
+		//   ③ 单元类型一变或超宽即另开单元。
+		//   packed/cap 记录（ph 非空）走「显式 [gap x i8] + isPacked 体」，真实对齐另登
+		//   struct_align_；无 packed/cap 时不出显式垫（IR 形态与旧版一致，LLVM 自插垫）。
 		{
+			const bool explicit_pads = (ph != nullptr);
 			std::vector<llvm::Type*> fields;
-			unsigned bf_idx = 0;  // 当前成员在 fields 中的索引
-			unsigned cur_offset = 0; // 当前存储单元内已用位数
+			std::vector<unsigned> pos_map;
+			uint64_t off = 0;
+			unsigned sal = sd->align ? sd->align : 1;
+			bool in_storage = false;    // 是否正处在一个存储单元内
 			unsigned cur_unit_bits = 0; // 当前存储单元位宽
-			bool in_storage = false; // 是否在收集位域存储单元
+			unsigned cur_used = 0;      // 当前存储单元已用位数
+			unsigned bf_idx = 0;        // 当前存储单元在 fields 中的索引
+			llvm::Type *i8 = llvm::Type::getInt8Ty(ctx);
+			auto pad_to = [&](unsigned a) {
+				uint64_t aligned = ((off + a - 1) / a) * a;
+				if (aligned > off)
+				{
+					fields.push_back(llvm::ArrayType::get(i8, aligned - off));
+					off = aligned;
+				}
+			};
 
 			for (std::size_t i = 0; i < sd->members.size(); ++i)
 			{
 				const auto &m = sd->members[i];
-				if (m.bit_width >= 0)
+				unsigned ea = member_effective_align(m, ph);
+				if (ea < 1) ea = 1;
+				if (m.bit_width == 0)
+				{
+					// 零宽：只截断单元，自身不占空间、不贡献对齐
+					in_storage = false;
+					cur_used = 0;
+					cur_unit_bits = 0;
+					continue;
+				}
+				if (ea > sal) sal = ea;
+				if (m.bit_width > 0)
 				{
 					// 位域成员
 					unsigned unit_bits = get_bitfield_unit_bits(m.type);
-					if (!in_storage || cur_unit_bits != unit_bits)
+					if (!in_storage || cur_unit_bits != unit_bits
+						|| cur_used + static_cast<unsigned>(m.bit_width) > unit_bits)
 					{
-						// 开新存储单元
+						// 另开存储单元：按单元的放置对齐落位，整个单元（ub/8 字节）一次占满
+						in_storage = false;
+						if (explicit_pads) pad_to(ea);
 						bf_idx = static_cast<unsigned>(fields.size());
 						fields.push_back(get_int_ty_for_bits(unit_bits));
-						cur_offset = 0;
+						off += unit_bits / 8;
 						cur_unit_bits = unit_bits;
+						cur_used = 0;
 						in_storage = true;
-					}
-					// 检查是否超宽，需要新单元
-					if (cur_offset + static_cast<unsigned>(m.bit_width) > cur_unit_bits)
-					{
-						bf_idx = static_cast<unsigned>(fields.size());
-						fields.push_back(get_int_ty_for_bits(unit_bits));
-						cur_offset = 0;
-						cur_unit_bits = unit_bits;
 					}
 					// 记录位域访问信息
 					if (!m.name.empty())
 					{
 						BitfieldAccess ba;
 						ba.storage_idx = bf_idx;
-						ba.bit_offset = cur_offset;
+						ba.bit_offset = cur_used;
 						ba.bit_width = static_cast<unsigned>(m.bit_width);
 						ba.is_signed = m.type && m.type->kind != TypeKind::Bool && m.type->kind != TypeKind::Enum && !is_unsigned_int_type(m.type); // Bool 恒0/1、Enum 沿用基线(无符号)均不参与符号扩展；覆盖 Char/Short/Int/Long/LongLong/_BitInt
 						ba.unit_bits = cur_unit_bits;
 						bitfield_access_[tag + "." + m.name] = ba;
 					}
-					cur_offset += static_cast<unsigned>(m.bit_width);
+					cur_used += static_cast<unsigned>(m.bit_width);
 				}
 				else
 				{
 					// 普通成员: 结束当前位域段
 					in_storage = false;
-					cur_offset = 0;
+					cur_used = 0;
 					cur_unit_bits = 0;
+					if (explicit_pads) pad_to(ea);
 					unsigned fidx = static_cast<unsigned>(fields.size());
-					fields.push_back(to_llvm_alloca_type(m.type));
+					llvm::Type *mt = to_llvm_alloca_type(m.type);
+					fields.push_back(mt);
+					off += DL.getTypeStoreSize(mt);
 					if (!m.name.empty())
 						field_index_map_[tag + "." + m.name] = fidx;
+					pos_map.push_back(fidx);
 				}
 			}
-			st->setBody(fields, false);
-			// struct 对齐：LLVM 自然对齐与成员有效对齐取 max（覆盖 alignas+位域回退情形）
-			unsigned sal = static_cast<unsigned>(DL.getABITypeAlign(st).value());
-			for (const auto &m : sd->members)
+			if (fields.empty())
 			{
-				if (m.bit_width >= 0) continue;
-				unsigned ea = member_effective_align(m);
-				if (ea > sal) sal = ea;
+				// 仅含零宽位域的记录：clang 按空记录给 4 字节 / 对齐 1
+				fields.push_back(llvm::ArrayType::get(i8, 4));
+				off = 4;
+				sal = 1;
 			}
+			if (explicit_pads)
+			{
+				uint64_t total = ((off + sal - 1) / sal) * sal;
+				if (total > off)
+					fields.push_back(llvm::ArrayType::get(i8, total - off));
+				st->setBody(fields, true);
+				struct_align_[tag] = sal;
+				struct_pos_map_[tag] = std::move(pos_map);
+				return st;
+			}
+			st->setBody(fields, false);
+			// struct 对齐：LLVM 自然对齐与成员/单元有效对齐取 max（覆盖 alignas+位域回退情形）
+			unsigned nat = static_cast<unsigned>(DL.getABITypeAlign(st).value());
+			if (nat > sal) sal = nat;
 			if (sd->align > sal) sal = sd->align; // 位域+类型级 aligned 罕见组合：至少抬高 struct_align_（alloca/数组步长）
 			struct_align_[tag] = sal;
 		}
@@ -728,14 +876,41 @@ struct CodeGenImpl
 
 	// stdbit_parse/stdbit_is_value_op/stdbit_unsigned_ty：P140 起移至 type_resolver.h
 
+	// P352：win64 按值聚合体形参/返回的 ABI 标量型。Microsoft x64：尺寸为 1/2/4/8 字节的
+	//   struct/union 整块进一个通用寄存器（即当作对应宽度的整数传）；clang 在 IR 层面亦将其
+	//   scalarize 为 i8/i16/i32/i64（而非 first-class 聚合体）。>8 或非 2 幂尺寸走「按参考传」
+	//   （隐指针），与 colang 旧「降 ptr」一致，故回 nullptr 表示维持旧口径。
+	llvm::Type *win64_agg_abi_type(const CTypePtr &t)
+	{
+		if (!t || (t->kind != TypeKind::Struct && t->kind != TypeKind::Union))
+			return nullptr;
+		uint64_t sz = module->getDataLayout().getTypeStoreSize(get_struct_type(t->tag));
+		if (sz == 1) return llvm::Type::getInt8Ty(ctx);
+		if (sz == 2) return llvm::Type::getInt16Ty(ctx);
+		if (sz == 4) return llvm::Type::getInt32Ty(ctx);
+		if (sz == 8) return llvm::Type::getInt64Ty(ctx);
+		return nullptr;
+	}
+
+	// P352：函数签名中形参/返回的 LLVM 类型。Windows x64 下尺寸∈{1,2,4,8} 的按值 struct/union
+	//   降为对应整数标量（进一个通用寄存器，与 clang 一致）；其余（非 win64、>8 聚合体、指针/数组/
+	//   标量/class 等）逐字回退旧 to_llvm_type 行为。
+	llvm::Type *sig_val_type(const CTypePtr &t)
+	{
+		if (win64_abi_)
+			if (llvm::Type *a = win64_agg_abi_type(t))
+				return a;
+		return to_llvm_type(t);
+	}
+
 	llvm::FunctionType *to_func_type(const FuncDecl &fn)
 	{
-		llvm::Type *ret_ty = to_llvm_type(fn.return_type);
+		llvm::Type *ret_ty = sig_val_type(fn.return_type);
 		std::vector<llvm::Type *> param_tys;
 		for (const auto &p : fn.params)
 		{
 			// 数组参数退化为指针
-			param_tys.push_back(to_llvm_type(p.type));
+			param_tys.push_back(sig_val_type(p.type));
 		}
 		return llvm::FunctionType::get(ret_ty, param_tys, fn.is_variadic);
 	}
@@ -800,6 +975,8 @@ struct CodeGenImpl
 			case_label_bb_.clear();
 			pending_gotos_.clear();
 			label_rc_depth_.clear();
+			label_vla_depth_.clear();
+			vla_frames_.assign(1, nullptr);
 			cur_func_name_ = fname;
 			in_synthesized_main_body_ = true; // 允许 return; 兜底为 ret void
 			for (auto &pi : tl_pending_inits)
@@ -895,6 +1072,8 @@ struct CodeGenImpl
 			case_label_bb_.clear();
 			pending_gotos_.clear();
 			label_rc_depth_.clear();
+			label_vla_depth_.clear();
+			vla_frames_.assign(1, nullptr);
 			cur_func_name_ = "DllMain";
 			// entry：reason 分岔
 			auto *entry = llvm::BasicBlock::Create(ctx, "entry", F);
@@ -1363,6 +1542,8 @@ struct CodeGenImpl
 					case_label_bb_.clear();
 					pending_gotos_.clear();
 					label_rc_depth_.clear();
+					label_vla_depth_.clear();
+					vla_frames_.assign(1, nullptr);
 					cur_func_name_ = "main";
 					cur_class_tag_.clear();
 					cur_this_ = nullptr;
@@ -1423,7 +1604,10 @@ struct CodeGenImpl
 					{
 						llvm::BasicBlock *cur_bb = builder.GetInsertBlock();
 						if (cur_bb && (cur_bb->empty() || !cur_bb->back().isTerminator()))
+						{
 							release_all_rc();
+							vla_restore_emit(0);
+						}
 					}
 					// 末尾未终止 → 转调 __co_main__ 或 ret 0（“return V;”已提前 ret 时跳过）
 					llvm::BasicBlock *tail = builder.GetInsertBlock();
@@ -1555,10 +1739,10 @@ struct CodeGenImpl
 			fn = fty->base;
 		if (fn)
 		{
-			llvm::Type *ret = to_llvm_type(fn->base);
+			llvm::Type *ret = sig_val_type(fn->base);
 			std::vector<llvm::Type *> pts;
 			for (const auto &pt : fn->params)
-				pts.push_back(to_llvm_type(pt));
+				pts.push_back(sig_val_type(pt));
 			// 无原型 () 函数指针（params 空且非变参）却带实参调用：C 允许并作默认提升，
 			//   LLVM 以 ret(...) 建模，避免按 i32() 零参发射触发 verifier「参数数不符」（00209 fptr1）。
 			bool va = fn->is_variadic;
@@ -2212,119 +2396,192 @@ struct CodeGenImpl
 		}
 	}
 
-	// 常量 → union 载荷字节（小端，按 DataLayout 布局）。
-	// LLVM 禁止聚合→字节数组的 bitcast，故逐成员摊开：整型截位、浮点取位模式。
-	// 含重定位（非空指针）时返回 false：对象写入器不支持 lshr/trunc 形式的
-	// 重定位常量表达式（"unsupported constant expression of type lshr"），
-	// 只能回退旧的全零行为。未覆盖的填充字节保持 0。
-	bool const_to_bytes(llvm::Constant *c, uint64_t off, std::vector<llvm::Constant *> &bytes)
+	// 常量 → union 载荷**字节位模式**（小端，按 DataLayout 布局；未覆盖的填充字节保持 0）。
+	// LLVM 禁止聚合→字节数组的 bitcast，故逐成员摊开。全程纯 APInt 运算、**不产生
+	//   ConstantExpr**：旧实现的 `trunc(lshr v, k*8)` 字节表达式会被对象写入器拒绝
+	//   （"unsupported constant expression of type lshr"）。
+	// 含重定位（非空指针）时返回 false：字节层无法表达符号地址，交回全零。
+	bool const_byte_pattern(llvm::Constant *c, uint64_t off, std::vector<uint8_t> &bs)
 	{
-		if (!c || off >= bytes.size()) return true;
+		if (!c || off >= bs.size()) return true;
 		const auto &DL = module->getDataLayout();
-		llvm::Type *i8 = llvm::Type::getInt8Ty(ctx);
 		llvm::Type *t = c->getType();
 		if (t->isIntegerTy())
 		{
-			auto *it = llvm::cast<llvm::IntegerType>(t);
-			unsigned bw = it->getBitWidth();
-			if (bw < 8)
+			auto *ci = llvm::dyn_cast<llvm::ConstantInt>(c);
+			if (!ci) return false;
+			const llvm::APInt v = ci->getValue();
+			const uint64_t n = std::min<uint64_t>(DL.getTypeStoreSize(t), bs.size() - off);
+			for (uint64_t k = 0; k < n; ++k)
 			{
-				bytes[off] = llvm::ConstantExpr::getCast(llvm::Instruction::ZExt, c, i8);
-				return true;
-			}
-			if (bw == 8)
-			{
-				bytes[off] = c;
-				return true;
-			}
-			for (unsigned k = 0; k < bw / 8 && off + k < bytes.size(); ++k)
-			{
-				// LLVM 23 已移除 ConstantExpr::getLShr，改用通用二元 get
-				llvm::Constant *sh = llvm::ConstantExpr::get(llvm::Instruction::LShr, c,
-					llvm::ConstantInt::get(it, k * 8));
-				bytes[off + k] = llvm::ConstantExpr::getTrunc(sh, i8);
+				const uint64_t bit = k * 8;
+				bs[off + k] = (bit + 8 <= v.getBitWidth())
+					? static_cast<uint8_t>(v.extractBitsAsZExtValue(8, static_cast<unsigned>(bit)))
+					: 0;
 			}
 			return true;
 		}
 		if (t->isFloatingPointTy())
 		{
-			auto *fp = llvm::cast<llvm::ConstantFP>(c);
-			llvm::APInt v = fp->getValueAPF().bitcastToAPInt();
-			for (unsigned k = 0; k < v.getBitWidth() / 8 && off + k < bytes.size(); ++k)
-				bytes[off + k] = llvm::ConstantInt::get(i8, v.extractBitsAsZExtValue(8, k * 8));
+			auto *cf = llvm::dyn_cast<llvm::ConstantFP>(c);
+			if (!cf) return false;
+			const llvm::APInt v = cf->getValueAPF().bitcastToAPInt();
+			const uint64_t n = std::min<uint64_t>(DL.getTypeStoreSize(t), bs.size() - off);
+			for (uint64_t k = 0; k < n; ++k)
+				bs[off + k] = static_cast<uint8_t>(
+					v.extractBitsAsZExtValue(8, static_cast<unsigned>(k * 8)));
 			return true;
 		}
 		if (t->isPointerTy())
-			return llvm::isa<llvm::ConstantPointerNull>(c); // 非空指针＝重定位，交回全零
+			return llvm::isa<llvm::ConstantPointerNull>(c); // 非空指针＝重定位，字节层不可表达
 		if (llvm::isa<llvm::ConstantAggregateZero>(c)) return true; // 全 0
 		if (auto *cs = llvm::dyn_cast<llvm::ConstantStruct>(c))
 		{
 			const auto *sl = DL.getStructLayout(cs->getType());
 			for (unsigned i = 0; i < cs->getNumOperands(); ++i)
-				if (!const_to_bytes(cs->getOperand(i), off + sl->getElementOffset(i), bytes))
+				if (!const_byte_pattern(cs->getOperand(i), off + sl->getElementOffset(i), bs))
 					return false;
 			return true;
 		}
 		if (auto *ca = llvm::dyn_cast<llvm::ConstantArray>(c))
 		{
-			uint64_t esz = DL.getTypeAllocSize(ca->getType()->getElementType());
+			const uint64_t esz = DL.getTypeAllocSize(ca->getType()->getElementType());
 			for (unsigned i = 0; i < ca->getNumOperands(); ++i)
-				if (!const_to_bytes(ca->getOperand(i), off + i * esz, bytes))
+				if (!const_byte_pattern(ca->getOperand(i), off + i * esz, bs))
 					return false;
 			return true;
 		}
 		if (auto *cd = llvm::dyn_cast<llvm::ConstantDataSequential>(c))
 		{
-			uint64_t esz = DL.getTypeAllocSize(cd->getElementType());
+			const uint64_t esz = DL.getTypeAllocSize(cd->getElementType());
 			for (unsigned i = 0; i < cd->getNumElements(); ++i)
-				if (!const_to_bytes(cd->getElementAsConstant(i), off + i * esz, bytes))
+				if (!const_byte_pattern(cd->getElementAsConstant(i), off + i * esz, bs))
 					return false;
 			return true;
 		}
-		return true;
+		return false; // 未覆盖形态（向量/undef 等）：保守失败，交回全零
 	}
 
-	// union 首成员常量 → union 的 [N x i8] 载荷常量（成员小于 union 时余位补 0）。
-	llvm::Constant *union_body_const(llvm::StructType *sty, llvm::Constant *mc)
+	// 字节位模式 → 指定类型的常量（小端）。首成员可以是标量/聚合/数组，故按类型递归重建：
+	//   整数与浮点按低位取位（_Bool 按「非零即真」），聚合/数组按 alloc size 逐子对象切。
+	// 指针只接受全零位（重定位无法由字节还原），遇非零位返回 nullptr。
+	llvm::Constant *bytes_to_const(llvm::Type *t, const std::vector<uint8_t> &bs, uint64_t off)
 	{
-		llvm::Type *body = sty->getNumElements() == 1 ? sty->getElementType(0) : nullptr;
-		auto *arr = body && body->isArrayTy() ? llvm::cast<llvm::ArrayType>(body) : nullptr;
-		if (!arr || !mc)
-			return llvm::ConstantStruct::get(sty, llvm::Constant::getNullValue(body ? body : arr));
-		uint64_t N = arr->getNumElements();
-		llvm::Type *i8 = llvm::Type::getInt8Ty(ctx);
-		if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(mc))
+		if (!t || off > bs.size()) return nullptr;
+		const auto &DL = module->getDataLayout();
+		const uint64_t avail = bs.size() - off;
+		if (auto *it = llvm::dyn_cast<llvm::IntegerType>(t))
 		{
-			llvm::APInt v = CI->getValue();
-			if (v.getBitWidth() < N * 8) v = v.zext(N * 8);
-			else if (v.getBitWidth() > N * 8) v = v.trunc(N * 8);
-			std::vector<uint8_t> bytes(N, 0);
-			for (uint64_t b = 0; b < N; ++b)
-				bytes[b] = static_cast<uint8_t>(v.extractBitsAsZExtValue(8, static_cast<unsigned>(b * 8)));
-			return llvm::ConstantStruct::get(sty, llvm::ConstantDataArray::get(ctx, bytes));
+			const unsigned bw = it->getBitWidth();
+			if (bw <= 8)
+			{
+				const uint64_t b = avail ? bs[off] : 0;
+				return llvm::ConstantInt::get(it, llvm::APInt(bw, bw == 1 ? (b ? 1 : 0) : b));
+			}
+			llvm::APInt v(bw, 0);
+			const uint64_t n = std::min<uint64_t>(bw / 8, avail);
+			for (uint64_t k = 0; k < n; ++k)
+				v.insertBits(llvm::APInt(8, bs[off + k]), static_cast<unsigned>(k * 8));
+			return llvm::ConstantInt::get(it, v);
 		}
-		// 指针/浮点/聚合首成员：逐成员摊字节（旧实现只认 ConstantInt，其余一律全零）。
-		// 含重定位（指针）时对象写入器无法表达 → 保持旧的全零。
-		std::vector<llvm::Constant *> bytes(N, llvm::ConstantInt::get(i8, 0));
-		if (!const_to_bytes(mc, 0, bytes))
-			return llvm::ConstantStruct::get(sty, llvm::Constant::getNullValue(arr));
-		return llvm::ConstantStruct::get(sty, llvm::ConstantArray::get(llvm::ArrayType::get(i8, N), bytes));
+		if (t->isFloatingPointTy())
+		{
+			const unsigned bw = static_cast<unsigned>(t->getPrimitiveSizeInBits());
+			llvm::APInt v(bw, 0);
+			const uint64_t n = std::min<uint64_t>(bw / 8, avail);
+			for (uint64_t k = 0; k < n; ++k)
+				v.insertBits(llvm::APInt(8, bs[off + k]), static_cast<unsigned>(k * 8));
+			return llvm::ConstantFP::get(t, llvm::APFloat(t->getFltSemantics(), v));
+		}
+		if (t->isPointerTy())
+		{
+			const uint64_t n = std::min<uint64_t>(DL.getTypeStoreSize(t), avail);
+			for (uint64_t k = 0; k < n; ++k)
+				if (bs[off + k] != 0) return nullptr; // 非零位 ＝ 重定位，字节层还原不出
+			return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(t));
+		}
+		if (auto *aty = llvm::dyn_cast<llvm::ArrayType>(t))
+		{
+			const uint64_t esz = DL.getTypeAllocSize(aty->getElementType());
+			std::vector<llvm::Constant *> es;
+			for (uint64_t k = 0; k < aty->getNumElements(); ++k)
+			{
+				llvm::Constant *e = bytes_to_const(aty->getElementType(), bs, off + k * esz);
+				if (!e) return nullptr;
+				es.push_back(e);
+			}
+			return llvm::ConstantArray::get(aty, es);
+		}
+		auto *sty = llvm::dyn_cast<llvm::StructType>(t);
+		if (sty && sty->isSized())
+		{
+			const auto *sl = DL.getStructLayout(sty);
+			std::vector<llvm::Constant *> es;
+			for (unsigned k = 0; k < sty->getNumElements(); ++k)
+			{
+				llvm::Constant *e = bytes_to_const(sty->getElementType(k), bs, off + sl->getElementOffset(k));
+				if (!e) return nullptr;
+				es.push_back(e);
+			}
+			return llvm::ConstantStruct::get(sty, es);
+		}
+		return nullptr;
 	}
 
-	// union 常量槽：目标为具名 struct 且其 tag 是 union（colang union 表征 = struct{[N x i8]}）。
-	// 标量或花括号初值均作用于首成员（§6.7.9p19）；取首成员常量按小端写入 [N x i8]。
+	// union 成员常量，union 常量（{ <首成员类型>, [M x i8] }）。
+	// mem_ty = mc 的 LLVM 类型（成员类型）。缺省或等于首成员类型 → 首成员通道：直接放进
+	//   槽 0，指针/聚合重定位常量天然可表达——全局 union 初始化零值缺陷的修复主通道。
+	// 其余情形（被指的是**非首成员**，P238 指定初始化器）→ 位重解释：先摊成字节位模式，
+	//   再按首成员类型重建（首成员吃低 head_sz 字节、尾部吃余下字节）。含重定位时
+	//   摊平失败 → 全零，与改前行为一致（已知边界，见 PROJECT.md §3.2）。
+
+	llvm::Constant *union_body_const(llvm::StructType *sty, llvm::Constant *mc,
+		llvm::Type *mem_ty = nullptr)
+	{
+		if (!sty || sty->getNumElements() == 0) return mc;
+		const auto &DL = module->getDataLayout();
+		llvm::Type *fty = sty->getElementType(0);
+		auto *tai = (sty->getNumElements() >= 2)
+			? llvm::dyn_cast<llvm::ArrayType>(sty->getElementType(1)) : nullptr;
+		auto build = [&](llvm::Constant *head, llvm::Constant *tail) {
+			std::vector<llvm::Constant *> elems;
+			elems.push_back(head ? head : llvm::Constant::getNullValue(fty));
+			for (unsigned k = 1; k < sty->getNumElements(); ++k)
+				elems.push_back((k == 1 && tail) ? tail : llvm::Constant::getNullValue(sty->getElementType(k)));
+			return llvm::ConstantStruct::get(sty, elems);
+		};
+		if (!mc) return build(nullptr, nullptr);
+		// ① 首成员通道：值类型即首成员类型（含指针/聚合重定位）
+		if (!mem_ty || mem_ty == fty) return build(mc, nullptr);
+		// ② 非首成员被指定：摊成字节位模式，再按首成员类型重建
+		const uint64_t head_sz = DL.getTypeStoreSize(fty);
+		const uint64_t tail_sz = tai ? tai->getNumElements() : 0;
+		std::vector<uint8_t> bs(static_cast<std::size_t>(head_sz + tail_sz), 0);
+		if (!const_byte_pattern(mc, 0, bs)) return build(nullptr, nullptr); // 重定位：仍全零
+		llvm::Constant *head = bytes_to_const(fty, bs, 0);
+		if (!head) return build(nullptr, nullptr);
+		llvm::Constant *tail = nullptr;
+		if (tai)
+		{
+			std::vector<uint8_t> tb(bs.begin() + static_cast<std::ptrdiff_t>(head_sz), bs.end());
+			tail = llvm::ConstantDataArray::get(ctx, tb);
+		}
+		return build(head, tail);
+	}
+
+	// union 常量槽：目标为具名 struct 且其 tag 是 union。标量或花括号初值均作用于
+	// 首成员（§6.7.9p19）；首成员通道直接产出 { <首成员类型>, [M x i8] } 常量，
+	// 指针/聚合重定位因此可表达（旧表征只能给字节，遇非空指针落全零）。
 	llvm::Constant *fold_union_slot(llvm::StructType *sty, const ExprPtr &e)
 	{
-		llvm::Type *body = sty->getNumElements() == 1 ? sty->getElementType(0) : nullptr;
-		auto *arr = body && body->isArrayTy() ? llvm::cast<llvm::ArrayType>(body) : nullptr;
 		std::string tag = sty->hasName()
 			? std::string(llvm::StringRef(sty->getName()).drop_front(7)) // 去 "struct." 前缀
 			: std::string();
-		if (!arr || tag.empty())
-			return llvm::ConstantStruct::get(sty, llvm::Constant::getNullValue(body ? body : arr));
+		if (tag.empty() || sty->getNumElements() == 0)
+			return llvm::Constant::getNullValue(sty);
 		auto sd = struct_defs_.find(tag);
 		if (sd == struct_defs_.end() || sd->second->members.empty())
-			return llvm::ConstantStruct::get(sty, llvm::Constant::getNullValue(arr));
+			return llvm::Constant::getNullValue(sty);
 		// 指定初始化器（P238）：union 宿主的成员指定符必须落到**被指定**的成员（§6.7.9p12：
 		// 「用设计符指定成员时初始化该成员」）。旧实现无条件取 args[0] 折进 members[0] ——
 		// `union { int i; long long q; } g = { .q = 0x1122334455667788 }` 被截成 32 位写进 i，
@@ -2365,10 +2622,10 @@ struct CodeGenImpl
 				mc = fold_global_init(item, fmt);
 			}
 		}
-		return union_body_const(sty, mc);
+		return union_body_const(sty, mc, fmt);
 	}
 
-	// 目标 struct 是否为 union 包装（colang union 表征 = 具名 struct 包 [N x i8]）。
+	// 目标 struct 是否为 union 包装（colang union = 具名 struct 包 { <首成员类型>, [M x i8] }）。
 	bool is_union_struct(llvm::StructType *sty)
 	{
 		if (!sty || !sty->hasName()) return false;
@@ -2378,7 +2635,7 @@ struct CodeGenImpl
 		return sd != struct_defs_.end() && sd->second->is_union;
 	}
 
-	// 由 LLVM 类型反查 union 的 CType（union 表征 = 具名 struct 包 [N x i8]）。
+	// 由 LLVM 类型反查 union 的 CType（colang union = 具名 struct 包 { <首成员类型>, [M x i8] }）。
 	// 嵌套初始化器递归时用于传递上下文：缺了它，union 载荷字节数组会被当成真实
 	// [N x i8] 数组逐字节初始化（指针/聚合成员全写 0，CTS 0054_0008 运行期访问冲突）。
 	CTypePtr union_ctype_of(llvm::Type *ty)
@@ -2425,7 +2682,7 @@ struct CodeGenImpl
 				llvm::Type *fmt = (usd != struct_defs_.end() && !usd->second->members.empty())
 					? to_llvm_alloca_type(usd->second->members[0].type) : nullptr;
 				if (fmt && fmt->isAggregateType() && args[pos] && args[pos]->kind != ExprKind::InitList)
-					return union_body_const(sty, elide_fold(fmt, args, pos));
+					return union_body_const(sty, elide_fold(fmt, args, pos), fmt);
 				ExprPtr it = args[pos++];
 				return fold_global_init(it, sty);
 			}
@@ -2572,15 +2829,19 @@ struct CodeGenImpl
 			return llvm::ConstantArray::get(aty, elems);
 		}
 		auto *sty = llvm::dyn_cast<llvm::StructType>(ty);
-		if (!sty) return nullptr;
+		if (!sty || !sty->isSized()) return nullptr;
 		std::string tag = tag_for_struct(sty);
 		auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
 		if (dit == struct_defs_.end() || st.idx >= dit->second->members.size()) return nullptr;
 		llvm::Constant *inner = wrap_path_const(
 			to_llvm_alloca_type(dit->second->members[st.idx].type), path, lvl + 1, leaf);
 		if (!inner) return nullptr;
-		// union 层：先按成员类型把内层包好，再摊成 [N x i8] 载荷（成员偏移恒 0）
-		if (dit->second->is_union) return union_body_const(sty, inner);
+		// union 层：按成员类型装进 { <首成员类型>, [M x i8] }（成员偏移恒 0）
+		if (dit->second->is_union)
+		{
+			llvm::Type *umt = to_llvm_alloca_type(dit->second->members[st.idx].type);
+			return union_body_const(sty, inner, umt);
+		}
 		unsigned slot = static_cast<unsigned>(struct_member_ll_index(sty, st.idx));
 		if (slot >= sty->getNumElements()) return nullptr;
 		std::vector<llvm::Constant *> elems(sty->getNumElements(), nullptr);
@@ -2751,7 +3012,7 @@ struct CodeGenImpl
 			return llvm::ConstantArray::get(aty, elems);
 		}
 		auto *sty = llvm::dyn_cast<llvm::StructType>(ty);
-		if (!sty) return base;
+		if (!sty || !sty->isSized()) return base;
 		std::string tag = tag_for_struct(sty);
 		auto dit = tag.empty() ? struct_defs_.end() : struct_defs_.find(tag);
 		if (dit == struct_defs_.end() || st.idx >= dit->second->members.size()) return base;
@@ -2760,7 +3021,7 @@ struct CodeGenImpl
 		if (dit->second->is_union)
 		{
 			llvm::Constant *inner = merge_path_const(mt, path, lvl + 1, nullptr, leaf);
-			return inner ? union_body_const(sty, inner) : base;
+			return inner ? union_body_const(sty, inner, mt) : base;
 		}
 		unsigned slot = static_cast<unsigned>(struct_member_ll_index(sty, st.idx));
 		if (slot >= sty->getNumElements()) return base;
@@ -3420,7 +3681,8 @@ struct CodeGenImpl
 						llvm::Constant *c0 = lt ? fold_global_init(se, lt) : nullptr;
 						llvm::Constant *cv = c0 ? wrap_path_const(mt, path, 1, c0) : nullptr;
 						if (!cv) return false;
-						elems[slot] = cv;
+						// union：槽 0 承载首成员类型，成员值须经 union_body_const 重解释后入槽
+						elems[slot] = gsd->second->is_union ? union_body_const(sty, cv, mt) : cv;
 						root = path[0].idx;
 						return true;
 					};
@@ -3512,7 +3774,12 @@ struct CodeGenImpl
 							std::size_t slot = gsd->second->is_union ? 0 : struct_member_ll_index(sty, tgt[0].idx);
 							llvm::Type *mt = to_llvm_alloca_type(gsd->second->members[tgt[0].idx].type);
 							if (mt && slot < elems.size())
-								elems[slot] = merge_path_const(mt, tgt, 1, elems[slot], c0);
+							{
+								// union：从 union 层（lvl 0）合并，base 是 union 常量而非成员值
+								elems[slot] = gsd->second->is_union
+									? merge_path_const(sty, tgt, 0, elems[slot], c0)
+									: merge_path_const(mt, tgt, 1, elems[slot], c0);
+							}
 							pos = tgt[0].idx + 1;
 						}
 						std::vector<PhysStep> nx;
@@ -3537,7 +3804,7 @@ struct CodeGenImpl
 							llvm::Constant *cv = c0 ? wrap_path_const(mt, path, 1, c0) : nullptr;
 							if (cv)
 							{
-								elems[slot] = cv;
+								elems[slot] = gsd->second->is_union ? union_body_const(sty, cv, mt) : cv;
 								pos = path[0].idx + 1;
 								std::vector<PhysStep> nx;
 								cur_on = phys_next_path(sty, path, nx); // P239：游标接在该路径之后
@@ -3556,7 +3823,9 @@ struct CodeGenImpl
 						CTypePtr mt = (cpath[0] < psd->members.size()) ? psd->members[cpath[0]].type : nullptr;
 						std::size_t slot = psd->is_union ? 0 : struct_member_ll_index(sty, cpath[0]);
 						llvm::Constant *cv = mt ? build_desig_const(mt->tag, cpath, 1, se) : nullptr;
-						if (cv && slot < elems.size()) elems[slot] = cv;
+						if (cv && slot < elems.size())
+							elems[slot] = psd->is_union
+								? union_body_const(sty, cv, to_llvm_alloca_type(mt)) : cv;
 						pos = cpath[0] + 1;
 						// P239：游标接在「匿名聚合全链之后」；`.hi` 之后无可续成员时逐层上溯
 						{
@@ -3725,10 +3994,12 @@ struct CodeGenImpl
 		case_label_bb_.clear();
 		pending_gotos_.clear();
 		label_rc_depth_.clear();
+		label_vla_depth_.clear();
 		cur_class_tag_.clear(); // 普通 C 函数无类上下文
 		cur_this_ = nullptr;
 		rc_frames_.clear();
 		rc_frames_.emplace_back(); // 函数级 RC 帧
+		vla_frames_.assign(1, nullptr); // 函数级 VLA 帧
 		borrowed_slots_.clear(); // P300 借用形参集合按函数重置
 		llvm::BasicBlock *entry = llvm::BasicBlock::Create(ctx, "entry", F);
 		builder.SetInsertPoint(entry);
@@ -3751,7 +4022,14 @@ struct CodeGenImpl
 					// 并从入参指针 memcpy（手动 byval），与局部 struct Decl 路径(to_llvm_alloca_type)一致。
 					llvm::Type *sty = to_llvm_alloca_type(pty);
 					al = builder.CreateAlloca(sty, nullptr, fn.params[i].name.c_str());
-					emit_memcpy(al, argval, module->getDataLayout().getTypeAllocSize(sty));
+					if (win64_abi_ && argval->getType()->isIntegerTy())
+						// P352：win64 尺寸∈{1,2,4,8} 聚合体形参 ABI 降为整数标量，入参 argval 即该整数。
+						//   opaque 指针下直接以等宽整数 store 进 struct alloca（字节布局与聚合体一致）。
+						builder.CreateStore(argval, al);
+					else
+						// 非 win64、或 win64 >8 聚合体（按参考传、入参为指针）：手动 memcpy byval
+						//（plct 00204 SysV 路径零改动）。
+						emit_memcpy(al, argval, module->getDataLayout().getTypeAllocSize(sty));
 				}
 				else
 				{
@@ -3771,7 +4049,10 @@ struct CodeGenImpl
 		gen_stmt(fn.body, F);
 		// P300 Co class：正常落点退出函数→释放本函数所有 RC 帧（Return 语句已就地释放）。
 		if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
+		{
 			release_all_rc();
+			vla_restore_emit(0);
+		}
 		// 当前插入点无终止则补 ret
 		// 注：用 getNullValue 而非 ConstantInt::get——返回类型为 ptr（struct 值建模）
 		// 或浮点时 ConstantInt::get 会造出非法常量（`ret i0 0`）触发 verifier 报错；
@@ -3963,8 +4244,10 @@ struct CodeGenImpl
 		case_label_bb_.clear();
 		pending_gotos_.clear();
 		label_rc_depth_.clear();
+		label_vla_depth_.clear();
 		rc_frames_.clear();
 		rc_frames_.emplace_back(); // 函数级帧
+		vla_frames_.assign(1, nullptr); // 函数级 VLA 帧
 		borrowed_slots_.clear(); // P300 借用形参集合按方法重置
 		llvm::BasicBlock *entry = llvm::BasicBlock::Create(ctx, "entry", F);
 		builder.SetInsertPoint(entry);
@@ -4010,7 +4293,10 @@ struct CodeGenImpl
 		// 正常落点出函数：释放本函数所有 RC 帧（由内向外、逆序）
 		llvm::BasicBlock *cur = builder.GetInsertBlock();
 		if (cur && (cur->empty() || !cur->back().isTerminator()))
+		{
 			release_all_rc();
+			vla_restore_emit(0);
+		}
 		cur = builder.GetInsertBlock();
 		if (cur->empty() || !cur->back().isTerminator())
 		{
@@ -4052,6 +4338,31 @@ struct CodeGenImpl
 	}
 
 	void release_all_rc() { release_rc_frames(0); }
+
+	// P348 VLA 栈回退：llvm.stacksave / llvm.stackrestore 声明。
+	//   LLVM 23 起二者为 anyptr 重载（Intrinsics.td: int_stacksave / int_stackrestore），
+	//   API 亦由 getDeclaration 改名 getOrInsertDeclaration，须显式给指针重载类型。
+	llvm::Function *stacksave_decl()
+	{
+		return llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::stacksave,
+			{llvm::PointerType::getUnqual(ctx)});
+	}
+
+	llvm::Function *stackrestore_decl()
+	{
+		return llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::stackrestore,
+			{llvm::PointerType::getUnqual(ctx)});
+	}
+
+	// 回退指定深度以上所有 VLA 帧的栈（由内向外、多次 restore 逐层回到目标深度）。
+	//   语义同 release_rc_frames_emit：仅发射 restore，不弹 C++ 帧栈——直落的兄弟路径
+	//   仍需见到那些帧存活，出域逻辑自行负责 pop。
+	void vla_restore_emit(std::size_t target_depth)
+	{
+		for (std::size_t d = vla_frames_.size(); d-- > target_depth;)
+			if (vla_frames_[d])
+				builder.CreateCall(stackrestore_decl(), {vla_frames_[d]});
+	}
 
 	// 仅发射 release 调用（不弹 C++ 帧栈）：供 return/break/continue 等「路径终结」使用。
 	//   这些语句只终结当前 IR 路径，直落的兄弟路径仍需见到那些槽存活；若在此弹栈会
@@ -4961,7 +5272,7 @@ struct CodeGenImpl
 			: build_desig_const(m.type ? m.type->tag : std::string(), cpath, lvl + 1, e);
 		if (!val) return nullptr;
 		llvm::StructType *sty = get_struct_type(tag);
-		if (sd->is_union) return union_body_const(sty, val);
+		if (sd->is_union) return union_body_const(sty, val, to_llvm_alloca_type(m.type));
 		std::vector<llvm::Constant *> elems(sty->getNumElements(), nullptr);
 		for (std::size_t i = 0; i < sty->getNumElements(); ++i)
 			elems[i] = llvm::Constant::getNullValue(sty->getElementType(i));
@@ -5028,7 +5339,9 @@ struct CodeGenImpl
 				auto saved_types = var_types_;
 				// P300 Co class：块作用域进一帧，出域按逆序 release（仅当本帧仍存活且当前块未终止）。
 				const std::size_t rc_depth0 = rc_frames_.size();
+				const std::size_t vla_depth0 = vla_frames_.size();
 				rc_frames_.emplace_back();
+				vla_frames_.emplace_back(nullptr); // P348：本块 VLA 帧（块内无 VLA 时始终为 nullptr）
 				for (const auto &inner : s->body)
 					gen_stmt(inner, F);
 				if (rc_frames_.size() > rc_depth0)
@@ -5041,6 +5354,15 @@ struct CodeGenImpl
 						for (auto rit = fr.rbegin(); rit != fr.rend(); ++rit) rc_release_slot(*rit);
 					}
 					rc_frames_.pop_back();
+				}
+				// P348：出块前回退本块的 VLA 栈（放在 RC release 之后——release 求值时 VLA 仍有效）。
+				if (vla_frames_.size() > vla_depth0)
+				{
+					llvm::BasicBlock *cur = builder.GetInsertBlock();
+					const bool live = cur && (cur->empty() || !cur->back().isTerminator());
+					if (live && vla_frames_.back())
+						builder.CreateCall(stackrestore_decl(), {vla_frames_.back()});
+					vla_frames_.pop_back();
 				}
 				vars_ = std::move(saved_vars);
 				var_types_ = std::move(saved_types);
@@ -5068,28 +5390,35 @@ struct CodeGenImpl
 					{
 						gen_expr(s->expr);
 						release_rc_frames_emit(0);
+						vla_restore_emit(0); // P348：返回前回退所有 VLA 帧
 						builder.CreateRetVoid();
 						break;
 					}
 				}
 				llvm::Value *rv = gen_expr(s->expr);
 				llvm::Type *rt = F->getReturnType();
-				// 返回値隐式转换到函数返回类型（C §6.8.7.5）；聚合/void 不转
-				if (rv->getType() != rt && !rt->isVoidTy() &&
-					!rt->isStructTy() && !rt->isArrayTy())
+				// 返回値隐式转换到函数返回类型（C §6.8.7.5）；void 不转。
+				//   P352：win64 下 rt 可为 first-class 聚合体（struct/array），而 colang 表达式值恒为
+				//   存储指针——交由 convert_value 新增的「ptr→聚合体 load」分支取回聚合值；非 win64
+				//   rt 恒为 ptr（旧降法），rv 亦 ptr，类型相等即不转。旧代码此处排除 struct/array 乃
+				//   因彼时 rt 从不为聚合体（现已会），故放开排除、统一由 convert_value 兜底。
+				if (rv->getType() != rt && !rt->isVoidTy())
 					rv = convert_value(rv, rt, get_expr_ctype(s->expr));
 				release_rc_frames_emit(0); // P300 Co class：返回路径仅发射释放、不弹 C++ 栈
+vla_restore_emit(0);       // P348：返回前回退所有 VLA 帧（与 clang 同位置：restore 紧邻 ret）
 				builder.CreateRet(rv);
 			}
 			else if (in_synthesized_main_body_)
 			{
 				// P211：顶层裸 `return;` 无回返値 → 合成 main 以退出码 0 返回（i32 ret void 会 verifier 失败）
 				release_rc_frames_emit(0); // P300 Co class：顶层裸 return 路径仅发射释放
+vla_restore_emit(0);       // P348：同上
 				builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0));
 			}
 			else
 			{
 				release_rc_frames_emit(0); // P300 Co class：void 返回路径仅发射释放、不弹栈
+vla_restore_emit(0);       // P348：同上
 				builder.CreateRetVoid();
 			}
 			break;
@@ -5206,6 +5535,10 @@ struct CodeGenImpl
 				if (is_vla)
 				{
 					// VLA 留在声明点：count 操作数必须支配使用点，提升 entry 会错化尺寸与生命周期。
+					// P348：同一位置先插 llvm.stacksave（每层只存一个，块内多 VLA 复用同一 save 点），
+					//   与 clang 生成的 save 位置一致；无 VLA 的块 IR 逐字不变。
+					if (!vla_frames_.empty() && vla_frames_.back() == nullptr)
+						vla_frames_.back() = builder.CreateCall(stacksave_decl());
 					addr = builder.CreateAlloca(vla_elem_ty, vla_n, s->var_name.c_str());
 					if (auto a = obj_align(s->var_type, vla_elem_ty, s->var_align))
 						llvm::cast<llvm::AllocaInst>(addr)->setAlignment(*a);
@@ -5355,7 +5688,7 @@ struct CodeGenImpl
 			llvm::Value *cond = gen_cond(s->expr);
 			builder.CreateCondBr(cond, body_bb, end_bb);
 			builder.SetInsertPoint(body_bb);
-			loop_stack_.push_back({end_bb, cond_bb, rc_frames_.size()});
+			loop_stack_.push_back({end_bb, cond_bb, rc_frames_.size(), vla_frames_.size(), vla_frames_.size()});
 			gen_stmt(s->then_branch, F);
 			loop_stack_.pop_back();
 			if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
@@ -5370,7 +5703,7 @@ struct CodeGenImpl
 			llvm::BasicBlock *end_bb = llvm::BasicBlock::Create(ctx, "do.end", F);
 			builder.CreateBr(body_bb);
 			builder.SetInsertPoint(body_bb);
-			loop_stack_.push_back({end_bb, cond_bb, rc_frames_.size()});
+			loop_stack_.push_back({end_bb, cond_bb, rc_frames_.size(), vla_frames_.size(), vla_frames_.size()});
 			gen_stmt(s->then_branch, F);
 			loop_stack_.pop_back();
 			if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
@@ -5400,7 +5733,7 @@ struct CodeGenImpl
 			else
 				builder.CreateBr(body_bb); // 无 cond = 始终为真
 			builder.SetInsertPoint(body_bb);
-			loop_stack_.push_back({end_bb, incr_bb, rc_frames_.size()});
+			loop_stack_.push_back({end_bb, incr_bb, rc_frames_.size(), vla_frames_.size(), vla_frames_.size()});
 			gen_stmt(s->then_branch, F);
 			loop_stack_.pop_back();
 			if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
@@ -5419,6 +5752,7 @@ struct CodeGenImpl
 				// P300：break 仅终结当前 IR 路径，先按目标帧深度发射 release（不弹 C++ 栈，
 				//   块出域仍负责 pop），再 br 到出口，修循环体句柄泄漏（补 §5.5）。
 				release_rc_frames_emit(loop_stack_.back().rc_depth);
+				vla_restore_emit(loop_stack_.back().vla_depth); // P348：break 退出嵌套块时回退 VLA 栈
 				if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
 					builder.CreateBr(loop_stack_.back().break_target);
 			}
@@ -5433,6 +5767,7 @@ struct CodeGenImpl
 			{
 				// P300：continue 进入下一迭代 = 退出本轮块作用域，发射释放循环体帧（不弹栈）。
 				release_rc_frames_emit(loop_stack_.back().rc_depth);
+				vla_restore_emit(loop_stack_.back().vla_continue_depth); // P348：continue = 退出本轮块，回退 VLA 栈
 				if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
 					builder.CreateBr(loop_stack_.back().continue_target);
 			}
@@ -5450,6 +5785,8 @@ struct CodeGenImpl
 			//   兜底——goto 跨入声明点的形态本批按方案风险项#4 不支持。
 			if (auto ld = label_rc_depth_.find(s->label_name); ld != label_rc_depth_.end())
 				release_rc_frames_emit(ld->second);
+			if (auto lv = label_vla_depth_.find(s->label_name); lv != label_vla_depth_.end())
+				vla_restore_emit(lv->second); // P348：goto 跳越块作用域时回退 VLA 栈
 			llvm::BasicBlock *&target = label_blocks_[s->label_name];
 			if (!target)
 				target = llvm::BasicBlock::Create(ctx, ("label." + s->label_name).c_str(), F);
@@ -5473,6 +5810,7 @@ struct CodeGenImpl
 				builder.CreateBr(lbl_bb);
 			builder.SetInsertPoint(lbl_bb);
 			label_rc_depth_[s->label_name] = rc_frames_.size(); // P300：记录标签处 RC 帧深度，供 goto 释放
+			label_vla_depth_[s->label_name] = vla_frames_.size(); // P348：同上，供 goto 回退 VLA 栈
 			if (s->then_branch)
 				gen_stmt(s->then_branch, F);
 			break;
@@ -5529,15 +5867,17 @@ struct CodeGenImpl
 		// continue 不是迭代语句（§6.8.6.2p2），switch 帧须继承最近外层循环的 continue 目标，
 		// 否则 switch 内的 continue 无处跳转，当前块会缺终止符触发 verifier 报错。
 		llvm::BasicBlock *cont_target = nullptr;
+		std::size_t cont_vla_depth = 0;
 		for (auto it = loop_stack_.rbegin(); it != loop_stack_.rend(); ++it)
 		{
 			if (it->continue_target)
 			{
 				cont_target = it->continue_target;
+				cont_vla_depth = it->vla_depth; // P348：switch 内 continue 须回退到该循环体外
 				break;
 			}
 		}
-		loop_stack_.push_back({switch_end, cont_target, rc_frames_.size()});
+		loop_stack_.push_back({switch_end, cont_target, rc_frames_.size(), vla_frames_.size(), cont_vla_depth});
 		// 体内按源码顺序线性发射；Case/Default 经 gen_stmt 的 label 分支重定向到各自 BB。
 		// 前导非 case 语句落进此 entry（C 语义本就不可达，属合法不可达块，-O 后清除）。
 		llvm::BasicBlock *entry = llvm::BasicBlock::Create(ctx, "switch.body", F);
@@ -5647,6 +5987,13 @@ struct CodeGenImpl
 	{
 		llvm::Type *from = v->getType();
 		if (from == target) return v;
+		// P352：win64 按值聚合体 ABI——colang 的 struct/union 表达式值恒为指向存储的指针，
+		//   而 winx64 把尺寸∈{1,2,4,8} 的按值聚合体降为整数标量传/返。此处 src_t 为 struct/union
+		//   且目标为整数时，从存储指针整块 load 出等宽整数（与 clang 将聚合体 bitcast 为整数同效）。
+		//   须经此于「ptr→非ptr 标量」分支之前，否则下方 CreatePtrToInt 会把地址当值传。
+		if (win64_abi_ && from->isPointerTy() && target->isIntegerTy() && src_t &&
+			(src_t->kind == TypeKind::Struct || src_t->kind == TypeKind::Union))
+			return builder.CreateLoad(target, v);
 		if (from->isPointerTy() && !target->isPointerTy())
 		{
 			// P327：指针 → _Bool(i1) 按 C 6.3.1.2「非空即真」，与 gen_cond 同源发 icmp ne null。
@@ -5744,6 +6091,30 @@ struct CodeGenImpl
 			for (unsigned i = n; i < args.size(); ++i)
 				args[i] = default_arg_promote(args[i],
 					i < arg_cts.size() ? arg_cts[i] : nullptr);
+	}
+
+	// P352：win64 下若逻辑返回类型为尺寸∈{1,2,4,8} 的 struct/union，ABI 返回为整数标量；
+	//   colang 需将该整数回填至 entry 块新建 alloca（等宽）、返回该 alloca 指针，以守住
+	//   colang「struct/union 表达式值 = 指向存储的指针」不变量。其余情形（非 win64、非聚合体返回、
+	//   >8 聚合体 ABI 返回本即 ptr）原样透传。
+	llvm::Value *finalize_call_result(const CTypePtr &ret_ct, llvm::Value *call)
+	{
+		if (!win64_abi_ || !ret_ct)
+			return call;
+		if (ret_ct->kind != TypeKind::Struct && ret_ct->kind != TypeKind::Union)
+			return call;
+		llvm::Type *it = call->getType();
+		if (!it->isIntegerTy())
+			return call;   // >8 聚合体 ABI 返回为 ptr（旧口径），无需回填
+		llvm::BasicBlock *cur_bb = builder.GetInsertBlock();
+		llvm::Function *F = cur_bb->getParent();
+		llvm::BasicBlock::iterator saved_ip = builder.GetInsertPoint();
+		llvm::BasicBlock &EB = F->getEntryBlock();
+		builder.SetInsertPoint(&EB, EB.begin());
+		llvm::Value *al = builder.CreateAlloca(it, nullptr, "p352.retval");
+		builder.SetInsertPoint(cur_bb, saved_ip);
+		builder.CreateStore(call, al);
+		return al;
 	}
 
 	llvm::Value *gen_expr(const ExprPtr &e)
@@ -6432,7 +6803,7 @@ struct CodeGenImpl
 						{
 							coerce_call_args(callee->getFunctionType(), cargs, ccts);
 							llvm::Value *r = builder.CreateCall(callee, cargs);
-							return r;
+							return finalize_call_result(get_expr_ctype(e), r);
 						}
 					}
 				}
@@ -6443,7 +6814,7 @@ struct CodeGenImpl
 				llvm::Function *callee = qualified_func_ref(e->lhs->q_func);
 				llvm::FunctionType *ft = callee->getFunctionType();
 				coerce_call_args(ft, args, arg_cts);
-				return builder.CreateCall(callee, args);
+				return finalize_call_result(get_expr_ctype(e), builder.CreateCall(callee, args));
 			}
 			// 纯间接调用：callee 是表达式（如 (*fp)(...) 或 funcs[i](...) ）
 			if (e->lhs)
@@ -6451,7 +6822,7 @@ struct CodeGenImpl
 				llvm::Value *fp = gen_expr(e->lhs);
 				llvm::FunctionType *ft = infer_call_ft(e);
 				coerce_call_args(ft, args, arg_cts);
-				return builder.CreateCall(ft, fp, args);
+				return finalize_call_result(get_expr_ctype(e), builder.CreateCall(ft, fp, args));
 			}
 			// 命名调用：先查本地变量（函数指针），再查全局，最后查函数
 			if (!e->name.empty())
@@ -6466,7 +6837,7 @@ struct CodeGenImpl
 						llvm::Value *fp = builder.CreateLoad(vt, vit->second);
 						llvm::FunctionType *ft = infer_call_ft(e);
 						coerce_call_args(ft, args, arg_cts);
-						return builder.CreateCall(ft, fp, args);
+						return finalize_call_result(get_expr_ctype(e), builder.CreateCall(ft, fp, args));
 					}
 				}
 				// 全局变量（函数指针）
@@ -6478,7 +6849,7 @@ struct CodeGenImpl
 						llvm::Value *fp = builder.CreateLoad(llvm::PointerType::getUnqual(ctx), gv);
 						llvm::FunctionType *ft = infer_call_ft(e);
 						coerce_call_args(ft, args, arg_cts);
-						return builder.CreateCall(ft, fp, args);
+						return finalize_call_result(get_expr_ctype(e), builder.CreateCall(ft, fp, args));
 					}
 				}
 				// 直接函数调用
@@ -6527,9 +6898,9 @@ struct CodeGenImpl
 						std::vector<llvm::Type *> atys;
 						for (auto *a : args) atys.push_back(a->getType());
 						llvm::FunctionType *cft = llvm::FunctionType::get(ft->getReturnType(), atys, false);
-						return builder.CreateCall(cft, callee, args);
+						return finalize_call_result(get_expr_ctype(e), builder.CreateCall(cft, callee, args));
 					}
-					return builder.CreateCall(callee, args);
+					return finalize_call_result(get_expr_ctype(e), builder.CreateCall(callee, args));
 				}
 				// 未声明的函数：按 C 语言实现「隐式函数声明」（§6.5.2.2p4 + §6.3.1.1/.1.2，
 				// C89/C99 规则；C23 已移除，本项目按用户决策实现之）：

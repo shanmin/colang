@@ -12,7 +12,9 @@
 
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -46,6 +48,9 @@ struct Parser
 	std::unordered_map<std::string, std::int64_t> enum_constants_;
 	// P232 Co 层：enum 标签名集合（供「省去 enum 关键字」按名作类型）。仅 .co（co_mode_）启用。
 	std::unordered_set<std::string> enum_tag_names_;
+	// P337：仅**前置声明**带 GNU aligned 的 enum（`enum __attribute__((aligned(8))) EF;`）：
+	//   前置声明不造 EnumDef 登记项（保持既有行为），在此暂存对齐，待真定义时并入。
+	std::unordered_map<std::string, unsigned> enum_fwd_align_;
 	// P232 Co 层：源文件是否为 .co「新面」。为 false（纯 C 档 / .c）时，裸 struct/union/enum
 	//   标签名**不**被视为类型起始（is_type_start / 声明解析逐字同改前），C 语言零影响由结构坐实。
 	bool co_mode_ = false;
@@ -56,6 +61,204 @@ struct Parser
 	{
 		return f.size() >= 3 &&
 			(f.compare(f.size() - 3, 3, ".co") == 0 || f.compare(f.size() - 3, 3, ".CO") == 0);
+	}
+	// ADR-106（路线 B）：`long` 的宽度由**声明所在源文件的后缀**逐文件判定——`.co`/`.CO` 内
+	//   `long`/`unsigned long` 恒 8 字节（定型为 `LongLong`，宽度模型与 `to_llvm_type` 全部零改动），
+	//   `.h`/`.c` 及其它一切来源恒 target 原生（Windows 4 / Linux 8）。
+	//   判定按 **token 自身的 `loc.file`**、不用 TU 级 `co_mode_`：`.co` 主源 `#include` 的头文件
+	//   内容按被包含文件口径取值，宏展开出的 `long`/`L` 字面量按调用点口径（preproc 把宏体 token
+	//   的 loc 改写成调用点）。
+	static TypeKind long_kind(const std::string &file)
+	{
+		return is_co_source_file(file) ? TypeKind::LongLong : TypeKind::Long;
+	}
+	// C §6.4.5 字面量扫描（诊断符合性 + 崩溃防线）。pp-number 文法容许数字后接任意标识符字符，
+	//   旧实现把整串直交 std::stod/stoull：尾随杂字符被**静默丢弃**（`1w`→int 1、`1.0z`→1.0、
+	//   `08`→0、`0b`→0），且 `0x`/超宽常量会令 stoull/stod 抛未捕获异常（0xC0000409 零诊断崩溃，
+	//   取证 _tmp/sc_crash.log）。判据、句式、caret 落点逐条对齐本机 clang 23.1.0，实现照 clang
+	//   clang/lib/Lex/LiteralSupport.cpp `NumericLiteralParser` 的**结构与顺序**改写：
+	//     * 前缀 0x/0b/0o **仅在后随本进制合法数字时**才吃掉（clang 1390/1457/1490 行三处条件），
+	//       否则退回「0 起头八进制」，使 `0x`→invalid suffix 'x'、`0b`→invalid digit 'b' in octal、
+	//       `0o8`→invalid suffix 'o8' 各落 clang 同款判据。
+	//     * invalid digit 只在**整数位数字串结束处**判一次（clang 1289 行），且判据是 `isHexDigit`
+	//       并排除 e/E（`.` 不参与）——故 `1b`/`1f`/`1d` 报 invalid digit，而 `1.0f`/`1.0ff` 走后缀、
+	//       `1g` 走 invalid suffix。十六进制路径根本不判 invalid digit。
+	//     * `0` 起头后跟 8/9 时，clang 先看是否 `.`/`e`/`E` 而改判十进制浮点（1552-1560 行），
+	//       故 `08.5`、`09e1` 是**合法浮点**而非 invalid digit，此处一并照搬。
+	//     * 浮点与否由扫描**导出**（saw_period/saw_exponent），不靠 token 文本猜，避免 `1.f` 误杀。
+	struct NumScan
+	{
+		std::size_t dend = 0;      // 数字段终点（= 后缀起点）
+		int base = 10;             // 数字段进制
+		bool is_fp = false;        // 浮点常量（clang isFloatingLiteral）
+		char bad_digit = 0;        // clang err_invalid_digit 的字符
+		std::string base_name = "decimal"; // decimal / octal / binary（供拼写）
+		bool bad_exponent = false; // clang err_exponent_has_no_digits
+		std::size_t exp_off = 0;   // 指数标记 e/E/p/P 的下标，caret 落此
+		bool hex_no_exp = false;   // 带小数点却无 p/P（clang: hexadecimal floating constant requires an exponent）
+		bool hex_no_sig = false;   // 有效位数字全空（clang: … requires a significand）
+	};
+	static NumScan scan_numeric_literal(const std::string &s)
+	{
+		NumScan r;
+		const std::size_t n = s.size();
+		auto is_hex_digit = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); };
+		auto dec = [](char c) { return c >= '0' && c <= '9'; };
+		auto skip = [&](std::size_t i, int lim) {
+			while (i < n && (lim == 16 ? is_hex_digit(s[i]) : lim == 8 ? (s[i] >= '0' && s[i] <= '7') :
+					lim == 2 ? (s[i] == '0' || s[i] == '1') : dec(s[i]))) ++i;
+			return i;
+		};
+		std::size_t i = 0;
+		if (n > 1 && s[0] == '0')
+		{
+			const char c1 = s[1];
+			const char c2 = n > 2 ? s[2] : '\0';
+			if ((c1 == 'x' || c1 == 'X') && (is_hex_digit(c2) || c2 == '.'))
+			{	// 十六进制：digits [. digits] [p/P [+/-] digits]；此路 clang 不判 invalid digit
+				r.base = 16;
+				const std::size_t sig0 = 2;
+				i = skip(2, 16);
+				bool has_sig = i > sig0;
+				if (i < n && s[i] == '.')
+				{
+					r.is_fp = true;
+					const std::size_t f0 = i + 1;
+					i = skip(f0, 16);
+					if (i > f0) has_sig = true;
+				}
+				if (!has_sig) { r.hex_no_sig = true; r.dend = i; return r; } // clang 1410-1417
+				if (i < n && (s[i] == 'p' || s[i] == 'P'))
+				{
+					r.exp_off = i;
+					std::size_t j = i + 1;
+					if (j < n && (s[j] == '+' || s[j] == '-')) ++j;
+					const std::size_t d0 = j;
+					j = skip(j, 10);
+					if (j == d0) { r.bad_exponent = true; r.dend = r.exp_off; return r; }
+					r.is_fp = true;
+					i = j;
+				}
+				else if (r.is_fp) { r.hex_no_exp = true; r.dend = i; return r; } // clang 1446-1452
+				r.dend = i;
+				return r;
+			}
+			if ((c1 == 'b' || c1 == 'B') && (c2 == '0' || c2 == '1'))
+			{	// 二进制：数字串后凡 hex digit 一律 invalid digit（clang 1476 行，不排除 e/E/.）
+				r.base = 2; r.base_name = "binary";
+				i = skip(2, 2);
+				if (i < n && is_hex_digit(s[i])) r.bad_digit = s[i];
+				r.dend = i;
+				return r;
+			}
+			if ((c1 == 'o' || c1 == 'O') && c2 >= '0' && c2 <= '7')
+			{	// 0o 前缀：clang 1513 行判 invalid digit，排除 e/E/.；不处理小数与指数
+				r.base = 8; r.base_name = "octal";
+				i = skip(2, 8);
+				if (i < n && is_hex_digit(s[i]) && s[i] != 'e' && s[i] != 'E' && s[i] != '.') r.bad_digit = s[i];
+				r.dend = i;
+				return r;
+			}
+			// 前导 0 旧式八进制（C23 仍保留）。clang 1540-1560：若 8/9 之后紧跟 . e E，则整体改判十进制浮点。
+			r.base = 8; r.base_name = "octal";
+			i = skip(1, 8);
+			if (i < n && dec(s[i]))
+			{
+				const std::size_t j = skip(i, 10);
+				if (j < n && (s[j] == '.' || s[j] == 'e' || s[j] == 'E')) { i = j; r.base = 10; r.base_name = "decimal"; }
+			}
+		}
+		else
+		{
+			r.base = 10; r.base_name = "decimal";
+			i = skip(0, 10);
+		}
+		// clang ParseDecimalOrOctalCommon（1284-1328 行）：invalid digit 只在此判一次
+		if (i < n && is_hex_digit(s[i]) && s[i] != 'e' && s[i] != 'E')
+		{
+			r.bad_digit = s[i];
+			r.dend = i;
+			return r;
+		}
+		if (i < n && s[i] == '.')
+		{
+			r.base = 10; r.base_name = "decimal"; r.is_fp = true;
+			i = skip(i + 1, 10);
+		}
+		if (i < n && (s[i] == 'e' || s[i] == 'E'))
+		{
+			r.exp_off = i;
+			std::size_t j = i + 1;
+			if (j < n && (s[j] == '+' || s[j] == '-')) ++j;
+			const std::size_t d0 = j;
+			j = skip(j, 10);
+			if (j == d0) { r.bad_exponent = true; r.dend = r.exp_off; return r; }
+			r.is_fp = true;
+			i = j;
+		}
+		r.dend = i;
+		return r;
+	}
+	// 后缀状态机（clang 1045-1236 行 for/switch 的 C 档形状）。clang 在**后缀起点**整串入文，
+	//   故只回整体合法与否；u/U 不得重复、l 与 ll 互斥且须相邻同案、w 须成对 wb、f/F 仅浮点、
+	//   l/L 对浮点合法（clang 只在配到 ll 时拒浮点）。
+	//   colang 扩展（0.4.0 已发布并写进 docs）：后缀恰为 ub/UB → 无符号位精确，clang 此处报
+	//   invalid suffix 'ub'（取证 _tmp/p4_verify.log k07）——这是 colang 唯一的位精确后缀超集。
+	//   另 clang 在 C 档接受 GNU 虚部后缀 i/j（1i/1j），colang 无 _Imaginary 类型、一律拒收。
+	struct SfxScan
+	{
+		bool ok = true;
+		bool uns = false;
+		bool is_float = false;
+		bool bitint = false;
+		unsigned long_count = 0; // 0 / 1 / 2
+	};
+	static SfxScan scan_numeric_suffix(const std::string &f, bool is_fp)
+	{
+		SfxScan r;
+		const std::size_t n = f.size();
+		if (n == 2 && (f[1] == 'b' || f[1] == 'B') && (f[0] == 'u' || f[0] == 'U'))
+		{
+			r.uns = r.bitint = true;
+			return r;
+		}
+		bool has_size = false;
+		for (std::size_t i = 0; i < n; )
+		{
+			const char c = f[i];
+			if (c == 'f' || c == 'F')
+			{
+				if (!is_fp || has_size) { r.ok = false; break; }
+				has_size = true; r.is_float = true; i += 1; continue;
+			}
+			if (c == 'l' || c == 'L')
+			{
+				if (has_size) { r.ok = false; break; }
+				has_size = true;
+				if (i + 1 < n && f[i + 1] == c)
+				{
+					if (is_fp) { r.ok = false; break; }
+					r.long_count = 2; i += 2; continue;
+				}
+				r.long_count = 1; i += 1; continue;
+			}
+			if (c == 'u' || c == 'U')
+			{
+				if (is_fp || r.uns) { r.ok = false; break; }
+				r.uns = true; i += 1; continue;
+			}
+			if (c == 'w' || c == 'W')
+			{
+				// clang 只收全小写 wb 或全大写 WB（混排 wB/Wb 不收，取证 _tmp/p4_probe2.log c26）；
+				//   混排非对外文档公布拼写，此处与 clang 同口径拒收。
+				if (is_fp || has_size || i + 1 >= n) { r.ok = false; break; }
+				if (!((c == 'w' && f[i + 1] == 'b') || (c == 'W' && f[i + 1] == 'B'))) { r.ok = false; break; }
+				has_size = true; r.bitint = true; i += 2; continue;
+			}
+			r.ok = false;
+			break;
+		}
+		return r;
 	}
 	// P233 Co 层：跨模块裸标签种子（指向 driver 持有的 ImportBundle.tag_seeds，仅 .co 且非空时置位）。
 	//   parse_translation_unit 起始据此把「已导入模块的 public 标签」登记为类型种子。
@@ -89,6 +292,14 @@ struct Parser
 	SourceLoc last_alignas_loc_;  // 本声明 _Alignas 的位置（诊断指向；仅在 last_alignas_!=0 时有效）
 	SourceLoc gnu_alignas_loc_;   // GNU __attribute__((aligned)) 记录位置（脱糖并入 _Alignas 时供诊断指向）
 		unsigned gnu_decl_align_ = 0;   // GNU __attribute__((aligned)) 提升通道（本声明 aligned 最大值；0=无）：仅取 max 抬升对齐，不触发 _Alignas 约束拒收
+	// P337：GNU packed 的绑定模式。consume_gnu_attributes() 默认按「不生效 + clang 同形告警」
+	//   处理 packed（变量/typedef/函数/前缀等位点）；仅真生效位点（记录级位点2/3、字段名后）
+	//   临时切至 Bind 取回 gnu_packed_hit_。默认值选 Ignore：新增调用位点若忘记处理，退化为
+	//   显式告警而非静默错布局（P162 教训）。
+	enum class GnuPackedMode { Ignore, Bind, Silent };
+	GnuPackedMode gnu_packed_mode_ = GnuPackedMode::Ignore;
+	bool gnu_packed_hit_ = false;   // 本次 consume 是否遇到 packed（consume 入口清零）
+	SourceLoc gnu_packed_loc_;      // 首个 packed 的位置（告警/绑定指向）
 	// 本声明是否出现过 _Alignas（_Alignas(0) 不等于「未出现」：对齐值 0 表示无效果，
 	//   但属性本身仍不得用于 typedef/函数/位域等语境——与 clang 同口径）。
 	bool last_has_alignas_ = false;
@@ -296,6 +507,12 @@ struct Parser
 			sd.is_union = s.is_union;
 			sd.is_definition = false; // inert：codegen 不据此排版
 			sd.is_public = false;
+			// P343：带上导出方定义点算定的布局快照（未带则保持 0，一切读取点回落惰性推导）。
+			//   仍标 is_definition=false：codegen/sema 的「不完整」语义不变，只补常量路径所需事实。
+			sd.members = s.members;
+			sd.layout_size = s.layout_size;
+			sd.layout_align = s.layout_align;
+			sd.layout_member_off = s.layout_member_off;
 			cur_tu_->structs.push_back(std::move(sd));
 			struct_tags_[s.name] = cur_tu_->structs.size() - 1;
 		}
@@ -1174,6 +1391,8 @@ struct Parser
 	unsigned consume_gnu_attributes()
 	{
 		unsigned aligned_acc = 0;
+		gnu_packed_hit_ = false; // P337：packed 回传位入口清零（防上一声明残留）
+		bool packed_warned = false;   // 同一次消费里多个 packed 只告一次（clang 先合后再报）
 		while (check_keyword("__attribute__"))
 		{
 			const SourceLoc kw_loc = peek().loc;
@@ -1224,7 +1443,19 @@ struct Parser
 				}
 				else if (!name.empty())
 				{
-					if (gnu_is_layout_abi(name))
+					if (name == "packed")
+					{
+						// P337：packed 有真语义，生效与否由调用位点决定（见 GnuPackedMode）。
+						if (!gnu_packed_hit_) gnu_packed_loc_ = a_loc; // 诊断指向首个 packed
+						gnu_packed_hit_ = true;
+						// Silent：clang 在此位既不生效也不告警（实测 enum 前缀 packed 静默接受）。
+						if (gnu_packed_mode_ == GnuPackedMode::Ignore && !packed_warned)
+						{
+							packed_warned = true;
+							warn(a_loc, "'packed' attribute ignored"); // clang 同形（非聚合对象/typedef/函数位）
+						}
+					}
+					else if (gnu_is_layout_abi(name))
 						warn(a_loc, "gnu attribute '" + name + "' ignored: may affect layout/ABI (non-standard, GCC/Clang compatibility)");
 					else
 						warn(a_loc, "gnu attribute '" + name + "' ignored (non-standard, GCC/Clang compatibility)");
@@ -1236,6 +1467,26 @@ struct Parser
 			expect_punct(")"); // 外层 )
 		}
 		return aligned_acc;
+	}
+
+	// P337：生效位点的 GNU 属性消费——aligned 走返回值，packed 经 packed_out 回传（不发忽略告警）。
+	//   仅本函数覆盖的五个绑定位点可用（结构级位点2/3、字段名后）；其余位点继续走默认 Ignore，
+	//   由 consume_gnu_attributes() 就地发 clang 同形的「'packed' attribute ignored」。
+	unsigned consume_gnu_attributes_bind_packed(bool &packed_out)
+	{
+		gnu_packed_mode_ = GnuPackedMode::Bind;
+		const unsigned al = consume_gnu_attributes();
+		packed_out = gnu_packed_hit_;
+		gnu_packed_mode_ = GnuPackedMode::Ignore;
+		return al;
+	}
+
+	unsigned consume_gnu_attributes_silent()
+	{
+		gnu_packed_mode_ = GnuPackedMode::Silent;
+		const unsigned al = consume_gnu_attributes();
+		gnu_packed_mode_ = GnuPackedMode::Ignore;
+		return al;
 	}
 
 	// _BitInt(N) 解析（C23 任意宽度整数）
@@ -1323,6 +1574,51 @@ struct Parser
 	CTypePtr infer_auto_type(const ExprPtr &e)
 	{
 		if (!e) return make_type(TypeKind::Int);
+		// P340：§6.3.1.1 整型提升——rank < int 的整型（char/short 系）提升为 int，char32 提升为
+		//   unsigned int，浮点与更大整型原样返回。用于一元 `-`/`+`/`~` 与两侧同型的整型二元运算，
+		//   使常量折叠侧与 clang 同值（`sizeof(c + c)`/`sizeof(-c)` 皆为 4）。
+		auto promote_int = [](const CTypePtr &t) -> CTypePtr {
+			if (!t) return make_type(TypeKind::Int);
+			switch (t->kind)
+			{
+			case TypeKind::Bool: case TypeKind::Char: case TypeKind::Char8:
+			case TypeKind::Char16: case TypeKind::Short: case TypeKind::WChar:
+				return make_type(TypeKind::Int);
+			case TypeKind::Char32: // 值域 int 表不下 → 提升为 unsigned int
+				return int_ctype_of(32, true);
+			default:
+				return t;
+			}
+		};
+		// P340：§6.3.1.8 整型常用算术转换——先各自整型提升，再取 rank 高者（同 rank 则有符号合并）。
+		//   非整型返回 Int 作“未知”近似（浮点已在调用前分流、指针不受影响）。
+		auto int_rank = [](TypeKind k) -> int {
+			switch (k)
+			{
+			case TypeKind::Bool: return 0;
+			case TypeKind::Char: case TypeKind::Char8: return 1;
+			case TypeKind::Short: case TypeKind::Char16: return 2;
+			case TypeKind::Int: case TypeKind::Char32: return 3;
+			case TypeKind::Long: return 4;
+			case TypeKind::LongLong: case TypeKind::BitInt: return 5;
+			default: return -1; // 非整型（浮点 / 指针 / 记录 …）
+			}
+		};
+		auto usual_int_arith = [&promote_int, &int_rank](const CTypePtr &a, const CTypePtr &b) -> CTypePtr {
+			if (!a || !b) return make_type(TypeKind::Int);
+			CTypePtr pa = promote_int(a);
+			CTypePtr pb = promote_int(b);
+			const int ra = int_rank(pa->kind), rb = int_rank(pb->kind);
+			if (ra < 0 || rb < 0) return make_type(TypeKind::Int);
+			if (ra == rb)
+			{
+				if (!pa->is_unsigned && !pb->is_unsigned) return pa;
+				auto t = std::make_shared<CType>(*pa);
+				t->is_unsigned = true;
+				return t;
+			}
+			return ra > rb ? pa : pb;
+		};
 		// P140 M3 定向复用：叶/简单节点交共享 resolve_expr_type（复用字面量定型、
 		//   nullptr、成员查找修复）；命中即返回，null 落回下方 parser 既有近似。
 		//   刻意不委托 Binary/Unary/Call：resolve 对指针算术/va_arg/++-- abstain 或
@@ -1336,6 +1632,7 @@ struct Parser
 		case ExprKind::IntLiteral:
 		case ExprKind::CharLiteral:
 		case ExprKind::Member:
+		case ExprKind::InitList:
 		{
 			ParserAutoTypeEnv env{this};
 			if (CTypePtr t = resolve_expr_type(e, env))
@@ -1383,13 +1680,12 @@ struct Parser
 			}
 			if (e->op == "!")
 				return make_type(TypeKind::Int);
-			// 一元算术 / 位取反 / 自增自减：结果取操作数类型（整型/浮点/指针皆适用）
-			if (e->op == "-" || e->op == "+" || e->op == "~" ||
-				e->op == "++" || e->op == "--")
-			{
-				CTypePtr t = infer_auto_type(e->lhs);
-				return t ? t : make_type(TypeKind::Int);
-			}
+			// 一元算术 / 位取反：§6.3.1.1 整型提升（`sizeof(-c)`/`sizeof(~c)` clang 为 4，旧路得 1）。
+			if (e->op == "-" || e->op == "+" || e->op == "~")
+				return promote_int(infer_auto_type(e->lhs));
+			// 自增自减：结果类型 = 操作数类型（不参与整型提升）
+			if (e->op == "++" || e->op == "--")
+				return infer_auto_type(e->lhs);
 			return make_type(TypeKind::Int);
 		case ExprKind::Cast:
 			return e->type ? e->type : make_type(TypeKind::Int);
@@ -1449,21 +1745,42 @@ struct Parser
 				bool anyF = (l && l->kind == TypeKind::Float) || (r && r->kind == TypeKind::Float);
 				if (anyD) return make_type(TypeKind::Double);
 				if (anyF) return make_type(TypeKind::Float);
-				// 整型：仅两侧同型时精确取之；否则沿用既有“未知→int”近似。
-				// （完整整型提升/常用算术转换留待 sema 类型装饰单一真值源收敛，勿在此复制 codegen 格）
-				if (l && r && l->kind == r->kind && !lP) return l;
-				return make_type(TypeKind::Int);
+				// 整型：P340 补 §6.3.1.8 常用算术转换——`1 + 1LL` 旧路退成 int（得 4），
+				//   现按整型提升 + rank 高者取值（clang 为 8）。
+				return usual_int_arith(l, r);
 			}
 			if (op == "&" || op == "|" || op == "^")
-			{
-				if (l && r && l->kind == r->kind && !lP) return l;
-				return make_type(TypeKind::Int);
-			}
+				return usual_int_arith(l, r);
 			return make_type(TypeKind::Int);
 		}
 		default:
 			return make_type(TypeKind::Int);
 		}
+	}
+
+	// P339：记录布局计划（位域感知）。成员偏移：普通成员＝自身起点、位域成员＝其存储单元起点。
+	struct RecordLayout
+	{
+		int64_t size = 4;  // 记录字节数（已上取整到 align）
+		int64_t align = 1; // 记录有效对齐
+		std::vector<int64_t> member_off;
+	};
+
+	// P343：取记录布局——带快照（导出定义/跨模块种子）直接用，否则惰性推导。
+	//   快照连整张成员偏移表一并带出，故「成员里嵌了导出方内部类型」的导入记录也能一次算准。
+	RecordLayout layout_of(const StructDef &s)
+	{
+		if (s.layout_size > 0 && s.layout_member_off.size() == s.members.size())
+		{
+			RecordLayout lay;
+			lay.size = s.layout_size;
+			lay.align = s.layout_align > 0 ? s.layout_align : 1;
+			lay.member_off = s.layout_member_off;
+			return lay;
+		}
+		RecordLayout lay;
+		record_layout(s, lay);
+		return lay;
 	}
 
 	int64_t const_sizeof_type(const CTypePtr &t)
@@ -1493,33 +1810,13 @@ struct Parser
 			for (const auto &s : cur_tu_->structs)
 			{
 				if (!tag_matches(t->tag, s.tag)) continue; // P302：限定名按后缀命中
-				if (s.is_union)
-				{
-					int64_t mx = 0, al = 1;
-					for (const auto &m : s.members)
-					{
-						int64_t ms = const_sizeof_type(m.type);
-						int64_t ma = const_member_align(m);
-						if (ms > mx) mx = ms;
-						if (ma > al) al = ma;
-					}
-					if (static_cast<int64_t>(s.align) > al) al = static_cast<int64_t>(s.align);
-					if (static_cast<int64_t>(t->align) > al) al = static_cast<int64_t>(t->align);
-					int64_t r = ((mx + al - 1) / al) * al;
-					return r > 0 ? r : 4;
-				}
-				// struct：逐成员对齐填充，尾部补到最大对齐
-				int64_t off = 0, al = 1;
-				for (const auto &m : s.members)
-				{
-					int64_t ma = const_member_align(m);
-					if (ma < 1) ma = 1;
-					if (ma > al) al = ma;
-					off = ((off + ma - 1) / ma) * ma + const_sizeof_type(m.type);
-				}
-				if (static_cast<int64_t>(s.align) > al) al = static_cast<int64_t>(s.align);
+				// P339：struct/union 一律交给 record_layout（位域按存储单元建模）。旧口径逐成员按
+				//   声明类型**全额**累加，`{unsigned a:3; unsigned b:5; char c}` 的数组维得 12，
+				//   与运行期 sizeof（LLVM 体 → 8）互相矛盾。
+				RecordLayout lay = layout_of(s);
+				int64_t al = lay.align;
 				if (static_cast<int64_t>(t->align) > al) al = static_cast<int64_t>(t->align);
-				int64_t r = ((off + al - 1) / al) * al;
+				int64_t r = ((lay.size + al - 1) / al) * al;
 				return r > 0 ? r : 4;
 			}
 			return 4; // 未定义 struct/union
@@ -1529,12 +1826,169 @@ struct Parser
 		default: return 4;
 		}
 	}
-	// struct/union 成员的有效对齐：max(类型自然对齐, 成员 _Alignas)
-	int64_t const_member_align(const StructMember &m)
+	// 类型的「显式声明对齐」：只取声明里写出来的那一份（对象/成员级 _Alignas、
+	//   记录类型的 GNU __attribute__((aligned))、typedef 上的 _Alignas），
+	//   **不含**由成员自然对齐推得的对齐。packed 压不动它（clang 实测 Ha：成员型的
+	//   类型级 aligned(16) 在 packed 宿主内仍把成员抬到 16；而 E 的 `struct Inner` 对齐
+	//   来自成员 int→被压到 1）。
+	int64_t const_declared_align(const CTypePtr &t, int depth = 0)
+	{
+		if (!t || depth > 8) return 0;
+		int64_t a = static_cast<int64_t>(t->align);
+		switch (t->kind)
+		{
+		case TypeKind::Array:
+		{
+			const int64_t e = const_declared_align(t->base, depth + 1);
+			if (e > a) a = e;
+			break;
+		}
+		case TypeKind::Struct: case TypeKind::Union:
+		{
+			for (const auto &s : cur_tu_->structs)
+				if (tag_matches(t->tag, s.tag)) // P302：限定名按后缀命中
+				{
+					if (static_cast<int64_t>(s.align) > a) a = static_cast<int64_t>(s.align);
+					break;
+				}
+			break;
+		}
+		default: break;
+		}
+		return a;
+	}
+
+	// packed / pack-cap 是否对本记录生效：类型级或任一字段级 packed，或定义点有 `#pragma pack` cap。
+	//   P339：含位域的 struct 同样生效——位域按「存储单元」建模后，packed/cap 只压单元的
+	//   **放置对齐**（min(自然, cap)；packed 恒 1），单元宽度仍取声明类型宽度（与 clang 同）。
+	//   返回 host 指针或 nullptr，供 const_member_align 取用。
+	const StructDef *packing_host(const StructDef &s)
+	{
+		bool any = s.packed || s.pack_cap > 0;
+		for (const auto &m : s.members)
+		{
+			if (m.packed) any = true;
+		}
+		return any ? &s : nullptr;
+	}
+
+	// struct/union 成员的有效对齐：max(类型自然对齐, 成员 _Alignas/GNU aligned)。
+	// P337：packed（成员级或宿主级）在无显式对齐时把它压至 1；显式对齐一律胜出
+	//   （clang 实测：压——B/D/E/F/G/N/T7/T2；不压——T1 `_Alignas(8)`、S10 字段
+	//   `packed, aligned(8)`、Ha 成员型的类型级 aligned(16)）。
+	// P338：`#pragma pack` cap 是「对齐上限」——无显式对齐时取 min(自然, cap)；显式对齐
+	//   同样胜出（pk_pack2 PK1/PK2：pack(4)+_Alignas(8)、pack(2)+aligned(8) 均保持 8）。
+	int64_t const_member_align(const StructMember &m, const StructDef *host)
 	{
 		int64_t a = const_alignof_type(m.type);
 		if (static_cast<int64_t>(m.align) > a) a = static_cast<int64_t>(m.align);
-		return a < 1 ? 1 : a;
+		if (a < 1) a = 1;
+		if (m.packed || (host && host->packed))
+		{
+			int64_t expl = static_cast<int64_t>(m.align);
+			const int64_t te = const_declared_align(m.type);
+			if (te > expl) expl = te;
+			if (expl == 0) a = 1;
+			else if (expl > a) a = expl;
+		}
+		else if (host && host->pack_cap > 0)
+		{
+			int64_t expl = static_cast<int64_t>(m.align);
+			const int64_t te = const_declared_align(m.type);
+			if (te > expl) expl = te;
+			if (expl == 0)
+			{
+				const int64_t cap = static_cast<int64_t>(host->pack_cap);
+				if (cap < a) a = cap; // min(自然, cap)
+			}
+			else if (expl > a)
+			{
+				a = expl; // 显式声明对齐胜出，cap 不降
+			}
+		}
+		return a;
+	}
+
+	// P339：记录布局计划（位域感知）——parser 三个常量路径（struct/union 的 `sizeof`、
+	//   `_Alignof`、`__builtin_offsetof`）与 codegen 的 `get_struct_type` 共用同一套规则：
+	//   ① 存储单元宽度 = 声明类型宽度（`int:4` 仍占 4 字节），packed/cap 只压单元的
+	//      **放置对齐**（`min(自然, cap)`；packed 恒 1），不缩单元；
+	//   ② 零宽 `:0` 只截断当前单元、自身不占空间（前导 `:0` 完全无操作）；
+	//   ③ 单元类型一变或超宽即另开单元。
+	//   仅含零宽位域的记录按 clang 的空记录口径给 4 字节 / 对齐 1。
+	//   union：成员偏移恒 0，尺寸/对齐沿用既有口径（位域按声明类型大小计入，不按
+	//   存储单元建模——保留差异）。
+	bool record_layout(const StructDef &s, RecordLayout &out)
+	{
+		out.member_off.assign(s.members.size(), 0);
+		const StructDef *ph = packing_host(s);
+		int64_t al = 1;
+		int64_t off = 0;
+		if (s.is_union)
+		{
+			int64_t mx = 0;
+			for (const auto &m : s.members)
+			{
+				const int64_t ms = const_sizeof_type(m.type);
+				const int64_t ma = const_member_align(m, ph);
+				if (ms > mx) mx = ms;
+				if (ma > al) al = ma;
+			}
+			off = mx;
+		}
+		else
+		{
+			bool open = false;      // 是否正处在一个位域存储单元内
+			unsigned unit_bits = 0; // 当前单元位宽
+			unsigned used = 0;      // 当前单元已用位数
+			int64_t unit_off = 0;   // 当前单元起点
+			for (std::size_t i = 0; i < s.members.size(); ++i)
+			{
+				const auto &m = s.members[i];
+				int64_t ea = const_member_align(m, ph);
+				if (ea < 1) ea = 1;
+				if (m.bit_width == 0)
+				{
+					// 零宽：只截断单元，自身不占空间、不贡献对齐（clang 实测 `{int:0; char c}` = 1/1）
+					open = false;
+					used = 0;
+					unit_bits = 0;
+					out.member_off[i] = unit_off;
+					continue;
+				}
+				if (ea > al) al = ea;
+				if (m.bit_width > 0)
+				{
+					const unsigned ub = get_bitfield_unit_bits(m.type);
+					const unsigned bw = static_cast<unsigned>(m.bit_width);
+					if (!open || ub != unit_bits || used + bw > ub)
+					{
+						off = ((off + ea - 1) / ea) * ea;
+						unit_off = off;
+						off += ub / 8;
+						unit_bits = ub;
+						used = 0;
+						open = true;
+					}
+					out.member_off[i] = unit_off;
+					used += bw;
+				}
+				else
+				{
+					open = false;
+					used = 0;
+					unit_bits = 0;
+					off = ((off + ea - 1) / ea) * ea;
+					out.member_off[i] = off;
+					off += const_sizeof_type(m.type);
+				}
+			}
+		}
+		if (static_cast<int64_t>(s.align) > al) al = static_cast<int64_t>(s.align);
+		out.align = al;
+		const int64_t r = ((off + al - 1) / al) * al;
+		out.size = r > 0 ? r : 4;
+		return true;
 	}
 
 	// 将 _Alignas 强制对齐并入类型节点（用于 typedef/声明）。
@@ -1598,17 +2052,13 @@ struct Parser
 		case TypeKind::BitInt: natural = 1; break; // _BitInt 对齐 = 1
 		case TypeKind::Struct: case TypeKind::Union:
 		{
-			// struct/union 对齐 = 各成员有效对齐的最大值
+			// struct/union 对齐 = record_layout 的有效对齐（P339：位域按存储单元参与，
+			//   零宽 `:0` 不贡献对齐；仅含零宽位域的记录得 1，与 clang 同）
 			int64_t al = 1;
 			for (const auto &s : cur_tu_->structs)
 				if (tag_matches(t->tag, s.tag)) // P302：限定名按后缀命中
 				{
-					for (const auto &m : s.members)
-					{
-						int64_t ma = const_member_align(m);
-						if (ma > al) al = ma;
-					}
-					if (static_cast<int64_t>(s.align) > al) al = static_cast<int64_t>(s.align);
+					al = layout_of(s).align;
 					break;
 				}
 			natural = al;
@@ -1867,6 +2317,15 @@ struct Parser
 			if (e->op == "alignof")
 			{
 				if (e->type) return const_alignof_type(e->type);
+				// P340：表达式形 `_Alignof d` / `_Alignof(expr)`——按操作数表达式的类型取对齐
+				//   （clang：`_Alignof d` = 8、`_Alignof(d + 1)` = 8、`_Alignof (struct S){0}` = 8）。
+				if (e->lhs)
+				{
+					CTypePtr ot = e->lhs->kind == ExprKind::StringLiteral
+						? ctype_of_string_literal(e->lhs->str_val)
+						: infer_auto_type(e->lhs);
+					if (ot) return const_alignof_type(ot);
+				}
 				return 4;
 			}
 			int64_t v = eval_const_int(e->lhs);
@@ -2131,8 +2590,19 @@ struct Parser
 		//   consume_sc_quals 兜住。aligned 走**独立提升通道**（gnu_decl_align_）：仅在各对象/成员/
 		//   typedef 落点取 max 抬升对齐，绝不并入 _Alignas 的 acc/last_has_alignas_——因 clang 对 GNU
 		//   __attribute__((aligned)) 不套用 _Alignas 的约束拒收（函数/位域/低于自然对齐均接受）。
+		gnu_packed_mode_ = GnuPackedMode::Bind; // 前缀位不绑定 packed：改由下方分流自行告警（免双告）
 		const unsigned gnu_prefix = consume_gnu_attributes();
+		const bool gpre_packed = gnu_packed_hit_;
+		const SourceLoc gpre_packed_loc = gnu_packed_loc_;
+		gnu_packed_mode_ = GnuPackedMode::Ignore;
 		if (gnu_prefix > gnu_decl_align_) gnu_decl_align_ = gnu_prefix;
+		// P337：前缀位的 packed 不生效——clang 对记录/标量给两条同形诊断，按后续关键字分流。
+		//   （实测：`__attribute__((packed)) struct V2 {...}` 只告警不改布局；
+		//   `__attribute__((packed)) int a1;` 同。一律不得当成绑定，否则前缀位误改布局。）
+		if (gpre_packed)
+			warn(gpre_packed_loc, (check_keyword("struct") || check_keyword("union"))
+				? "attribute 'packed' is ignored, place it after \"struct\" to apply attribute to type declaration"
+				: "'packed' attribute ignored");
 		const bool sc_static = last_static_, sc_extern = last_extern_, sc_typedef = last_typedef_;
 		// C23 _Alignas(...)：§6.7.2.1p6 多个取最大；类型形式取 _Alignof，常量形式取该常量。
 		// 前缀在此消费，避免后续类型解析（struct/typeof 递归）覆盖本声明的对齐值。
@@ -2249,7 +2719,8 @@ struct Parser
 				continue;
 			if (s == "void" || s == "_Bool" || s == "bool" || s == "char" || s == "short" ||
 				s == "int" || s == "long" || s == "float" || s == "double" ||
-				s == "signed" || s == "unsigned")
+				s == "signed" || s == "unsigned" || s == "char8_t" || s == "char16_t" ||
+				s == "char32_t" || s == "wchar_t")
 			{
 				++n;
 				continue;
@@ -2259,24 +2730,123 @@ struct Parser
 		return n;
 	}
 
+	// colang 把 char8_t/char16_t/char32_t/wchar_t 作**内置类型名**（不依赖头文件，见
+	//   github/docs/{zh,en}/src/types.md「当前边界」），而本机 clang 23.1.0 在 C 档把四者当
+	//   **普通标识符**：无同名 typedef 的 TU 里 `typedef long wchar_t;` exit=0（取证 _tmp/p4i/a.c）；
+	//   `typedef long char32_t;`、`typedef unsigned char char8_t;` 无论是否包含 <stddef.h> 均 exit=0
+	//   （_tmp/p4_wchar_probe.log，c17 与 c23 两档）。反例亦已取证：clang **先包含 <stddef.h>** 后，因 MSVC
+	//   SDK 已给 `typedef unsigned short wchar_t;` 而改报 `typedef redefinition with different types`——
+	//   那是「同名 typedef 相冲」，不是「说明符不可组合」；colang 不建模头文件 typedef（wchar_t 系关键
+	//   字、不占 typedef 命名空间），故此形在 colang 天然可表。CTS `0064_0006.c` 两侧均编不过（clang 报
+	//   相冲、colang 旧路径报不可组合），放行后才与基线一致地翻回绿。
+	//   按本批口径「绝不误杀 clang 容忍的」，此四名落在**声明符名位**时不得当类型说明符吃掉，
+	//   须留给声明符当标识符（配对放行见 parse_direct_rec；常驻断言 tests/p0011_contextual_type_name_ok.co）。
+	static bool is_contextual_type_name(const std::string &s)
+	{
+		return s == "char8_t" || s == "char16_t" || s == "char32_t" || s == "wchar_t";
+	}
+
+	// 声明符名位判据：当前 token 之后紧跟 `; , ) =` 之一 ⇒ 它自己不可能是类型说明符
+	//   （`typedef long wchar_t;` / `void f(unsigned char char8_t);` / `long wchar_t = 1;`）。
+	//   单靠本判据不足以放行 `wchar_t x;`（其后是标识符）与 `sizeof(wchar_t)`（其前无其它说明符），
+	//   故调用处一律再叠加「已见其它简单说明符」前置条件。
+	bool at_declarator_name_pos() const
+	{
+		const Token &nx = peek(1);
+		if (nx.kind != TokKind::Punct)
+			return false;
+		return nx.text == ";" || nx.text == "," || nx.text == ")" || nx.text == "=";
+	}
+
 	CTypePtr parse_type_specifier_combo(bool cnst, bool vol = false, bool ato = false)
 	{
 		bool saw_void = false, saw_bool = false, saw_char = false, saw_short = false;
 		bool saw_int = false, saw_float = false, saw_double = false;
 		bool saw_signed = false, saw_unsigned = false;
+		bool saw_char8 = false, saw_char16 = false, saw_char32 = false, saw_wchar = false;
 		int long_count = 0;
+		// ADR-106：`long_count == 1` 的定型要看**首个 long token 自身的来源文件**（见 long_kind）。
+		std::string long_file;
+		// §6.7.2p2 说明符组合校验。旧此路只「收集 + 归一化」，非法组合（`signed float`、`int int`、
+		//   `long float`、`unsigned char8_t` …）静默折成某个类型、符号位丢弃且零诊断。
+		//   判据与拼写对齐本机 clang 23.1.0 真值（逐条取证 _tmp/sc_probe.log：clang 容忍
+		//   `short short` / `signed signed` / `unsigned unsigned` 重复，此处一并容忍以免误杀）。
+		int n_void = 0, n_bool = 0, n_char = 0, n_short = 0, n_int = 0, n_float = 0, n_double = 0;
+		int n_fixed = 0; // char8_t/char16_t/char32_t/wchar_t：恒独占，不与任何其它类型说明符共存
+		std::string prev_name; // 已见简单说明符的规范化名（clang 报 'previous "X"' 用）
+		bool has_sign = false;
+		std::string sign_name; // 首个 signed/unsigned 的名
+		SourceLoc sign_loc;    // 首个 signed/unsigned 的位置（clang 的 caret 落在符号说明符上）
+		auto legal = [&]() -> bool {
+			if (n_fixed && (long_count || n_short || n_char || n_int || n_bool || n_void || n_float || n_double))
+				return false;
+			if (n_void > 1 || n_bool > 1 || n_char > 1 || n_int > 1 || n_float > 1 || n_double > 1 || n_fixed > 1)
+				return false;
+			if (long_count > 2 || n_short > 2) return false; // long 至两个，short 至一个（容忍 clang 式重复）
+			if (n_short && long_count) return false;         // short 与 long 不共存
+			if (n_float && (long_count || n_double || n_short || n_char || n_int || n_bool || n_void))
+				return false; // float 只可单独
+			if (n_double && (long_count > 1 || n_short || n_char || n_int || n_bool || n_void || n_float))
+				return false; // double 只可配一个 long（long double）
+			if (n_char && (long_count || n_short || n_int || n_bool || n_void || n_float || n_double))
+				return false;
+			if (n_bool && (long_count || n_short || n_char || n_int || n_void || n_float || n_double))
+				return false;
+			if (n_void && (long_count || n_short || n_char || n_int || n_bool || n_float || n_double))
+				return false;
+			return true;
+		};
+		// 简单说明符入位：记数后组合转非法即在本 token 处拒收（clang 同位置、同拼写）
+		auto add_simple = [&](const SourceLoc &kloc, const std::string &nm, int &counter) {
+			++counter;
+			if (!legal())
+				error(kloc, "cannot combine with previous '" + prev_name + "' declaration specifier");
+			prev_name = nm;
+		};
 		for (;;)
 		{
-			if (match_keyword("void")) saw_void = true;
-			else if (match_keyword("_Bool") || match_keyword("bool")) saw_bool = true;
-			else if (match_keyword("char")) saw_char = true;
-			else if (match_keyword("short")) saw_short = true;
-			else if (match_keyword("int")) saw_int = true;
-			else if (match_keyword("long")) ++long_count;
-			else if (match_keyword("float")) saw_float = true;
-			else if (match_keyword("double")) saw_double = true;
-			else if (match_keyword("signed")) saw_signed = true;
-			else if (match_keyword("unsigned")) saw_unsigned = true;
+			const SourceLoc kloc = peek().loc;
+			if (match_keyword("void")) { saw_void = true; add_simple(kloc, "void", n_void); }
+			else if (match_keyword("_Bool") || match_keyword("bool")) { saw_bool = true; add_simple(kloc, "bool", n_bool); } // clang 把 _Bool 亦记作 'bool'
+			else if (match_keyword("char")) { saw_char = true; add_simple(kloc, "char", n_char); }
+			else if (match_keyword("short")) { saw_short = true; add_simple(kloc, "short", n_short); }
+			else if (match_keyword("int")) { saw_int = true; add_simple(kloc, "int", n_int); }
+			else if (check_keyword("long"))
+			{
+				if (long_count == 0) long_file = kloc.file;
+				++long_count;
+				advance();
+				if (!legal())
+					error(kloc, "cannot combine with previous '" + prev_name + "' declaration specifier");
+				// clang 对第三个 long 报 previous 'long long'：把已见的 long 拼成完整名
+				std::string ld;
+				for (int i = 0; i < long_count; ++i) { if (i) ld += " "; ld += "long"; }
+				prev_name = ld;
+			}
+			else if (match_keyword("float")) { saw_float = true; add_simple(kloc, "float", n_float); }
+			else if (match_keyword("double")) { saw_double = true; add_simple(kloc, "double", n_double); }
+			// 四名处于声明符名位（其前已有别的简单说明符）：整体退出说明符收集，
+			//   把该 token 留给声明符（clang 同形，取证 _tmp/p4_wchar_probe.log）。
+			else if ((check_keyword("char8_t") || check_keyword("char16_t") ||
+					check_keyword("char32_t") || check_keyword("wchar_t")) &&
+					(n_fixed || long_count || n_char || n_short || n_int || n_bool ||
+					 n_void || n_float || n_double || has_sign) &&
+					at_declarator_name_pos())
+				break;
+			else if (match_keyword("char8_t")) { saw_char8 = true; add_simple(kloc, "char8_t", n_fixed); }
+			else if (match_keyword("char16_t")) { saw_char16 = true; add_simple(kloc, "char16_t", n_fixed); }
+			else if (match_keyword("char32_t")) { saw_char32 = true; add_simple(kloc, "char32_t", n_fixed); }
+			else if (match_keyword("wchar_t")) { saw_wchar = true; add_simple(kloc, "wchar_t", n_fixed); }
+			else if (check_keyword("signed") || check_keyword("unsigned"))
+			{
+				const std::string nm = peek().text;
+				advance();
+				if (nm == "unsigned") saw_unsigned = true; else saw_signed = true;
+				// 同号重复 clang 容忍；异号（signed + unsigned）拒收，caret 落在第二个符号 token
+				if (has_sign && sign_name != nm)
+					error(kloc, "cannot combine with previous '" + sign_name + "' declaration specifier");
+				if (!has_sign) { has_sign = true; sign_name = nm; sign_loc = kloc; }
+			}
 			else if (match_keyword("const")) cnst = true;
 			else if (match_keyword("volatile")) vol = true; // P253：类型关键字之间插写的限定符同样建模（仅拼写用）
 			else if (match_keyword("_Atomic")) ato = true;
@@ -2285,22 +2855,48 @@ struct Parser
 				;
 			else break;
 		}
+		// signed/unsigned 不得落在 float/double/_Bool/void 上（clang：`'X' cannot be signed or unsigned`，
+		//   caret 指标符号说明符本身；`long double` 亦归 'double'，`_Bool` 按 clang 记 'bool'）。
+		//   charN_t/wchar_t 系恒独占类型，clang 在 parse 期就断（无同款句式），沿用本族句式给出。
+		if (has_sign)
+		{
+			const std::string bad = saw_double ? std::string("double")
+				: saw_float ? std::string("float")
+				: saw_bool ? std::string("bool")
+				: saw_void ? std::string("void")
+				: saw_char8 ? std::string("char8_t")
+				: saw_char16 ? std::string("char16_t")
+				: saw_char32 ? std::string("char32_t")
+				: saw_wchar ? std::string("wchar_t") : std::string();
+			if (!bad.empty()) error(sign_loc, "'" + bad + "' cannot be signed or unsigned");
+		}
 		// 归一化（§6.7.2p2 组合表）：先定底层类型，再叠加符号
 		TypeKind k = TypeKind::Int;
 		if (saw_void) k = TypeKind::Void;
 		else if (saw_bool) k = TypeKind::Bool;
+		else if (saw_char8) k = TypeKind::Char8;
+		else if (saw_char16) k = TypeKind::Char16;
+		else if (saw_char32) k = TypeKind::Char32;
+		else if (saw_wchar) k = TypeKind::WChar;
 		else if (saw_char) k = TypeKind::Char;
 		else if (long_count >= 2) k = TypeKind::LongLong;
 		else if (saw_double) k = TypeKind::Double;
-		else if (long_count == 1) k = TypeKind::Long;
+		else if (long_count == 1) k = long_kind(long_file);
 		else if (saw_float) k = TypeKind::Float;
 		else if (saw_short) k = TypeKind::Short;
 		else if (saw_int) k = TypeKind::Int;
 		auto t = make_type(k, cnst);
 		t->is_volatile = vol;
 		t->is_atomic = ato;
-		if (saw_unsigned) t->is_unsigned = true;
-		else if (saw_signed) t->is_unsigned = false;
+		const bool fixed_width = k == TypeKind::Char8 || k == TypeKind::Char16 ||
+			k == TypeKind::Char32 || k == TypeKind::WChar;
+		if (k == TypeKind::Char8 || k == TypeKind::Char16 || k == TypeKind::Char32)
+			t->is_unsigned = true; // 与线性分支同口径（charN_t 恒无符号）；wchar_t 符号随 target，AST 层不置
+		if (!fixed_width)
+		{
+			if (saw_unsigned) t->is_unsigned = true;
+			else if (saw_signed) t->is_unsigned = false;
+		}
 		return t;
 	}
 
@@ -2402,8 +2998,10 @@ struct Parser
 		}
 		if (match_keyword("int"))
 			return make_type(TypeKind::Int, cnst);
-		if (match_keyword("long"))
+		if (check_keyword("long"))
 		{
+			const std::string lf = peek().loc.file; // ADR-106：来源文件决定 8 还是 target 原生
+			advance();
 			// long long [int] → LongLong（尾随 int 可选，对齐 signed/unsigned long long int 分支）
 			if (match_keyword("long"))
 			{
@@ -2415,7 +3013,7 @@ struct Parser
 				return make_type(TypeKind::Double, cnst);
 			// optional 'int' after long
 			match_keyword("int");
-			return make_type(TypeKind::Long, cnst);
+			return make_type(long_kind(lf), cnst);
 		}
 		if (match_keyword("unsigned"))
 		{
@@ -2428,11 +3026,13 @@ struct Parser
 			}
 			if (match_keyword("char")) { auto t = make_type(TypeKind::Char, cnst); t->is_unsigned = true; return t; }
 			if (match_keyword("short")) { match_keyword("int"); auto t = make_type(TypeKind::Short, cnst); t->is_unsigned = true; return t; }
-			if (match_keyword("long"))
+			if (check_keyword("long"))
 			{
+				const std::string lf = peek().loc.file; // ADR-106：来源文件决定 8 还是 target 原生
+				advance();
 				if (match_keyword("long")) { match_keyword("int"); auto t = make_type(TypeKind::LongLong, cnst); t->is_unsigned = true; return t; }
 				match_keyword("int");
-				auto t = make_type(TypeKind::Long, cnst); t->is_unsigned = true; return t;
+				auto t = make_type(long_kind(lf), cnst); t->is_unsigned = true; return t;
 			}
 			match_keyword("int");
 			{ auto t = make_type(TypeKind::Int, cnst); t->is_unsigned = true; return t; }
@@ -2444,11 +3044,13 @@ struct Parser
 				return parse_bitint();
 			if (match_keyword("char")) return make_type(TypeKind::Char, cnst);
 			if (match_keyword("short")) { match_keyword("int"); return make_type(TypeKind::Short, cnst); }
-			if (match_keyword("long"))
+			if (check_keyword("long"))
 			{
+				const std::string lf = peek().loc.file; // ADR-106：来源文件决定 8 还是 target 原生
+				advance();
 				if (match_keyword("long")) { match_keyword("int"); return make_type(TypeKind::LongLong, cnst); }
 				match_keyword("int");
-				return make_type(TypeKind::Long, cnst);
+				return make_type(long_kind(lf), cnst);
 			}
 			match_keyword("int");
 			return make_type(TypeKind::Int, cnst);
@@ -2464,9 +3066,14 @@ struct Parser
 		if (check_keyword("struct") || check_keyword("union"))
 		{
 			bool is_union = check_keyword("union");
-			advance(); // consume 'struct'/'union'
+			// P338：在关键字被消费的这一瞬取它的 pack 戳 = `#pragma pack(N)` 在本定义点的对齐上限
+			//   （0=无 pack 作用域）。定义点定格：只对真实定义生效，前置引用不记（无布局）。
+			const unsigned sd_pack_cap = advance().pack; // consume 'struct'/'union'
 			// 位点2：GNU __attribute__ 于 struct/union 关键字与标签名之间（`union __attribute__((packed)) U {`）。
-			unsigned sd_align = consume_gnu_attributes();
+			//   P337 实测：packed 在这一位**真生效**（V3/V4），且施加于**仅前置声明**同样延续到后续
+			//   的无属性定义（W2：`struct __attribute__((packed)) W2; struct W2 { char c; int i; };` → 5/1）。
+			bool sd_packed = false;
+			unsigned sd_align = consume_gnu_attributes_bind_packed(sd_packed);
 			std::string tag;
 			bool tag_qualified = false; // P302：`struct mod.Tag` —— 引用他模块已公开定义，不造本地前置项
 			if (peek().kind == TokKind::Identifier)
@@ -2479,8 +3086,18 @@ struct Parser
 					tag_qualified = true;
 				}
 			}
-			// 位点2：标签名与 '{' 之间（`struct __attribute__((aligned(16))) S {`）。
-			if (auto g = consume_gnu_attributes(); g > sd_align) sd_align = g;
+			// tag 与 '{'/';' 之间：packed **不绑定**——clang 实测 `struct W1 __attribute__((packed));`
+			//   仅发「place it after "struct"」并忽略（W1/W6，布局仍自然对齐）；跟 `{` 时
+			//   （`struct V3b __attribute__((packed)) {`）clang 直接报错——colang 现比 clang 宽，
+			//   本批不收紧（只登记），但一律按不生效处理，绝不静默改布局。aligned 仍走既有取 max 通道。
+			{
+				bool tk_packed = false;
+				const unsigned g = consume_gnu_attributes_bind_packed(tk_packed);
+				if (tk_packed)
+					warn(gnu_packed_loc_, std::string("attribute 'packed' is ignored, place it after \"")
+						+ (is_union ? "union" : "struct") + "\" to apply attribute to type declaration");
+				if (g > sd_align) sd_align = g;
+			}
 			if (tag_qualified && !check_punct("{"))
 			{
 				// P302：限定标签仅作引用——不登记前置声明（定义归其所属模块）
@@ -2495,6 +3112,12 @@ struct Parser
 				// 完整定义
 				advance(); // consume '{'
 				StructDef sd;
+				// P337：本次定义里「因匿名 struct 而被平铺」的段记录。宿主级 packed 写于闭 '}'
+				//   之后（位点3），那时平铺已完成——若宿主最终 packed，需把这些段还原为
+				//   嵌套成员（clang 实测 S6：内层非 packed 匿名 struct 在 packed 宿主内保持自身布局，
+				//   只有「成员位」被压到 1）。
+				struct FlatNote { std::size_t start; std::size_t count; CTypePtr mtype; unsigned align; SourceLoc loc; };
+				std::vector<FlatNote> flat_notes;
 				// 先定 tag 并登记前置声明，成员中的自引用才能命中同一 tag
 				tag = begin_definition_tag(tag, is_union);
 				sd.tag = tag;
@@ -2558,9 +3181,30 @@ struct Parser
 						// 匿名: 取最后定义的
 						if (!inner_sd && !cur_tu_->structs.empty())
 							inner_sd = &cur_tu_->structs.back();
-						if (inner_sd)
+						if (inner_sd && inner_sd->packed)
+						{
+							// P337：内层 packed 匿名 struct 不得平铺（同上 S15）。
+							StructMember m;
+							m.name = "";
+							m.type = mtype;
+							m.align = last_alignas_ > mg ? last_alignas_ : mg;
+							m.loc = mem_decl_loc;
+							sd.members.push_back(std::move(m));
+							match_punct(";");
+							continue;
+						}
+						if (inner_sd && !inner_sd->members.empty())
+						{
+							FlatNote fn;
+							fn.start = sd.members.size();
+							fn.count = inner_sd->members.size();
+							fn.mtype = mtype;
+							fn.align = last_alignas_ > mg ? last_alignas_ : mg;
+							fn.loc = mem_decl_loc;
 							for (const auto &im : inner_sd->members)
 								sd.members.push_back(im);
+							flat_notes.push_back(std::move(fn));
+						}
 						match_punct(";");
 						continue;
 					}
@@ -2579,8 +3223,8 @@ struct Parser
 							m.type = fp_type;
 							m.align = mal > mg ? mal : mg;
 							m.loc = mem_decl_loc;
-							// 位点后置：函数指针成员名后 GNU __attribute__（aligned 仅抬 m.align；余忽略告警）。
-							{ const unsigned mp = consume_gnu_attributes(); if (mp > m.align) m.align = mp; }
+							// 位点后置：函数指针成员名后 GNU __attribute__（aligned 仅抬 m.align；packed 生效于该字段）。
+							{ const unsigned mp = consume_gnu_attributes_bind_packed(m.packed); if (mp > m.align) m.align = mp; }
 							sd.members.push_back(std::move(m));
 							break; // funcptr 不支持逗号分隔多个声明符
 						}
@@ -2593,7 +3237,9 @@ struct Parser
 						m.align = mal > mg ? mal : mg;
 						// 位点后置：成员名后 GNU __attribute__((aligned)) 仅抬 m.align（纯提升），绝不并入 mal——
 						//   mal 供下方 _Alignas 专用 check_alignas_min/reject，GNU 不受该约束（clang 对 GNU 皆接受）。
-						{ const unsigned mp = consume_gnu_attributes(); if (mp > m.align) m.align = mp; }
+						//   P337：同位的 packed **生效于该字段**（clang 实测 D/S9/S10/S14：指针、数组、
+						//   `packed, aligned(8)` 均逐字段正确；aligned 压过 packed）。
+						{ const unsigned mp = consume_gnu_attributes_bind_packed(m.packed); if (mp > m.align) m.align = mp; }
 						if (is_void_object_type(m.type))
 							error(peek().loc, "field has incomplete type 'void'");
 						// 位域: name : width
@@ -2612,7 +3258,31 @@ struct Parser
 				}
 				expect_punct("}");
 				// 位点3：闭 '}' 之后、typedef/变量名之前（`struct S { ... } __attribute__((packed)) x;`）。
-				if (auto g = consume_gnu_attributes(); g > sd_align) sd_align = g;
+				//   P337 实测：这一位的 packed **生效于类型本身**（V1/V9/B/E：随后声明的对象 gV9 也
+				//   随之紧凑），aligned 同位生效（V7/V8）。它不作用于 '}' 后的**变量名**位（矩阵2 g1）。
+				{
+					bool tl_packed = false;
+					const unsigned g = consume_gnu_attributes_bind_packed(tl_packed);
+					if (g > sd_align) sd_align = g;
+					if (tl_packed) sd_packed = true;
+				}
+				// P337：宿主 packed 确立后，把「因匿名 struct 而平铺」的段还原为嵌套成员——
+				//   平铺会把内层成员逐个摊到宿主对齐下，与 clang 实测 S6（=9/off_t 8）不符。
+				//   P338：`#pragma pack` 同样是「宿主级对齐约束」，平铺在 cap 下也不等价，一并还原。
+				if (sd_packed || sd_pack_cap)
+					for (auto fn = flat_notes.rbegin(); fn != flat_notes.rend(); ++fn)
+					{
+						if (fn->start + fn->count > sd.members.size()) continue; // 防御：下标不成立则不动手
+						StructMember m;
+						m.name = ""; // 匿名：成员名由 sema/codegen 名提升递归解析
+						m.type = fn->mtype;
+						m.align = fn->align;
+						m.loc = fn->loc;
+						const auto b = static_cast<std::ptrdiff_t>(fn->start);
+						const auto e = static_cast<std::ptrdiff_t>(fn->start + fn->count);
+						sd.members.erase(sd.members.begin() + b, sd.members.begin() + e);
+						sd.members.insert(sd.members.begin() + b, std::move(m));
+					}
 				// 匿名 struct/union: 分配合成 tag
 				if (tag.empty() && !sd.members.empty())
 				{
@@ -2627,6 +3297,21 @@ struct Parser
 				// GNU __attribute__((aligned(N))) 于 struct/union 类型（位点2/3）：登进 StructDef，
 				//   供后续按 tag 引用（`struct B`）时 const_sizeof/const_alignof 与 codegen 布局一致采用。
 				sd.align = sd_align;
+				// P337：packed 落账。前置声明（kw..tag 位）上的 packed 延续到后续无属性定义
+				//   （clang 实测 W2：`struct __attribute__((packed)) W2; struct W2 { char c; int i; };` → 5/1），
+				//   故从已登记项继承——begin_definition_tag 先登记的前置壳不携属性，不会误抬。
+				if (!sd_packed && !tag.empty())
+				{
+					auto fit = struct_tags_.find(tag);
+					if (fit != struct_tags_.end() && fit->second < cur_tu_->structs.size()
+						&& cur_tu_->structs[fit->second].packed)
+						sd_packed = true;
+				}
+				sd.packed = sd_packed;
+				// P338：`#pragma pack` 定义点 cap（0=无）。与 packed 并列：无显式对齐成员按 min(自然, cap)。
+				sd.pack_cap = sd_pack_cap;
+				// P339：packed 与位域同现已真生效（位域按存储单元建模，packed/cap 只压单元
+				//   放置对齐），原「不应用 + 硬告警」已随本批销掉（欠账原文见 HISTORY D155）。
 				// 前置声明已由 begin_definition_tag 登记：原地补全，避免同一 tag 出现两条定义，
 				// 使按 tag 取首个匹配的成员查找（offsetof/sizeof/成员访问）读到空壳。
 				bool completed_in_place = false;
@@ -2648,6 +3333,24 @@ struct Parser
 				// P304：宿主自身的真定义胜出——撤销「来自其它模块」标记，使后续 public typedef
 				//   可以合法别名它（已不是导入类型）。
 				if (!tag.empty()) seed_type_names_.erase(tag);
+				// P343：public 定义补布局快照——成员类型在此点已全知，导出后消费方的常量路径
+				//   （包含成员里嵌了本模块内部非 public 记录的形态）直接取真值。
+				if (!tag.empty())
+				{
+					auto sit = struct_tags_.find(tag);
+					if (sit != struct_tags_.end() && sit->second < cur_tu_->structs.size())
+					{
+						StructDef &stored = cur_tu_->structs[sit->second];
+						if (stored.is_public)
+						{
+							RecordLayout lay;
+							record_layout(stored, lay);
+							stored.layout_size = lay.size;
+							stored.layout_align = lay.align;
+							stored.layout_member_off = std::move(lay.member_off);
+						}
+					}
+				}
 			}
 			else
 			{
@@ -2667,8 +3370,19 @@ struct Parser
 					StructDef fwd;
 					fwd.tag = tag;
 					fwd.is_union = is_union;
+					// P337：前置声明（kw..tag 位）上写的 packed 延续到后续无属性定义
+					//   （clang 实测 W2/W6：前置带 packed、定义不带 → 布局仍紧凑）。
+					fwd.packed = sd_packed;
 					cur_tu_->structs.push_back(std::move(fwd));
 					struct_tags_[tag] = cur_tu_->structs.size() - 1;
+				}
+				else if (sd_packed)
+				{
+					// 已有登记项（包括跨块 resolve 后的真名）：同样记上 packed，
+					//   使同一 tag 的后续定义继承（与上方“仅声明”同一口径）。
+					auto it = struct_tags_.find(tag);
+					if (it != struct_tags_.end() && it->second < cur_tu_->structs.size())
+						cur_tu_->structs[it->second].packed = true;
 				}
 			}
 			auto st = std::make_shared<CType>();
@@ -2683,6 +3397,14 @@ struct Parser
 		if (check_keyword("enum"))
 		{
 			advance();
+			// P337（同一 GNU 属性通道的位点缺口，矩阵5 a4 + pk_enum 实测）：`enum` 关键字与 tag 之间的
+			//   GNU __attribute__ 是 clang 合法写法。修前 colang 在此完全不消费：
+			//   `enum __attribute__((aligned(16))) EA {…};` 直接「expected type specifier」（误杀），
+			//   `enum __attribute__((packed)) EP {…};` 更是把 `__attribute__` 误当 tag、真 tag 丢弃
+			//   （sema 报 use of undeclared identifier）。clang 真值：aligned **生效**于 enum 类型对齐
+			//   （sizeof 恒 4，_Alignof 分别 EP 4 / EA 16 / EB 8），packed 对 enum **不生效也不告警**
+			//   （enum 的存储由取值范围决定，packed 无意义）→ 取 Silent 模式。
+			const unsigned en_align = consume_gnu_attributes_silent();
 			std::string tag;
 			bool tag_qualified = false; // P302：`enum mod.Tag`
 			if (peek().kind == TokKind::Identifier)
@@ -2719,12 +3441,43 @@ struct Parser
 				expect_punct("}");
 				// P217：顶层 public 回填——仅最外层被定义的 enum 继承 public
 				ed.is_public = ed.is_public || top_public;
+				ed.align = en_align;
+				// P337：同名 enum 的重复定义（或先前置声明带属性、后定义不带）取 max，绝不把
+				//   已抬升的对齐改小（clang 要求重声明兼容，此处宽松取大）。
+				for (const auto &prev : cur_tu_->enums)
+					if (!tag.empty() && tag_matches(prev.tag, tag) && prev.align > ed.align)
+						ed.align = prev.align;
+				{
+					auto fit = enum_fwd_align_.find(tag);
+					if (fit != enum_fwd_align_.end() && fit->second > ed.align) ed.align = fit->second;
+				}
 				cur_tu_->enums.push_back(std::move(ed));
+			}
+			else if (en_align && !tag.empty())
+			{
+				// 前置声明位（无 `{`）：暂存对齐，待真定义并入（不新建登记项）。
+				{
+					auto fit = enum_fwd_align_.find(tag);
+					if (fit == enum_fwd_align_.end() || en_align > fit->second)
+						enum_fwd_align_[tag] = en_align;
+				}
+				for (auto &prev : cur_tu_->enums)
+					if (tag_matches(prev.tag, tag) && en_align > prev.align) prev.align = en_align;
 			}
 			auto et = std::make_shared<CType>();
 			et->kind = TypeKind::Enum;
 			et->tag = tag;
 			et->is_const = cnst;
+			if (en_align > et->align) et->align = en_align; // GNU aligned 于 enum 类型（布局侧走 t->align 通道）
+			// P337：按 tag 反查已登记的对齐——`enum EA e;` 这类**引用**处不重写属性，也必须拿到 16
+			//   （否则同一个 enum 在声明处与引用处布局不一致，与 codegen 自相矛盾）。
+			if (!tag.empty())
+				for (const auto &s0 : cur_tu_->enums)
+					if (tag_matches(s0.tag, tag))
+					{
+						if (s0.align > et->align) et->align = s0.align;
+						break;
+					}
 			return et;
 		}
 		// P302 Co 层：模块限定类型名 `mod.Tag`（仅 .co）。parser 只掌握别名与标签，产出
@@ -2927,6 +3680,12 @@ struct Parser
 			p.type = t;
 			if (is_void_object_type(p.type))
 				error(ploc, "argument has incomplete type 'void'");
+			// P337（矩阵5 a11 实测）：形参声明符后的 GNU __attribute__ 为 clang 合法写法
+			//   （`void f(int x __attribute__((packed)));` rc=0，仅发 'packed' attribute ignored）。
+			//   修前 colang 在此不消费 → 形参表收尾直接 expected ')'（误杀）。属性对形参无布局意义
+			//   （调用约定决定其栈/寄存器落位）：按 Ignore 模式消费并就地发 clang 同形告警，
+			//   aligned 值**不并入** gnu_decl_align_（否则外层的函数声明会被误抬对齐）。
+			consume_gnu_attributes();
 			params.push_back(std::move(p));
 			if (!match_punct(","))
 			{
@@ -3445,12 +4204,21 @@ struct Parser
 					if (check_punct("["))
 					{
 						advance(); // [
-						// 护栏：数组下标指定符须为整型常量表达式；解析失败(如不支持的 GCC 范围指定符
-						//   [a ... b]，parse_assign 见 '...' 返回 null)时不可直接 ->int_val，否则空指针 AV。
+						// 护栏：数组下标指定符须为整型常量表达式；解析失败时不可直接 ->int_val，否则空指针 AV。
 						//   parse_primary 已记录诊断，st.index 保持 -1（无效下标，后续按畸形初始化器处理）。
 						auto idx = parse_assign();
 						st.is_index = true;
 						st.index = idx ? idx->int_val : -1;
+						// GNU 范围指定符 `[a ... b]`：ADR-104 / 清单 A 明确不做（厂商扩展，C11–C23 皆无）。
+						//   旧此 `...` 落在 `expect_punct("]")`/`expect_punct("=")` 上，一处范围写法要报
+						//   `expected ']'` + `expected '='` + `unexpected token '...'` 等 4~5 条，看不出边界。
+						//   现给专名诊断、并把上界吃掉（值丢弃），后续 `]`/`=`/初值照常解析——一处只报一条。
+						if (check_punct("..."))
+						{
+							error(peek().loc, "GNU range designator '[a ... b]' is not supported");
+							advance();      // ...
+							parse_assign(); // 上界表达式（不参与后续语义：本方言未实现范围填充）
+						}
 						expect_punct("]");
 					}
 					else
@@ -3603,7 +4371,9 @@ struct Parser
 	using DeclaratorFn = std::function<CTypePtr(CTypePtr)>;
 
 	// P331：标识符位置沿当前声明符递归传出，后缀参数表不共享出参，避免参数名覆盖对象名。
-	DeclaratorFn parse_declarator_rec(std::string &name, std::vector<Param>* own = nullptr, SourceLoc* ident_loc = nullptr)
+	// abstract_decl：C §6.7.6 abstract-declarator 语境（cast / 复合字面量的类型名）——此语境
+	//   括号内仍是抽象声明符，文法不允许出现具名声明符，见 parse_direct_rec 的同名分支。
+	DeclaratorFn parse_declarator_rec(std::string &name, std::vector<Param>* own = nullptr, SourceLoc* ident_loc = nullptr, bool abstract_decl = false)
 	{
 		decl_tail_ = 0; // a2-follow：每层入口清零；外层后缀循环最后写入 → 最终值即最外层尾形态
 		// 位点5/6：GNU __attribute__ 可出现于声明符各嵌套层（如函数指针类型 `int(ATTR *)(void)`）。
@@ -3626,7 +4396,7 @@ struct Parser
 			// 0.4.1 a2-follow：'*' 与内层声明符之间的 [[...]] ＝指针类型位 → clang 报 cannot be applied to types（P2/Q5 探针）。
 			if (check_punct("[") && peek(1).kind == TokKind::Punct && peek(1).text == "[")
 				reject_attributes_type_context();
-			DeclaratorFn rest = parse_declarator_rec(name, own, ident_loc);
+			DeclaratorFn rest = parse_declarator_rec(name, own, ident_loc, abstract_decl);
 			return [rest, qc, qv, qr, qa](CTypePtr X) -> CTypePtr
 			{
 				CTypePtr p = make_pointer(X);
@@ -3637,20 +4407,29 @@ struct Parser
 				return rest(p);
 			};
 		}
-		return parse_direct_rec(name, own, ident_loc);
+		return parse_direct_rec(name, own, ident_loc, abstract_decl);
 	}
 
-	DeclaratorFn parse_direct_rec(std::string &name, std::vector<Param>* own = nullptr, SourceLoc* ident_loc = nullptr)
+	DeclaratorFn parse_direct_rec(std::string &name, std::vector<Param>* own = nullptr, SourceLoc* ident_loc = nullptr, bool abstract_decl = false)
 	{
 		DeclaratorFn cur;
 		bool ident_here = false; // 本帧是否消费了标识符（其紧邻参数表=被定义函数自身参数）
 		if (check_punct("("))
 		{
 			advance();
-			cur = parse_declarator_rec(name, own, ident_loc); // 括号内是一个完整声明符
+			cur = parse_declarator_rec(name, own, ident_loc, abstract_decl); // 括号内是一个完整声明符
 			expect_punct(")");
 		}
-		else if (peek().kind == TokKind::Identifier)
+		else if (peek().kind == TokKind::Identifier ||
+			(!abstract_decl && is_contextual_type_name(peek().text) && peek().kind == TokKind::Keyword))
+			// 后半支放行 `typedef long wchar_t;` 一类写法：说明符收集已在声明符名位主动退出
+			//   （见 parse_type_specifier_combo 的同名守卫），此处须能把该关键字 token 当名字取走。
+			//   `wchar_t x;` / `sizeof(wchar_t)` 等正途在收集期已被消费，不会落到本支。
+			//   abstract_decl 位（改动五）：该放行只主张**声明语境**可把四名当名字，不得外溢到
+			//   cast/复合字面量的类型名——本机 clang 23.1.0 对 `(unsigned wchar_t)0` 报 `expected ')'`
+			//   （类型名内不允许具名声明符），而 sizeof/_Alignof/typeof 诸路径本就不进本函数、两侧
+			//   已同拒（取证 _tmp/p4_wchar_probe.log），故此处须以 abstract_decl 拦回、保持同严。
+			//   （前半支 Identifier 未加此约束：cast 类型名内写普通标识符属既有更宽，不在本批扩大改动面。）
 		{
 			last_ident_loc_ = peek().loc; // P252：标识符位置（跨声明对齐一致性诊断指此列）
 			if (ident_loc) *ident_loc = peek().loc;
@@ -4240,7 +5019,7 @@ struct Parser
 			// 抽象声明符（Decorator）：支持 void (*)(void) 等函数指针/数组 cast 类型
 			{
 				std::string dummy_nm;
-				DeclaratorFn d = parse_declarator_rec(dummy_nm);
+				DeclaratorFn d = parse_declarator_rec(dummy_nm, nullptr, nullptr, true);
 				e->type = d(e->type);
 			}
 			expect_punct(")");
@@ -4279,19 +5058,44 @@ struct Parser
 				return e;
 			}
 		}
-		// _Alignof(type) / alignof(type)
-		if (check_keyword("_Alignof") || check_keyword("alignof"))
+		// _Alignof(type) / alignof(type) / __alignof__(type)，以及表达式形（clang 的 GNU 扩展：
+		//   `_Alignof d`、`_Alignof(expr)`——按操作数表达式的类型取对齐）。
+		if (check_keyword("_Alignof") || check_keyword("alignof") || check_keyword("__alignof__"))
 		{
 			auto e = std::make_shared<Expr>();
 			e->kind = ExprKind::Unary;
 			e->loc = advance().loc;
 			e->op = "alignof";
-			expect_punct("(");
-			e->type = parse_decl_specifiers();
-			e->type = parse_pointer_suffix(e->type);
-			if (check_punct("["))
-				e->type = parse_array_suffix(e->type);
-			expect_punct(")");
+			if (check_punct("(") && is_type_after_paren())
+			{
+				advance(); // '(' 且后为类型名——类型形
+				CTypePtr tn = parse_decl_specifiers();
+				tn = parse_pointer_suffix(tn);
+				if (check_punct("["))
+					tn = parse_array_suffix(tn);
+				// P340：`_Alignof (T){...}`——复合字面量作操作数，与 sizeof 同判据（只认 '{'）。
+				if (check_punct(")") && peek(1).kind == TokKind::Punct && peek(1).text == "{")
+				{
+					advance(); // ')'
+					auto lit = parse_init_list();
+					lit->type = tn;
+					lit->loc = e->loc;
+					e->lhs = lit; // e->type 留空 → 按操作数型取对齐
+				}
+				else
+				{
+					e->type = tn;
+					expect_punct(")");
+				}
+			}
+			else if (check_punct("("))
+			{
+				advance(); // '(' 但后为表达式——表达式形
+				e->lhs = parse_expr();
+				expect_punct(")");
+			}
+			else
+				e->lhs = parse_unary(); // `_Alignof d`：与 clang 的 unary-expression 同结合
 			return e;
 		}
 		if (check_keyword("sizeof"))
@@ -4309,9 +5113,27 @@ struct Parser
 				if (is_type_after_paren())
 				{
 					advance(); // consume '('
-					e->type = parse_decl_specifiers();
-					e->type = parse_pointer_suffix(e->type);
-					expect_punct(")");
+					CTypePtr tn = parse_decl_specifiers();
+					tn = parse_pointer_suffix(tn);
+					if (check_punct("["))
+						tn = parse_array_suffix(tn);
+					// P340：`sizeof (T){...}`——复合字面量作操作数（§6.5.2.5）。判据只认 `{`：
+					//   clang 对 `sizeof (int)(1+2)` 报 "expression cannot be followed by a postfix
+					//   '(' operator"、对 `sizeof (int) 1` 报 "expected ','"（均 rc=1），而
+					//   `sizeof (int) - 1` 走 type-name 形 + 减法（= 3）。
+					if (check_punct(")") && peek(1).kind == TokKind::Punct && peek(1).text == "{")
+					{
+						advance(); // ')'
+						auto lit = parse_init_list();
+						lit->type = tn;
+						lit->loc = e->loc;
+						e->lhs = lit; // e->type 留空 → 走表达式折叠路
+					}
+					else
+					{
+						e->type = tn;
+						expect_punct(")");
+					}
 				}
 				else
 				{
@@ -4446,9 +5268,14 @@ struct Parser
 					}
 					int64_t off = 0;
 					bool bad = false;
+					// P341：`offsetof` 施于位域成员无「字节偏移」可言（clang 硬拒
+					//   `cannot compute offset of bit-field 'b'`）；旧路静默给存储单元起点。
+					//   只记首个命中，主诊断由下方按 clang 口径给出。
+					std::string bf_name;
+					SourceLoc bf_loc{};
 					// 成员访问：在当前 struct/union 上累加对齐填充后的偏移，并切换到成员类型；
 					// 直查不中时递归穿过匿名聚合（成员名提升，与 sema/codegen 同口径；P235）。
-					auto access_member = [&](auto &&self, const std::string &mname, int depth) -> bool {
+					auto access_member = [&](auto &&self, const std::string &mname, const SourceLoc &mloc, int depth) -> bool {
 						if (depth > 16) return false;
 						if (!cur || (cur->kind != TypeKind::Struct && cur->kind != TypeKind::Union)) return false;
 						const StructDef *sd = nullptr;
@@ -4456,40 +5283,42 @@ struct Parser
 							if (s.tag == cur->tag) { sd = &s; break; }
 						if (!sd) return false;
 						const bool isun = sd->is_union;
+						// P339：成员偏移一律取自记录布局（位域感知）——旧口径把位域成员按声明
+						//   类型全额累加，`{char c; int:4; char d}` 的 off_d 会算成 12（clang 8）。
+						const RecordLayout lay = layout_of(*sd);
 						// 一级：直命名成员（union 各成员偏移恒 0）
-						int64_t moff = 0;
-						for (const auto &m : sd->members)
+						for (std::size_t mi = 0; mi < sd->members.size(); ++mi)
 						{
-							if (!isun)
+							const auto &m = sd->members[mi];
+							if (!m.name.empty() && m.name == mname)
 							{
-								int64_t ma = const_member_align(m);
-								if (ma < 1) ma = 1;
-								moff = ((moff + ma - 1) / ma) * ma;
+								off += isun ? 0 : lay.member_off[mi];
+								cur = m.type;
+								// P341：位域成员记名（首个命中即准），定位取设计符标识符起点——
+								//   与 clang 主诊断落在成员名一列同口径。
+								if (m.bit_width >= 0 && bf_name.empty())
+								{
+									bf_name = m.name;
+									bf_loc = mloc;
+								}
+								return true;
 							}
-							if (!m.name.empty() && m.name == mname) { off += moff; cur = m.type; return true; }
-							if (!isun) moff += const_sizeof_type(m.type);
 						}
 						// 二级：穿过匿名聚合递归（内层偏移照加；union 级无偏移）
-						moff = 0;
-						for (const auto &m : sd->members)
+						for (std::size_t mi = 0; mi < sd->members.size(); ++mi)
 						{
-							if (!isun)
-							{
-								int64_t ma = const_member_align(m);
-								if (ma < 1) ma = 1;
-								moff = ((moff + ma - 1) / ma) * ma;
-							}
+							const auto &m = sd->members[mi];
 							if (m.name.empty() && m.type
 								&& (m.type->kind == TypeKind::Struct || m.type->kind == TypeKind::Union)
 								&& !m.type->tag.empty())
 							{
 								int64_t saved_off = off;
 								CTypePtr saved_cur = cur;
-								off += moff; cur = m.type;
-								if (self(self, mname, depth + 1)) return true;
+								off += isun ? 0 : lay.member_off[mi];
+								cur = m.type;
+								if (self(self, mname, mloc, depth + 1)) return true;
 								off = saved_off; cur = saved_cur;
 							}
-							if (!isun) moff += const_sizeof_type(m.type);
 						}
 						return false;
 					};
@@ -4501,14 +5330,14 @@ struct Parser
 					};
 					{
 						auto id = expect_identifier();
-						if (!access_member(access_member, id.text, 0)) bad = true;
+						if (!access_member(access_member, id.text, id.loc, 0)) bad = true;
 					}
 					while (!check_punct(")"))
 					{
 						if (match_punct("."))
 						{
 							auto id = expect_identifier();
-							if (!access_member(access_member, id.text, 0)) bad = true;
+							if (!access_member(access_member, id.text, id.loc, 0)) bad = true;
 						}
 						else if (match_punct("["))
 						{
@@ -4519,9 +5348,14 @@ struct Parser
 						else { bad = true; break; }
 					}
 					expect_punct(")");
-					if (bad)
+					if (bad || !bf_name.empty())
 					{
-						error(call->loc, "__builtin_offsetof: invalid type or member designator");
+						// P341：位域成员走专文（与 clang 同文），不与下面的通用文案混用——
+						//   设计符本身是找得到的，错的只是「位域没有字节偏移」这一点。
+						if (!bf_name.empty())
+							error(bf_loc, "cannot compute offset of bit-field '" + bf_name + "'");
+						else
+							error(call->loc, "__builtin_offsetof: invalid type or member designator");
 						off = 0;
 					}
 					auto lit = std::make_shared<Expr>();
@@ -4692,49 +5526,53 @@ struct Parser
 			advance();
 			auto e = std::make_shared<Expr>();
 			e->loc = t.loc;
-			bool is_hex = (t.text.size() > 2 && t.text[0] == '0' &&
-				(t.text[1] == 'x' || t.text[1] == 'X'));
-			// 检测十六进制浮点: 0x...p/P...
-			bool is_hexfloat = is_hex &&
-				(t.text.find('p') != std::string::npos || t.text.find('P') != std::string::npos);
-			// 检测普通浮点: 含 '.' 或 e/E指数(非 hex)
-			bool is_float = is_hexfloat ||
-				(t.text.find('.') != std::string::npos && !is_hex) ||
-				(!is_hex && (t.text.find('e') != std::string::npos ||
-					t.text.find('E') != std::string::npos));
+			// C §6.4.5 扫描与校验：判据、句式、caret 落点逐条对齐本机 clang 23.1.0（取证
+			//   _tmp/sc_probe.log、_tmp/p4_verify.log、_tmp/p4_probe2.log），结构照 clang
+			//   LiteralSupport.cpp `NumericLiteralParser`。旧此把 pp-number 整串直交 std::stod/stoull：
+			//   尾随杂字符被**静默丢弃**（`1w`→int 1、`1.0z`→1.0、`08`→0、`0b`→0），
+			//   超宽常量更抛未捕获异常 → 0xC0000409 零诊断崩溃（取证 _tmp/sc_crash.log）。
+			const NumScan ns = scan_numeric_literal(t.text);
+			const std::string numtxt = t.text.substr(0, ns.dend); // 校验过的数字段
+			const std::string sfx = t.text.substr(ns.dend);       // 余下即后缀
+			const bool is_hex = ns.base == 16;
+			const bool is_float = ns.is_fp;                      // 由扫描**导出**，不猜文本
+			const bool is_hexfloat = is_hex && is_float;
+			const SfxScan sscan = scan_numeric_suffix(sfx, is_float);
+			SourceLoc off_loc = t.loc;
+			off_loc.column += ns.dend; // clang 的 caret 落在越界处/后缀起点/指数标记，而非字面量首列
+			if (ns.bad_exponent)
+				error(off_loc, "exponent has no digits");
+			else if (ns.bad_digit)
+				error(off_loc, "invalid digit '" + std::string(1, ns.bad_digit) + "' in " + ns.base_name + " constant");
+			else if (ns.hex_no_exp)
+				error(off_loc, "hexadecimal floating constant requires an exponent");
+			else if (ns.hex_no_sig)
+				error(off_loc, "hexadecimal floating constant requires a significand");
+			else if (!sscan.ok)
+				error(off_loc, "invalid suffix '" + sfx + "' on " +
+					(is_float ? std::string("floating") : std::string("integer")) + " constant");
 			if (is_hexfloat || is_float)
 			{
 				e->kind = ExprKind::FloatLiteral;
-				e->float_val = is_hexfloat ? parse_hex_float(t.text) : std::stod(t.text);
+				// 越界浮点常量按 clang 口径落 ±inf 且**不诊断**（旧此 std::stod 抛 out_of_range
+				//   未捕获 → 0xC0000409 零诊断崩溃，取证 _tmp/sc_crash.log dbl_overflow）
+				try { e->float_val = is_hexfloat ? parse_hex_float(numtxt) : std::stod(numtxt); }
+				catch (const std::exception &) { e->float_val = std::numeric_limits<double>::infinity(); }
 				// C §6.4.5 浮点后缀定型（P9.24）：f/F → float；无后缀 / l/L → double。
-				//   （本机 Windows long double==double，故 L 亦落 double，与 clang -std=c23 一致。
-				//    std::stod / parse_hex_float 均自然忽略尾随 f/L，值解析无须剥后缀。）
-				const char lastc = t.text.empty() ? '\0' : t.text.back();
-				if (lastc == 'f' || lastc == 'F')
+				//   （本机 Windows long double==double，故 L 亦落 double，与 clang -std=c23 一致。）
+				if (sscan.is_float)
 					e->type = make_type(TypeKind::Float);
 			}
 			else
 			{
 				e->kind = ExprKind::IntLiteral;
-				// C23 位精确整数字面量后缀：wb/WB → signed _BitInt(N)，ub/UB → unsigned _BitInt(N)。
-				// N 为表示该值所需的最小位宽（signed 额外含符号位）。
-				const std::string &txt = t.text;
-				const std::size_t tl = txt.size();
-				bool bi = false, bi_unsigned = false;
-				std::string digits = txt;
-				if (tl >= 2)
-				{
-					const char a = txt[tl - 2], b = txt[tl - 1];
-					if ((b == 'b' || b == 'B') && (a == 'w' || a == 'W'))
-					{
-						bi = true; bi_unsigned = false; digits = txt.substr(0, tl - 2);
-					}
-					else if ((b == 'b' || b == 'B') && (a == 'u' || a == 'U'))
-					{
-						bi = true; bi_unsigned = true; digits = txt.substr(0, tl - 2);
-					}
-				}
+				// C23 位精确整数字面量：wb/WB → signed _BitInt(N)，ub/UB（colang 扩展）与 u 前缀
+				//   形（1uwb，clang 亦收）→ unsigned _BitInt(N)。N 为表示该值所需最小位宽，signed 额外含符号位。
+				const bool bi = sscan.bitint;
+				const bool bi_unsigned = bi && sscan.uns;
+				const std::string digits = numtxt; // 只取校验过的数字段（旧此取整串，杂字符被 stoull 静默吞掉）
 				unsigned long long mag = 0ULL;
+				bool too_big = false; // 超出 unsigned long long 可表示范围（clang 判 too large）
 				{
 					// 规范化 C23 前缀 0b/0B(二进制)、0o/0O(八进制)——std::stoull base0 不识别这两者；
 					// 0x / 前导 0 八进制 / 十进制仍交给 base0 自动判定。
@@ -4746,7 +5584,14 @@ struct Parser
 						if (c1 == 'b' || c1 == 'B') { rbase = 2; num = num.substr(2); }
 						else if (c1 == 'o' || c1 == 'O') { rbase = 8; num = num.substr(2); }
 					}
-					if (!num.empty()) mag = std::stoull(num, nullptr, rbase);
+					if (!num.empty())
+					{
+						// 位宽超出 unsigned long long：旧此 stoull 抛 out_of_range **未捕获** →
+						//   0xC0000409 零诊断崩溃（取证 _tmp/sc_crash.log int_overflow/hex_overflow）；
+						//   现就地记 too_big，交下方选型处统一拒收（与 clang 同口径）。
+						try { mag = std::stoull(num, nullptr, rbase); }
+						catch (const std::exception &) { mag = 0xFFFFFFFFFFFFFFFFULL; too_big = true; }
+					}
 				}
 				e->int_val = static_cast<long long>(mag);
 				if (bi)
@@ -4767,24 +5612,31 @@ struct Parser
 					// C §6.4.5.2：按后缀(u/U, l/L, ll/LL)与进制(十进制 vs 八/十六进制)，
 					// 从候选类型序列中选出能容纳该值的最小类型（LLP64：int=32, long=32, long long=64）。
 					// 十进制候选恒不含无符号型；八/十六进制可选到 unsigned int/long/long long。
-					std::size_t sb = tl;
-					while (sb > 0)
-					{
-						char c = txt[sb - 1];
-						if (c == 'u' || c == 'U' || c == 'l' || c == 'L') --sb;
-						else break;
-					}
-					bool uns = false; unsigned lcnt = 0;
-					if (sb < tl)
-					{
-						std::string sfx = txt.substr(sb);
-						for (char c : sfx) { if (c == 'u' || c == 'U') uns = true; else ++lcnt; }
-					}
-					// 十进制字面量不以 '0' 开头（单独 "0" 视作十进制）
-					bool decimal = !(txt.size() > 1 && txt[0] == '0');
+					//   u/ll 形状由后缀状态机给出（旧此反向刺 u/l 字符，会把 `1lull` 这类
+					//   clang 拒收的拼写误读为合法两 l）。进制取扫描结果，与 clang `getRadix()` 同口径。
+					const bool uns = sscan.uns;
+					const unsigned lcnt = sscan.long_count;
+					const bool decimal = ns.base == 10; // 单独 "0" 亦计十进制（clang radix=10）
+					// ADR-106：`.co` 内 `long` 与 `long long` 同为 64 位——候选序列按 §6.4.5.2
+					//   把 `long` 项并入 64 位后去重。判定取**字面量 token 自身的来源文件**（逐 token）。
+					const bool co64 = is_co_source_file(t.loc.file);
 					struct Cand { TypeKind tk; bool uns; unsigned bits; };
 					std::vector<Cand> list;
-					if (uns && lcnt == 0)
+					if (co64)
+					{
+						if (uns && lcnt == 0)
+							list = { {TypeKind::Int,true,32},{TypeKind::LongLong,true,64} };
+						else if (uns) // ul / uL / ull / ULL：long 与 long long 同宽，候选均归 64 位无符号
+							list = { {TypeKind::LongLong,true,64} };
+						else if (lcnt >= 1) // l / L / ll / LL：同归 64 位
+							list = { {TypeKind::LongLong,false,64} };
+						else if (decimal) // 无后缀十进制
+							list = { {TypeKind::Int,false,32},{TypeKind::LongLong,false,64} };
+						else // 无后缀八/十六进制
+							list = { {TypeKind::Int,false,32},{TypeKind::Int,true,32},
+							         {TypeKind::LongLong,false,64},{TypeKind::LongLong,true,64} };
+					}
+					else if (uns && lcnt == 0)
 						list = { {TypeKind::Int,true,32},{TypeKind::Long,true,32},{TypeKind::LongLong,true,64} };
 					else if (uns && lcnt >= 2) // ull / ULL 等（两个 l + u）：§6.4.5.2 候选仅 unsigned long long
 						list = { {TypeKind::LongLong,true,64} };
@@ -4800,6 +5652,7 @@ struct Parser
 						list = { {TypeKind::Int,false,32},{TypeKind::Int,true,32},{TypeKind::Long,false,32},
 						         {TypeKind::Long,true,32},{TypeKind::LongLong,false,64},{TypeKind::LongLong,true,64} };
 					Cand chosen = list.back();
+					bool fits_any = false;
 					for (const Cand &cd : list)
 					{
 						bool fits;
@@ -4807,7 +5660,19 @@ struct Parser
 							fits = cd.uns ? true : (mag <= 0x7FFFFFFFFFFFFFFFULL);
 						else
 							fits = cd.uns ? (mag <= 0xFFFFFFFFULL) : (mag <= 0x7FFFFFFFULL);
-						if (fits) { chosen = cd; break; }
+						if (fits) { chosen = cd; fits_any = true; break; }
+					}
+					// clang 4080-4084 / 4240-4248：**只有超出 unsigned long long 全宽**才报
+					//   "integer literal is too large to be represented in any integer type"（旧此
+					//   stoull 抛 out_of_range 直接 0xC0000409 崩溃，取证 _tmp/sc_crash.log）。
+					//   能装进 ULL、却装不进「本形允许的类型」（如无后缀十进制 ≥ 2^63）时，clang
+					//   只给 -Wimplicitly-unsigned-literal **告警**并定类型 unsigned long long
+					//   （取证 _tmp/p4_probe2.log c29：`9223372036854775808` exit=0），故不得拒收。
+					if (too_big || !fits_any)
+					{
+						if (too_big)
+							error(t.loc, "integer literal is too large to be represented in any integer type");
+						chosen = { TypeKind::LongLong, true, 64 };
 					}
 					auto lt = std::make_shared<CType>();
 					lt->kind = chosen.tk;
@@ -4959,7 +5824,23 @@ struct Parser
 		}
 		if (check_punct("("))
 		{
-			advance();
+			const Token &lp = advance();
+			// GNU 语句表达式 `({ ... })`：ADR-104 明确不做（厂商扩展不作为本方言的一部分，
+			//   清单 A 同条）。旧此落到 primary 的「非法表达式起始符」→ `unexpected token '{'
+			//   in expression` 加连带 `expected ')'`，用户看不出这是有意划定的边界。
+			//   现给专名诊断、并整块跳过配对花括号，一处扩展写法只报一条。
+			if (check_punct("{"))
+			{
+				error(lp.loc, "GNU statement expression '({ ... })' is not supported");
+				skip_braced_block();
+				match_punct(")");
+				auto e = std::make_shared<Expr>();
+				e->kind = ExprKind::IntLiteral;
+				e->loc = lp.loc;
+				e->int_val = 0;
+				e->type = make_type(TypeKind::Int);
+				return e; // 占位：诊断已记录，编译必失败，只为不连带次生错误
+			}
 			auto e = parse_expr();
 			expect_punct(")");
 			return e;
@@ -4969,6 +5850,24 @@ struct Parser
 	}
 
 	// —— 错误恢复 ——
+	// 跳过一整段配对的 `{ ... }`（含嵌套），停在匹配的 `}` 之后。供已诊断的 GNU 语句表达式
+	//   使用：整块吞掉，避免逐 token 再报次生错误。
+	void skip_braced_block()
+	{
+		int depth = 0;
+		while (!at_end())
+		{
+			const Token &k = peek();
+			if (k.kind == TokKind::Punct && k.text == "}")
+			{
+				advance();
+				if (--depth <= 0) return;
+				continue;
+			}
+			if (k.kind == TokKind::Punct && k.text == "{") ++depth;
+			advance();
+		}
+	}
 	void skip_to_semi()
 	{
 		while (!at_end() && !check_punct(";"))

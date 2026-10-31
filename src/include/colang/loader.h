@@ -35,6 +35,13 @@ struct ImportTagSeed
 	bool is_union = false; // struct vs union（is_enum=false 且 is_class=false 时有义）
 	bool is_enum = false;  // 是否为 enum 标签
 	bool is_class = false; // P300 Co class：是否为 public class 标签（宿主裸类名作类型的 parse 种子）
+	// P343：public 记录的布局快照与成员表。前向声明（is_definition=false）留空 → 消费方
+	//   仍按不完整处理；完整定义则把定义点算定的 size/align/成员偏移原样带出，使宿主的
+	//   常量路径（sizeof/_Alignof/offsetof）不再因「嵌套类型不在本 TU」而回落到 4。
+	std::vector<StructMember> members;
+	int64_t layout_size = 0;
+	int64_t layout_align = 0;
+	std::vector<int64_t> layout_member_off;
 };
 
 // P256：加载阶段采集的 public const int 值种子。供 parser 在「parse 主源时」把

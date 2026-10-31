@@ -59,10 +59,27 @@ The two target classes differ in nature and must not be conflated: `.co` is **so
 
 ## Independent Module Closures
 
-Since **0.3.2**, every `.co` module is an **independent compilation closure**: each module builds its own type and symbol tables and is analyzed on its own; the main source sees a module only through its **export surface** (its `public` names). This yields two user-visible guarantees:
+Since **0.3.2**, every `.co` module is an **independent compilation closure**: each module builds its own type and symbol tables and is analyzed on its own; the main source sees a module only through its **export surface** (its `public` names). This yields three user-visible guarantees:
 
 - **Same-name, different-layout types never interfere**: two modules may each define a `struct Config` with a different layout, and each `sizeof` uses its own layout — there is no "last importer wins" hijack.
 - **Ambient cut-off**: **ambient symbols** brought in by a module's `#include` (e.g. `<stdio.h>`'s `printf`) **do not enter the module's export surface**. A host that also `#include <stdio.h>` has its `printf` unconflicted with the module's — no more "import non-public symbol" error.
+- **Macros are never exported (either direction)**: `#define` is **preprocessing-time text substitution** and applies only to **the file that defines it** — it does not enter a module's export surface, and it is not injected into an imported module either. A host macro used inside an imported module, or a module macro used in the host, reports `use of undeclared identifier`. Function-like macros are more insidious: a **call form** such as `XM_ADD(2, 3)` is let through at compile time by the deliberately retained C89 implicit function declaration and only fails at **link time** with `undefined symbol: XM_ADD` (object-like `XM_MACRO` is rejected at compile time).
+
+**The only way to share a macro** is to have every consuming file `#include` the same header (a `.h` is C-surface for `.co` and is expanded per file); for an **integer constant** that must cross modules, use `public const` instead (both the bare name and `mod.K` work — see "Main Source and Submodules Alike" below).
+
+```co
+// shared.h -- the only way to share a macro: each side includes it
+#define XV_LIMIT 9
+
+// mod.co
+#include "shared.h"
+public int limit(void) { return XV_LIMIT; }     // 9
+
+// main.co
+#include "shared.h"
+import * from mod;
+int arr[XV_LIMIT];                              // 9; XV_LIMIT cannot be imported from mod
+```
 
 ## Visibility Rules
 

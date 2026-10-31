@@ -136,6 +136,11 @@ private:
 	// #pragma push_macro/pop_macro（clang/gcc 扩展，修 plct 00206）：
 	//   每个宏名对应一条定义快照栈；nullopt 表示快照时该宏未定义。
 	std::unordered_map<std::string, std::vector<std::optional<Macro>>> push_macro_stack_;
+	// P338：#pragma pack 的作用域栈与当前对齐上限（cur_pack_=0 表示无 pack 作用域≡自然对齐；
+	//   本目标默认 pack=8 对所有标量 ≡ 自然，故二者等价）。pack 值经 process_line 逐行发射时
+	//   给 token 盖章（Token::pack）传给 parser 的定义点，实现「定义点定格 + 按文件隔离」。
+	std::vector<unsigned> pack_stack_;
+	unsigned cur_pack_ = 0;
 };
 
 // 驱动管线入口：运行预处理器，产物写入 state.tokens。

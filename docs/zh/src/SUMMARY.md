@@ -4,6 +4,7 @@
 - [程序入口与执行](entry.md)
 - [函数定义](function.md)
 - [属性（[[...]]）](attribute.md)
+- [数据类型](types.md)
 - [struct / union / enum](struct.md)
 - [class](class.md)
 - [模块](module.md)

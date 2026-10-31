@@ -405,6 +405,8 @@ struct StructMember
 	CTypePtr type;
 	int bit_width = -1;  // -1 = 普通成员; >=0 = 位域宽度
 	unsigned align = 0;  // C23 _Alignas 成员强制对齐（字节；0 = 未指定）
+	// P337：GNU __attribute__((packed)) 施于字段——无显式对齐时有效对齐降为 1（显式 align 仍压过它）。
+	bool packed = false;
 	SourceLoc loc;       // 成员声明起始位置（诊断 note 用）
 };
 
@@ -414,7 +416,21 @@ struct StructDef
 	bool is_union = false;
 	bool is_definition = false; // 带 { ... } 的完整定义（false = 仅前置引用，成员表为空不代表空类型）
 	std::vector<StructMember> members;
+	// P343：布局快照。定义点（成员类型信息已齐）由 parser 用 record_layout 算定，随 public 导出
+	//   经 ImportTagSeed 传给消费方；`layout_size == 0` 表示未算，一切读取点回落到惰性推导。
+	//   存在的理由：导入到宿主 TU 的记录只有 inert 种子，成员里若嵌了「导出方内部的非 public
+	//   记录」，宿主侧递归推导找不到它而静默按 4 计；带上整张快照才能一次传准（含多层导入）。
+	int64_t layout_size = 0;            // 上取整到 align 后的字节数
+	int64_t layout_align = 0;           // 记录有效对齐
+	std::vector<int64_t> layout_member_off; // 与 members 等长：成员起始偏移（位域＝存储单元起点）
 	unsigned align = 0;   // GNU __attribute__((aligned(N))) 施加于 struct/union 类型本身（字节；0=未指定）
+	// P337：GNU __attribute__((packed)) 施于类型——其内无显式对齐成员一律按 1 对齐（不递归改写
+	//   已定义嵌套类型的内部布局；显式 _Alignas/类型级 aligned 压不住，见 clang 实测 Ha/T1/S10）。
+	bool packed = false;
+	// P338：`#pragma pack(N)` 定义点对本记录的对齐上限 cap（0=无 pack 作用域）。与 packed 并列的另一条
+	//   路：无显式对齐成员按 min(自然对齐, cap) 摆放（cap 不递归改写嵌套内部、显式声明对齐压不动，
+	//   见 clang 实测 pk_pack2：PK1/PK4/PK5/PK6）。含位域记录 clang 本就不因 pack 缩小，故不应用。
+	unsigned pack_cap = 0;
 	SourceLoc loc;
 	bool is_public = false;         // P212：struct 定义可标 public 参与 import
 	std::string source_module_key;  // P212 同 FuncDecl
@@ -430,6 +446,9 @@ struct EnumDef
 {
 	std::string tag;     // enum Name 的 Name
 	std::vector<EnumConstant> constants;
+	// P337：GNU __attribute__((aligned(N))) 施于 enum 类型——clang 实测改 _Alignof 而不改 sizeof
+	//   （`enum __attribute__((aligned(16))) EA{..}` → sizeof 4 / _Alignof 16）；packed 对 enum 无效。
+	unsigned align = 0;
 	SourceLoc loc;
 	bool is_public = false;         // P212
 	std::string source_module_key;  // P212

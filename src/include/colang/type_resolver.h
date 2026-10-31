@@ -265,7 +265,13 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 			return make_type(TypeKind::Int);
 		if (e->op == "-" || e->op == "+" || e->op == "~")
 		{
-			IntPromo p = int_promo_of(resolve_expr_type(e->lhs, env), env.long_bits());
+			// P340：一元 `-`/`+`/`~` 施于浮点保持原类型（§6.5.3.3；整型提升只对整型生效）。
+			//   旧路一律过 int_promo_of，其 default 把 Float/Double 收成 {32,false}，令
+			//   `sizeof(-d)`/`sizeof(d+d)` 在 codegen 侧得 4，而 parser 自算那份给 8——两引擎分叉。
+			CTypePtr ot = resolve_expr_type(e->lhs, env);
+			if (ot && (ot->kind == TypeKind::Float || ot->kind == TypeKind::Double))
+				return ot;
+			IntPromo p = int_promo_of(ot, env.long_bits());
 			return int_ctype_of(p.bits, p.is_unsigned);
 		}
 		// ++/--（prefix/postfix）结果类型 = 操作数类型（C：后缀值为自增前的旧值，类型同操作数）。
@@ -312,6 +318,17 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		if (bop == "==" || bop == "!=" || bop == "<" || bop == ">" ||
 		    bop == "<=" || bop == ">=" || bop == "&&" || bop == "||")
 			return make_type(TypeKind::Int);
+		// P340：常用算术转换（§6.3.1.8）中浮点秩高于整型——`+ - * /` 两侧任一为浮点即取浮点秩高者。
+		//   旧路只走 int_uac，令 `d+d`/`1+d`/`d/2` 在 codegen 侧全被当 int（parser 侧反而对）。
+		if (bop == "+" || bop == "-" || bop == "*" || bop == "/")
+		{
+			const bool lD = lt && lt->kind == TypeKind::Double;
+			const bool rD = rt && rt->kind == TypeKind::Double;
+			const bool lF = lt && lt->kind == TypeKind::Float;
+			const bool rF = rt && rt->kind == TypeKind::Float;
+			if (lD || rD) return make_type(TypeKind::Double);
+			if (lF || rF) return make_type(TypeKind::Float);
+		}
 		if (bop == "+" || bop == "-" || bop == "*" || bop == "/" || bop == "%" ||
 		    bop == "&" || bop == "|" || bop == "^")
 		{

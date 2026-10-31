@@ -91,6 +91,10 @@ public:
 			structs_[s.tag] = &s;
 			// P305：单建一份「真定义」索引（前置引用空壳不得盖住定义，成员名校核依赖它）。
 			if (s.is_definition) real_struct_defs_[s.tag] = &s;
+			// P344：裸名标签按模块分组（限定名/块内改名带 '.' 的键不进，仍走 structs_ 精确查表）。
+			//   merge 把各模块 struct 并进同一 vector 且宿主的恒排最后，只靠 last-wins 会让
+			//   模块内引用自身类型被宿主/他模块的同名项顶替——分组后由 record_def_of 按上下文挑。
+			if (s.tag.find('.') == std::string::npos) struct_defs_by_tag_[s.tag].push_back(&s);
 		}
 		// P217：enum 类型标签登记表（供跨模块类型可见性门禁查 is_public/source_module_key）
 		for (const auto &e : tu->enums)
@@ -379,12 +383,22 @@ public:
 		scopes_.emplace_back(); // 文件作用域（全局变量已入 globals_，本层仅充局部声明用）
 		// P212：拓序前插的 imported 项需“不查跨模块可见性”（子模块引用同模块非 public 助手合法）。
 		//   以 imported_top_level_body_count 为界：前缀项标“imported”、后缀项标“主源”（空串）。
+		// P344：前缀项还须带上**自己的模块 key**——模块内裸名引用（含与宿主同名的非 public 记录）
+		//   恒绑自身定义；只标哨兵 "imported" 时 record_def_of 认不出归属，会落到宿主同名项上误判成员。
+		//   逐模块分段视图（loader 双写、拓序最深依赖在前）与摊平 body 的顺序相反，故按段逆序铺 key。
 		const std::size_t prefix = tu->imported_top_level_body_count;
+		std::vector<std::string> prefix_keys;
+		prefix_keys.reserve(prefix);
+		for (auto sit = tu->top_level_segments.rbegin(); sit != tu->top_level_segments.rend(); ++sit)
+			prefix_keys.insert(prefix_keys.end(), sit->second.size(), sit->first);
 		std::size_t idx = 0;
 		for (const auto &s : tu->top_level_body)
 		{
 			if (!s) { ++idx; continue; }
-			cur_source_module_key_ = (idx < prefix) ? std::string("imported") : std::string();
+			if (idx < prefix)
+				cur_source_module_key_ = idx < prefix_keys.size() ? prefix_keys[idx] : std::string("imported");
+			else
+				cur_source_module_key_.clear();
 			check_stmt(s, 0, 0);
 			++idx;
 		}
@@ -1151,6 +1165,15 @@ private:
 		return t && (t->kind == TypeKind::Array || t->kind == TypeKind::Struct || t->kind == TypeKind::Union);
 	}
 
+	// P349：字符串字面量可整体初始化的元素型（§6.7.9p14「array of character type」）。
+	//   `unsigned char` 在 CType 里是 Char + is_unsigned=true（与 char 同 kind）→ 一并覆盖。
+	static bool is_char_elem(const CTypePtr &t)
+	{
+		if (!t) return false;
+		return t->kind == TypeKind::Char || t->kind == TypeKind::Char8 || t->kind == TypeKind::WChar ||
+		       t->kind == TypeKind::Char16 || t->kind == TypeKind::Char32;
+	}
+
 	// 标量槽位：对表达式做一次 assign_compat（复用三元/常量性既有放行护栏）
 	void check_scalar_slot(const CTypePtr &to, const ExprPtr &it)
 	{
@@ -1209,6 +1232,15 @@ private:
 		{
 			// 字符串字面量整体初始化字符数组（§6.7.9p14）：不逐元素（不触及元素位）
 			if (args.size() == 1 && args[0] && args[0]->kind == ExprKind::StringLiteral) return;
+			// P349：brace elision 形态（`struct T {u8 s[4]; u8 a;} t = {"abc", 1};`）——此时 args 是
+			//   外层花括号内容、字符串只是其中一项，上一条判据不成立（旧行为把游标降到元素 u8，
+			//   报「指针转整数」。clang 接受，属误拒）。改按「当前项是字符串 + 元素是字符型」
+			//   消费一整格，与 codegen elide_fold/elide_store 同口径；其余元素由零初始化补齐。
+			if (pos < args.size() && args[pos] && args[pos]->kind == ExprKind::StringLiteral && is_char_elem(to->base))
+			{
+				pos++;
+				return;
+			}
 			for (std::size_t k = 0; k < to->array_size && pos < args.size(); ++k)
 				agg_consume(to->base, args, pos, depth);
 			return;
@@ -1233,12 +1265,28 @@ private:
 		}
 	}
 
-	// 把单项元素应用到槽型 slot（子 InitList→递归；标量落聚合槽→brace elision；否则标量检查）
+	// 把单项元素应用到槽型 slot（子 InitList→递归；同型聚合整值→放行；标量落聚合槽→brace elision；否则标量检查）
 	void agg_apply_to_slot(const CTypePtr &slot, const ExprPtr &elem, int depth)
 	{
 		if (!slot || !elem || depth > 16) return;
 		if (elem->kind == ExprKind::InitList) { agg_walk_init(slot, elem, depth + 1); return; }
-		if (agg_slot(slot)) { std::vector<ExprPtr> one{elem}; std::size_t pos = 0; agg_walk_pos(slot, one, pos, depth + 1); return; }
+		if (agg_slot(slot))
+		{
+			// P349：右值是**与槽同型的聚合表达式**（`.m = s`、`.m = p->m`）→ 整值初始化，不 elide。
+			//   旧版直接落 brace elision，把 struct 值当首成员链的叶子消费，报「用 struct X 初始化 u8」
+			//   （clang 接受，属误拒）。与上方 agg_consume 的同型整值判据同口径。
+			const CTypePtr nt = resolve_type(elem);
+			if (nt && (nt->kind == TypeKind::Struct || nt->kind == TypeKind::Union) &&
+			    assign_compat(nt, slot, elem) == Compat::Ok)
+			{
+				check_scalar_slot(slot, elem);
+				return;
+			}
+			std::vector<ExprPtr> one{elem};
+			std::size_t pos = 0;
+			agg_walk_pos(slot, one, pos, depth + 1);
+			return;
+		}
 		check_scalar_slot(slot, elem);
 	}
 
@@ -1586,6 +1634,28 @@ private:
 	const StructDef *record_def_of(const std::string &tag) const
 	{
 		if (tag.empty()) return nullptr;
+		// P344：裸名 tag 可能同时存在多份（宿主一份、各被导入模块各一份，merge 只把它们并进同一
+		//   vector 且宿主排末位）。旧实现按 structs_ 的 last-wins 取，模块内引用自身记录会拿到宿主
+		//   或他模块的同名定义 → 成员名校核误报 `no member named`。改按「当前代码归属」挑：
+		//   ① 归属模块自己的定义 ② 宿主自有定义 ③ 其余定义 ④ 只剩前置引用空壳。
+		//   带 '.' 的键（限定名 `alias.Tag` / 块内改名 `X.__blkN`）本就是精确键，走 structs_。
+		if (tag.find('.') == std::string::npos)
+		{
+			auto git = struct_defs_by_tag_.find(tag);
+			if (git != struct_defs_by_tag_.end())
+			{
+				for (const StructDef *s : git->second)
+					if (s && s->is_definition && !s->source_module_key.empty() &&
+					    s->source_module_key == cur_source_module_key_)
+						return s;
+				for (auto rit = git->second.rbegin(); rit != git->second.rend(); ++rit)
+					if (*rit && (*rit)->is_definition && (*rit)->source_module_key.empty())
+						return *rit;
+				for (auto rit = git->second.rbegin(); rit != git->second.rend(); ++rit)
+					if (*rit && (*rit)->is_definition) return *rit;
+				return git->second.back(); // 只有前置声明的空壳
+			}
+		}
 		auto it = structs_.find(tag);
 		if (it != structs_.end() && it->second && it->second->is_definition) return it->second;
 		auto rd = real_struct_defs_.find(tag);
@@ -1800,6 +1870,9 @@ private:
 			// 主源引用 `struct X` 时 parser 会先造一条前置引用项（is_definition=false、source_module_key 空）；
 			//   loader 又把子模块 struct 插到 vector 首部，故 structs_[tag] 可能指向主源的空壳。
 			//   门禁须以「真正的定义项」为准：按 tag 找 is_definition 的那条（即子模块定义）判归属/public。
+			// P344：但宿主自有同名定义时，该引用恒绑宿主自身（裁定②遮蔽），不存在跨模块可见性问题；
+			//   修前首匹配会取到模块的同名定义，把宿主自引用误报成「不可导入非 public / 未从模块导入」。
+			if (host_defines_type(t->tag)) return;
 			const StructDef *def = find_struct_def_by_tag(t->tag);
 			if (!def || def->source_module_key.empty()) return; // 无定义/主源自定义 → 跳过
 			ensure_visible_from_main(t->tag, def->source_module_key, def->is_public, loc);
@@ -2028,11 +2101,12 @@ private:
 					if (m.name == field) return m.ret_type;
 				return nullptr;
 			}
-			auto it = self->structs_.find(tag);
-			if (it == self->structs_.end()) return nullptr;
-			for (const auto &m : it->second->members)
+			// P344：按当前代码归属取记录定义（模块内自引用不得被宿主同名项顶替）。
+			const StructDef *sd = self->record_def_of(tag);
+			if (!sd) return nullptr;
+			for (const auto &m : sd->members)
 				if (!m.name.empty() && m.name == field) return m.type;
-			for (const auto &m : it->second->members)
+			for (const auto &m : sd->members)
 			{
 				if (m.name.empty() && m.type
 					&& (m.type->kind == TypeKind::Struct || m.type->kind == TypeKind::Union)
@@ -2192,9 +2266,9 @@ private:
 	SourceLoc find_member_loc(const CTypePtr &obj, const std::string &field)
 	{
 		if (!obj || obj->tag.empty() || field.empty()) return {};
-		auto sit = structs_.find(obj->tag);
-		if (sit == structs_.end() || !sit->second) return {};
-		for (const auto &m : sit->second->members)
+		const StructDef *sd = record_def_of(obj->tag); // P344：按归属取定义
+		if (!sd) return {};
+		for (const auto &m : sd->members)
 			if (m.name == field) return m.loc;
 		return {};
 	}
@@ -2204,9 +2278,9 @@ private:
 	{
 		if (!t || depth > 4) return {};
 		if (t->kind != TypeKind::Struct && t->kind != TypeKind::Union) return {};
-		auto it = structs_.find(t->tag);
-		if (it == structs_.end()) return {};
-		for (const auto &m : it->second->members)
+		const StructDef *sd = record_def_of(t->tag); // P344：按归属取定义
+		if (!sd) return {};
+		for (const auto &m : sd->members)
 		{
 			if (!m.type) continue;
 			if (m.type->is_const) return m.loc;
@@ -2221,9 +2295,9 @@ private:
 	{
 		if (!t || depth > 4) return false;
 		if (t->kind != TypeKind::Struct && t->kind != TypeKind::Union) return false;
-		auto it = structs_.find(t->tag);
-		if (it == structs_.end()) return false;
-		for (const auto &m : it->second->members)
+		const StructDef *sd = record_def_of(t->tag); // P344：按归属取定义
+		if (!sd) return false;
+		for (const auto &m : sd->members)
 		{
 			if (!m.type) continue;
 			if (m.type->is_const) { out_name = m.name; return true; }
@@ -2871,11 +2945,17 @@ private:
 			check_void_incdec(e);
 			// P335：`-`/`+`/`!`/`~` 作用于 void 值——clang `invalid argument type 'void' to unary expression`
 			//   定位在运算符起点（e->loc）；仅当操作数型为 Void 才报，sizeof/alignof/++/-- 不属本形。
+			// P340：`~` 另限整型——clang 对浮点直拒
+			//   （`invalid argument type 'double' to unary expression`）；旧路静默接受并给出值。
 			if (e->op == "-" || e->op == "+" || e->op == "!" || e->op == "~")
 			{
 				CTypePtr ut = resolve_type(e->lhs);
 				if (ut && ut->kind == TypeKind::Void)
 					report(e->loc, "invalid argument type 'void' to unary expression");
+				// describe_type() 返回值已自带单引号（type_spell.h），此处不另补引号对。
+				else if (e->op == "~" && ut &&
+				         (ut->kind == TypeKind::Float || ut->kind == TypeKind::Double))
+					report(e->loc, "invalid argument type " + describe_type(ut) + " to unary expression");
 			}
 			// P335：`*` 解引用 void 值——clang `indirection requires pointer operand ('void' invalid)`
 			if (e->op == "*")
@@ -3367,6 +3447,126 @@ private:
 		}
 	}
 
+	// P348：数组类型链上含运行期维（VLA）——sema 侧判据，与 codegen 的 type_has_vla_dim 同口径。
+	static bool type_is_vla_array(const CTypePtr &t)
+	{
+		for (const CType *a = t.get(); a && a->kind == TypeKind::Array; a = a->base.get())
+			if (a->is_vla && a->vla_dim) return true;
+		return false;
+	}
+
+	// P348：前序扫描「goto / 标签 / VLA 声明」位置（独立一趟，不改动 P300 既有收集器）。
+	struct VlaJumpScan {
+		std::unordered_map<std::string, int> label_seq;
+		std::vector<std::pair<int, std::string>> gotos;
+		std::vector<SourceLoc> goto_locs;
+		std::vector<std::pair<int, std::string>> vlas;
+	};
+
+	void scan_vla_jumps(const StmtPtr &s, int &seq, VlaJumpScan &out)
+	{
+		if (!s) return;
+		const int my = seq++;
+		switch (s->kind)
+		{
+		case StmtKind::Label:
+			out.label_seq.emplace(s->label_name, my);
+			break;
+		case StmtKind::Goto:
+			out.gotos.push_back({my, s->label_name});
+			out.goto_locs.push_back(s->loc);
+			break;
+		case StmtKind::Decl:
+			if (s->var_type && type_is_vla_array(s->var_type))
+				out.vlas.push_back({my, s->var_name});
+			break;
+		default:
+			break;
+		}
+		scan_vla_jumps(s->init_stmt, seq, out);
+		scan_vla_jumps(s->for_init, seq, out);
+		if (s->kind == StmtKind::Compound)
+			for (const auto &b : s->body) scan_vla_jumps(b, seq, out);
+		else
+		{
+			scan_vla_jumps(s->then_branch, seq, out);
+			scan_vla_jumps(s->else_branch, seq, out);
+		}
+	}
+
+	// P348：switch body 内 case/default 跳过同块 VLA 初始化（clang: cannot jump from switch
+	//   statement to this case label）。嵌套 switch 由外层递归单独处理，此处不进其 body。
+	void scan_switch_vla_cases(const StmtPtr &s, int &seq,
+		std::vector<std::pair<int, std::string>> &vlas,
+		std::vector<std::pair<int, SourceLoc>> &cases)
+	{
+		if (!s) return;
+		const int my = seq++;
+		if (s->kind == StmtKind::Decl && s->var_type && type_is_vla_array(s->var_type))
+			vlas.push_back({my, s->var_name});
+		if (s->kind == StmtKind::Case || s->kind == StmtKind::Default)
+			cases.push_back({my, s->loc});
+		if (s->kind == StmtKind::Switch) return;
+		if (s->kind == StmtKind::Compound)
+			for (const auto &b : s->body) scan_switch_vla_cases(b, seq, vlas, cases);
+		else
+		{
+			scan_switch_vla_cases(s->then_branch, seq, vlas, cases);
+			scan_switch_vla_cases(s->else_branch, seq, vlas, cases);
+		}
+	}
+
+	void walk_switch_case_vla(const StmtPtr &s)
+	{
+		if (!s) return;
+		if (s->kind == StmtKind::Switch)
+		{
+			std::vector<std::pair<int, std::string>> vlas;
+			std::vector<std::pair<int, SourceLoc>> cases;
+			int seq = 0;
+			scan_switch_vla_cases(s->then_branch, seq, vlas, cases);
+			for (const auto &c : cases)
+				for (const auto &v : vlas)
+					if (v.first < c.first)
+					{
+						report(c.second, "jump bypasses initialization of variable length array '" + v.second + "'");
+						break;
+					}
+		}
+		if (s->kind == StmtKind::Compound)
+			for (const auto &b : s->body) walk_switch_case_vla(b);
+		else
+		{
+			walk_switch_case_vla(s->then_branch);
+			walk_switch_case_vla(s->else_branch);
+		}
+	}
+
+	// P348：禁止 goto/case 跳过 VLA 初始化——否则 codegen 的 stackrestore 可能读未经 stacksave 的帧。
+	//   判据循 clang：只拒「前向跳过声明」；后向跳回 VLA 之前 clang 接受（重新 alloca，语义正确），
+	//   此处不判，避免误杀 clang 容忍的写法。
+	void check_jump_bypass_vla(const StmtPtr &body)
+	{
+		if (!body) return;
+		VlaJumpScan sc;
+		int seq = 0;
+		scan_vla_jumps(body, seq, sc);
+		if (!sc.vlas.empty())
+			for (std::size_t i = 0; i < sc.gotos.size(); ++i)
+			{
+				auto lit = sc.label_seq.find(sc.gotos[i].second);
+				if (lit == sc.label_seq.end()) continue;
+				for (const auto &v : sc.vlas)
+					if (sc.gotos[i].first < v.first && v.first < lit->second)
+					{
+						report(sc.goto_locs[i], "jump to label '" + sc.gotos[i].second +
+							"' bypasses initialization of variable length array '" + v.second + "'");
+						break;
+					}
+			}
+		walk_switch_case_vla(body);
+	}
+
 	void check_func(const FuncDecl &f)
 	{
 		cur_func_ = &f;
@@ -3381,6 +3581,7 @@ private:
 		labels_.clear();
 		collect_labels(f.body);
 		check_goto_class_crossing(f.body); // P300 §风险项#4：禁 goto 跨越需 RC 清理的类句柄声明
+		check_jump_bypass_vla(f.body);     // P348：禁 goto/case 跳过 VLA 初始化（stackrestore 支配性）
 		// 非 void 函数可能执行到末尾而无 return（C 为 UB，clang 默认 -Wreturn-type 告警）。
 		// main 例外：C11 §5.1.2.2.3 规定 main 落到 } 等价于 return 0，clang 亦不告警。
 		if (f.return_type && f.return_type->kind != TypeKind::Void &&
@@ -3413,6 +3614,10 @@ private:
 	// P305：tag → 真定义（只收 `is_definition`）。`structs_` 按插入序后写胜出，同名前置引用
 	//   空壳（成员表为空）可能盖掉真定义；成员名校核必须看真定义，否则会把合法成员报成不存在。
 	std::unordered_map<std::string, const StructDef *> real_struct_defs_;
+	// P344：裸名 tag → 该 tag 的全部条目（含前置引用空壳），按 merge 后的 TU 顺序。`structs_` 是
+	//   last-wins 单槽，同名记录分属宿主与多个模块时会互相顶替；分组后由 record_def_of 按当前
+	//   代码归属挑定义（模块内自引用恒绑自身，宿主裸名恒绑宿主自有定义）。
+	std::unordered_map<std::string, std::vector<const StructDef *>> struct_defs_by_tag_;
 	// P302：public 标签 → 导出它的模块 key 集合（struct/union/enum 共用一张表；C 里 tag 是
 	//   独立名字空间，故不与 xmod_public_owners（函数/全局）混用）。owner ≥2 即「同名标签
 	//   被多个模块导出」，定义侧告警、宿主裸名引用侧报错——修前无任何检测，布局由后

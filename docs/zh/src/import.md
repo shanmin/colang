@@ -59,10 +59,27 @@ import * from ("file" | module_name) [as ModAlias];
 
 ## 独立模块闭包
 
-自 **0.3.2** 起，每个 `.co` 模块都是**独立的编译闭包**：逐模块各自建类型表与符号表、各自分析，主源只经**导出面**（`public` 名称）看到模块。这带来两条用户可见的保证：
+自 **0.3.2** 起，每个 `.co` 模块都是**独立的编译闭包**：逐模块各自建类型表与符号表、各自分析，主源只经**导出面**（`public` 名称）看到模块。这带来三条用户可见的保证：
 
 - **同名类型异布局互不干扰**：两个模块各定义同名 `struct Config` 而布局不同，各自 `sizeof` 取自身布局，不存在「后导入者顶替」。
 - **ambient 切断**：模块内 `#include`（如 `<stdio.h>`）带入的**环境符号**（`printf` 等）**不进入模块导出面**。宿主即使也 `#include <stdio.h>`，其 `printf` 与模块互不冲突、不再报「导入非 public 符号」。
+- **宏不随模块导出（双向）**：`#define` 是**预处理期的文本替换**，只对**定义它的那个文件**生效——既不进模块导出面，也不会反向注入被导入模块。主源里的宏在被导入模块内、模块里的宏在主源内，都报 `use of undeclared identifier`。函数宏更隐蔽：`XM_ADD(2, 3)` 这种**调用形**会被显式保留的 C89 隐式函数声明放过编译期，拖到**链接期**才报 `undefined symbol: XM_ADD`（对象宏 `XM_MACRO` 则在编译期就报未声明）。
+
+**共享宏的唯一手段**是让引用双方各自 `#include` 同一个头文件（`.h` 对 `.co` 是 C 口径面、按文件独立展开）；要跨模块共享的**整型常量**请用 `public const`（裸名与 `mod.K` 均可，见下文「主源与子模块同口径」）。
+
+```co
+// shared.h —— 宏只能这样共享：各方自己包含
+#define XV_LIMIT 9
+
+// mod.co
+#include "shared.h"
+public int limit(void) { return XV_LIMIT; }     // 9
+
+// main.co
+#include "shared.h"
+import * from mod;
+int arr[XV_LIMIT];                              // 9；不能指望从 mod 导入 XV_LIMIT
+```
 
 ## 可见性规则
 

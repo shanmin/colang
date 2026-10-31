@@ -438,20 +438,37 @@ void harvest_tag_seeds(const std::unordered_map<std::string, TUPtr> &cache,
 		{
 			if (!s.is_public || s.tag.empty()) continue;
 			if (!seen.insert(s.tag).second) continue;
-			out.push_back(ImportTagSeed{s.tag, s.is_union, false});
+			ImportTagSeed seed;
+			seed.name = s.tag;
+			seed.is_union = s.is_union;
+			// P343：完整定义才带布局快照（前置声明只有名字，消费方仍按不完整处理）。
+			if (s.is_definition)
+			{
+				seed.members = s.members;
+				seed.layout_size = s.layout_size;
+				seed.layout_align = s.layout_align;
+				seed.layout_member_off = s.layout_member_off;
+			}
+			out.push_back(std::move(seed));
 		}
 		for (const auto &e : tu->enums)
 		{
 			if (!e.is_public || e.tag.empty()) continue;
 			if (!seen.insert(e.tag).second) continue;
-			out.push_back(ImportTagSeed{e.tag, false, true});
+			ImportTagSeed seed;
+			seed.name = e.tag;
+			seed.is_enum = true;
+			out.push_back(std::move(seed));
 		}
 		// P300 Co class（跨模块 import）：public class 标签出种子，使宿主 parse 期即可裸类名作类型。
 		for (const auto &c : tu->classes)
 		{
 			if (!c.is_public || c.tag.empty()) continue;
 			if (!seen.insert(c.tag).second) continue;
-			out.push_back(ImportTagSeed{c.tag, false, false, true});
+			ImportTagSeed seed;
+			seed.name = c.tag;
+			seed.is_class = true;
+			out.push_back(std::move(seed));
 		}
 	};
 	if (only_keys)

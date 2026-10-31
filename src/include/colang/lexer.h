@@ -39,6 +39,10 @@ struct Token
 	SourceLoc loc;    // token 起点（文件/行/列）
 	bool bol = false;     // 前一 token 之后发生过换行（本 token 是逻辑行首）
 	bool had_space = false; // 与前一 token 之间隔了空白/注释（非行首时有效）；为函数式宏与 #/## 邻接判定铺路
+	// P338：发射点 `#pragma pack` 的当前对齐上限（cap；0=无 pack 作用域，走自然对齐）。
+	//   仅预处理器在 run 的逐行发射尾部按 cur_pack_ 盖章，供 parser 在记录定义点读回；
+	//   默认 0 使所有既有 token 构造点零改动，且对 -E/print_tokens 文本输出不可见。
+	unsigned pack = 0;
 };
 
 // next() 三态返回

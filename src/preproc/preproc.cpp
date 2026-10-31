@@ -2136,7 +2136,107 @@ bool Preprocessor::handle_pragma(const std::vector<Token> &line)
 		}
 		return true;
 	}
-	// 其他 pragma（mark/pack/GCC/...）：静默忽略
+	// P338：#pragma pack 真支持（承接 P337 次批）。建模为「对齐上限 cap」：无显式对齐成员按
+	//   min(自然对齐, cap) 摆放。cur_pack_ 表示当前生效 cap（0=无 pack 作用域≡自然对齐；本目标
+	//   默认 pack=8 对所有标量 ≡ 自然，二者等价）。状态完全留在预处理器：pack 值经 process_line
+	//   逐行发射时给 token 盖章，供 parser 在记录定义点读回（定义点定格、天然按文件隔离）。
+	//   无关 pragma 仍静默（不影响布局正确性）。
+	if (ptype == "pack")
+	{
+		auto warn = [&](const std::string &m) {
+			Error e;
+			e.file = line[0].loc.file;
+			e.pos = Pos{line[0].loc.line, line[0].loc.column};
+			e.message = m;
+			e.is_warning = true;
+			errors_.push_back(std::move(e));
+		};
+		// 取参数 token：优先括号内（pack(...)），否则 pack 之后的裸参数。
+		std::vector<const Token *> args;
+		std::size_t pi = 3;
+		if (pi < line.size() && line[pi].kind == TokKind::Punct && line[pi].text == "(")
+		{
+			int depth = 1;
+			for (++pi; pi < line.size(); ++pi)
+			{
+				const Token &t = line[pi];
+				if (t.kind == TokKind::Punct && t.text == "(") { ++depth; args.push_back(&t); continue; }
+				if (t.kind == TokKind::Punct && t.text == ")")
+				{
+					if (--depth == 0) break;
+					args.push_back(&t);
+					continue;
+				}
+				args.push_back(&t);
+			}
+		}
+		else
+		{
+			for (; pi < line.size(); ++pi) args.push_back(&line[pi]);
+		}
+		// 解析十进制对齐值（非数字返回 false；调用处再判合法域）。
+		auto parse_num = [](const Token *t, unsigned &out) -> bool {
+			if (!t || t->kind != TokKind::Number || t->text.empty()) return false;
+			unsigned v = 0;
+			for (char c : t->text) { if (c < '0' || c > '9') return false; v = v * 10u + (unsigned)(c - '0'); if (v > 100000u) return false; }
+			out = v;
+			return true;
+		};
+		auto valid_cap = [](unsigned v) { return v == 1 || v == 2 || v == 4 || v == 8 || v == 16; };
+		// pack() / 空参数 → 复位到默认（cur_pack_=0 ≡ 自然）。
+		if (args.empty())
+		{
+			cur_pack_ = 0;
+			return true;
+		}
+		const std::string &head = args[0]->text;
+		if (head == "push")
+		{
+			pack_stack_.push_back(cur_pack_);
+			// push[, value]：value 须为整数；带引号/非数字 → clang 同形告警并忽略值（但仍已 push）。
+			if (args.size() >= 3 && args[1]->kind == TokKind::Punct && args[1]->text == ",")
+			{
+				const Token *vt = args[2];
+				unsigned v = 0;
+				if (vt->kind == TokKind::String || !parse_num(vt, v))
+				warn("expected integer or identifier in '#pragma pack' - ignored");
+				else if (v == 0) cur_pack_ = 0;
+				else if (valid_cap(v)) cur_pack_ = v;
+				else warn("expected #pragma pack parameter to be '1', '2', '4', '8', or '16'");
+			}
+			return true;
+		}
+		if (head == "pop")
+		{
+			if (pack_stack_.empty())
+			{
+				warn("#pragma pack(pop, ...) failed: stack empty");
+				return true;
+			}
+			cur_pack_ = pack_stack_.back();
+			pack_stack_.pop_back();
+			return true;
+		}
+		if (head == "show")
+		{
+			warn("value of #pragma pack(show) == " + std::to_string(cur_pack_ ? cur_pack_ : 8u));
+			return true;
+		}
+		// 裸数值：0 → 复位；1/2/4/8/16 → 设定；其余 → 告警并忽略。
+		{
+			unsigned v = 0;
+			if (!parse_num(args[0], v))
+			{
+				warn("expected integer or identifier in '#pragma pack' - ignored");
+				return true;
+			}
+			if (v == 0) cur_pack_ = 0;
+			else if (valid_cap(v)) cur_pack_ = v;
+			else warn("expected #pragma pack parameter to be '1', '2', '4', '8', or '16'");
+			return true;
+		}
+	}
+	// 其他 pragma（mark/GCC/...）：静默忽略
 	return true;
 }
 
@@ -2296,7 +2396,11 @@ bool Preprocessor::process_line(const std::vector<Token> &line, std::vector<Toke
 	}
 	if (is_active())
 	{
+		const std::size_t mark = out.size(); // P338：本行发射起点
 		expand_line(line, out); // 对象式宏展开后转发（P1.4）
+		// P338：本行新增 token 统一盖当前 pack cap（定义点定格；指令行不进此处）。
+		for (std::size_t k = mark; k < out.size(); ++k)
+			out[k].pack = cur_pack_;
 	}
 	return true;
 }

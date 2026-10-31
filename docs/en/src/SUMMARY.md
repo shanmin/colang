@@ -4,6 +4,7 @@
 - [Program Entry and Execution](entry.md)
 - [Function Definition](function.md)
 - [Attributes ([[...]])](attribute.md)
+- [Data Types](types.md)
 - [struct / union / enum](struct.md)
 - [class](class.md)
 - [Module](module.md)

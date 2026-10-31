@@ -168,8 +168,9 @@ int WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow)
 Co 接受 GNU 的 `__attribute__((...))` 拼写，并**分级**处理：
 
 - **`aligned(N)`——赋予真语义**：抬高对象 / 成员 / `struct`·`union` 类型 / `typedef` 的对齐（可经 `sizeof`、`_Alignof`、`offsetof` 观察到），与本机 clang `-std=c23` 逐字一致。它只做**单向提升**：对齐取 `max(自然对齐, N)`，**永不降低**。`N` 须为 2 的幂，否则报错（与 clang 同）。
+- **`packed`——赋予真语义（0.5.0 起）**：施于 `struct`/`union` 类型或某个字段时，真改 `sizeof`、`_Alignof`、`offsetof` 与产物布局（无显式对齐的成员按 1 字节紧凑排布），与本机 clang `-std=c23` 逐值一致。四条边界如实列出：① **显式声明的对齐胜出**——成员自己的 `_Alignas(N)`、或该成员类型上带的类型级 `aligned(N)`，仍按 `N` 对齐（`packed` 只压「自然对齐」，不降「显式对齐」）；② **只在真生效的位点绑定**——`struct`/`union` 关键字与标签名之间、闭花括号 `}` 之后、字段名之后；写在声明说明符之前、变量名之后、`typedef` 名之后、形参、函数、以及标签名与 `{` 之间时**不生效**，并发出与 clang 同形的忽略告警（`'packed' attribute ignored` / `attribute 'packed' is ignored, place it after "struct" …`，其中 `struct` 随关键字变）；③ `packed` **不递归**改写已定义嵌套类型自身的内部布局；④ **与位域同现时同样真生效**——位域的**存储单元宽度不变**（`int : 4` 仍占 4 字节 / i32），`packed` 只把单元的**放置对齐**压到 1；零宽 `:0` 只截断当前单元、自身不占空间也不贡献对齐；单元类型一变或超宽即另开单元（如 `struct { unsigned a : 3; unsigned b : 5; char c; }` 加 `packed` 为 5/1，自然为 8/4，与本机 clang 逐值一致）。另有 `#pragma pack` 这条独立路径**自 0.5.0 起也真生效**（栈式语义见「当前边界」）。
 - **其余所有属性——接受语法、忽略语义、发告警**，按风险分**两级**：
-  - **强警告（可能影响内存布局 / 调用约定 / 链接）**：`packed`、调用约定类（`stdcall` / `cdecl` / `fastcall` / `thiscall` / `vectorcall`）、`section`、`weak`、`alias`、`dllimport` / `dllexport`、`constructor` / `destructor` 等。文案形如 `gnu attribute 'packed' ignored: may affect layout/ABI (non-standard, GCC/Clang compatibility)`。
+  - **强警告（可能影响内存布局 / 调用约定 / 链接）**：调用约定类（`stdcall` / `cdecl` / `fastcall` / `thiscall` / `vectorcall`）、`section`、`weak`、`alias`、`dllimport` / `dllexport`、`constructor` / `destructor` 等（`packed` 自 0.5.0 起已赋予真语义，不再属本级）。文案形如 `gnu attribute 'stdcall' ignored: may affect layout/ABI (non-standard, GCC/Clang compatibility)`。
   - **轻警告（仅优化 / 诊断 / 信息性，忽略不改变可观察行为）**：`noinline`、`always_inline`、`format`、`unused`、`used`、`pure`、`const`、`visibility`、`deprecated` 等，以及**未识别的属性名**。文案形如 `gnu attribute 'noinline' ignored (non-standard, GCC/Clang compatibility)`。
 - **以上告警都不阻断编译、不改变退出码。**
 
@@ -183,13 +184,14 @@ int  __attribute__((noinline)) leaf(void) { return 42; }  // 接受 + 轻警告
 ```
 
 > **兼容性告知（重要）**：
-> 1. 真 GCC/Clang 会**完整实现**这些属性，Co **只兑现 `aligned`**、其余一律忽略。若源码依赖 `packed` 压缩布局或某种调用约定，它在 Co 下**能编过、但行为与 GCC/Clang 不同**（结构不按 1 字节对齐、调用约定不变）——这正是 Co 对每个被忽略的「布局/ABI 类」属性都发**强警告**、而非静默接受的原因。
-> 2. 需要真实布局效果时，`aligned` 可改写为 C23 的 `_Alignas(N)`；`packed` 等在标准里无对应物、暂无等价写法。
+> 1. 真 GCC/Clang 会**完整实现**这些属性，Co 目前**兑现 `aligned` 与 `packed`**（后者限上一条列出的生效位点；「与位域同现」一项自 0.5.0 延续批起同样真生效），其余仍按「接受语法 + 忽略语义 + 分级告警」处理。若源码依赖某种调用约定，或依赖 `section`/`alias` 之类的链接属性，它在 Co 下**能编过、但行为与 GCC/Clang 不同**——这正是 Co 对每个被忽略的「布局/ABI 类」属性都发**强警告**、而非静默接受的原因。
+> 2. 需要真实布局效果时，`aligned` 可改写为 C23 的 `_Alignas(N)`；`packed` 在标准里无对应物，只能写 GNU 拼写（Co 已兑现其属性侧效果）。`#pragma pack` **自 0.5.0 起同样真产生布局效果**（`pack(N)`、`pack(push, N)`/`pack(push)`/`pack(pop)`、`pack(0)` 与裸 `pack()` 复位均按 clang 语义生效，可经 `sizeof`/`_Alignof`/`offsetof` 观察到）——两种写法可以等价互换，差异只在形态：`packed` 是**类型级绑定**（写在类型或字段上），`#pragma pack` 是**词法作用域内的对齐上限**（从 pragma 位置起生效、`pop` 还原）。
 > 3. `__declspec(...)`（MSVC 扩展）**不在本扩展范围内、不支持**；库归属请用 `[[lib("X")]]`。
 > 4. `aligned` 的罕见形式（无参 `aligned`、`aligned(_Alignof(T))`、`aligned(类型)`）本批**降级为轻警告忽略**。
 
 ## 当前边界（编译器实装状态）
 
+- `packed` 的实装状态（0.5.0 起）：**`__attribute__((packed))` 属性侧真改布局**（生效位点与「显式对齐胜出」「不递归改写嵌套」「与位域同现同样真生效」三条边界见上一节）；**`#pragma pack` 自 0.5.0 起同样真改布局**——`pack(N)`、`pack(push, N)`/`pack(push)`/`pack(pop)`、`pack(0)` 与裸 `pack()` 复位均按 clang 语义生效。四条口径：① **对齐上限**：成员有效对齐取 `min(自然对齐, N)`，即 pack 只压**自然**对齐、不压**显式声明**的对齐（`_Alignas`、类型级 `aligned`），且 `pack(16)` **不抬高**；② **作用域栈**：`push`/`pop` 成对还原，空栈 `pop` 发警告并忽略；③ **定义点定格**：记录在 `struct`/`union` 定义点取当时的上限，其后 `pop` 不影响已定义类型；④ **含位域记录同样受 pack 约束**——位域存储单元宽度不变（`int : 4` 仍占 4 字节），pack 只把单元的**放置对齐**压到 `min(自然, N)`（`pack(1)` 等价于 `packed`）；零宽 `:0` 只截断单元、自身不占空间也不贡献对齐；单元类型一变或超宽即另开单元。取证形：`struct { char c; int i : 4; }` 在 `pack(2)` 下 6/2、`pack(4)` 下 8/4、packed 下 5/1；`struct { unsigned a : 3; unsigned b : 5; char c; }` 自然 8/4、packed 5/1，与本机 clang 逐值一致。非法参数（非 1/2/4/8/16）发警告并忽略，带引号的 `push, "name"` 按 clang 忽略；`packed` + 位域与 `#pragma pack(1)` + 位域两种写法结果等价。
 - `[[lib("X")]]` 落地为 COFF `.drectve` 段的 `/DEFAULTLIB` 链接指令，按声明首现序去重；这依赖链接步能消费该指令，**尚不能**做到「同名符号按具体 dll 精确绑定」——多 dll 同名符号的 per-symbol 绑定属后续链接器能力。
 - `[[deprecated]]` 生效范围限于顶层函数与全局变量的引用点告警；局部声明位不生效，C23 允许的第二个标注位点（声明符之后）未建模。
 - `[[nodiscard]]` / `[[noreturn]]` 首批语义已落地（丢弃告警 / 不返回校验）。边界：标在非函数声明上（如 `[[nodiscard]] int x = 7;`）静默接受；挂在 `struct`/`union` 类型或函数指针类型上（C23 允许）未建模；`[[_Noreturn]]` 旧拼写不报弃用警告。
