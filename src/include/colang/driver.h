@@ -46,6 +46,10 @@ struct CompileOptions
 	bool preload_colang_h = true; // 自动注入默认设置头 colang.h：仅主翻译单元；import 子模块置 false
 
 	bool rc_dialect = false; // .rc 方言：跳过 C 阶段6 相邻字符串字面量合并（仅 RC 路径置真，C 路径逐字节不变）
+
+	// —— 诊断分级（warning 体系）——
+	bool werror = false;                            // -Werror：将所有告警升级为错误
+	std::vector<std::string> wno_groups;            // -Wno-<group>：抑制指定组（存组名、不带 -Wno- 前缀）
 };
 
 // 层间共享的编译产物；随管线推进逐步填充。

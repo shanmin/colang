@@ -358,10 +358,14 @@ struct Parser
 		return tag;
 	}
 
-	// 登记局部声明的名字（供 enum 常量遮蔽判定）
-	void note_local_name(const std::string &n)
+	// 登记局部声明的名字（供 enum 常量遮蔽判定 + P353 重定义诊断）
+	void note_local_name(const std::string &n, const SourceLoc &loc = {})
 	{
-		if (!var_scope_.empty()) var_scope_.back().insert(n);
+		if (!var_scope_.empty())
+		{
+			if (!var_scope_.back().insert(n).second && loc.line)
+				error(loc, "redefinition of '" + n + "'");
+		}
 	}
 
 	// 该名是否被内层局部声明（变量或形参）占用
@@ -463,13 +467,14 @@ struct Parser
 	}
 
 	// 告警：不置致命标志（Error::is_warning=true，driver 侧 has_fatal 不计入）
-	void warn(const SourceLoc &loc, const std::string &msg)
+	void warn(const SourceLoc &loc, const std::string &msg, const char *group = "")
 	{
 		Error e;
 		e.file = loc.file;
 		e.pos = Pos{loc.line, loc.column};
 		e.message = msg;
 		e.is_warning = true;
+		if (group && *group) e.warning_group = group;
 		errs.push_back(std::move(e));
 	}
 
@@ -590,7 +595,7 @@ struct Parser
 			for (const auto &s : *td_seeds_)
 				if (s.name == kv.first) { at = s.loc; break; }
 			warn(at, "typedef '" + kv.first + "' is exported by multiple imported modules (" + list +
-				"); unqualified references are an error, use a qualified name");
+				"); unqualified references are an error, use a qualified name", "ambiguous-import");
 		}
 	}
 
@@ -1265,7 +1270,7 @@ struct Parser
 		for (const char *p : k_no_effect)
 			if (name == p) return true;
 		if (!name.empty())
-			warn(loc, "unknown attribute '" + name + "' ignored");
+			warn(loc, "unknown attribute '" + name + "' ignored", "unknown-attributes");
 		return true;
 	}
 
@@ -1397,9 +1402,9 @@ struct Parser
 		{
 			const SourceLoc kw_loc = peek().loc;
 			advance(); // __attribute__
-			if (!check_punct("(")) { warn(kw_loc, "'__attribute__' expects '('"); break; }
+			if (!check_punct("(")) { warn(kw_loc, "'__attribute__' expects '('", "ignored-attributes"); break; }
 			advance(); // (
-			if (!check_punct("(")) { warn(kw_loc, "'__attribute__' expects an attribute list in parentheses"); break; }
+			if (!check_punct("(")) { warn(kw_loc, "'__attribute__' expects an attribute list in parentheses", "ignored-attributes"); break; }
 			advance(); // (
 			for (;;)
 			{
@@ -1410,7 +1415,7 @@ struct Parser
 				if (peek().kind == TokKind::Identifier || peek().kind == TokKind::Keyword)
 					raw = advance().text;
 				else
-					warn(a_loc, "expected attribute name in '__attribute__'");
+					warn(a_loc, "expected attribute name in '__attribute__'", "ignored-attributes");
 				const std::string name = gnu_norm_name(raw);
 				unsigned a_val = 0; bool a_has_arg = false;
 				if (check_punct("("))
@@ -1439,7 +1444,7 @@ struct Parser
 						else if (a_val > aligned_acc) { aligned_acc = a_val; gnu_alignas_loc_ = a_loc; }
 					}
 					else
-						warn(a_loc, "'aligned' without a constant argument is ignored (non-standard, GCC/Clang compatibility)");
+						warn(a_loc, "'aligned' without a constant argument is ignored (non-standard, GCC/Clang compatibility)", "ignored-attributes");
 				}
 				else if (!name.empty())
 				{
@@ -1452,13 +1457,13 @@ struct Parser
 						if (gnu_packed_mode_ == GnuPackedMode::Ignore && !packed_warned)
 						{
 							packed_warned = true;
-							warn(a_loc, "'packed' attribute ignored"); // clang 同形（非聚合对象/typedef/函数位）
+							warn(a_loc, "'packed' attribute ignored", "ignored-attributes"); // clang 同形（非聚合对象/typedef/函数位）
 						}
 					}
 					else if (gnu_is_layout_abi(name))
-						warn(a_loc, "gnu attribute '" + name + "' ignored: may affect layout/ABI (non-standard, GCC/Clang compatibility)");
+						warn(a_loc, "gnu attribute '" + name + "' ignored: may affect layout/ABI (non-standard, GCC/Clang compatibility)", "ignored-attributes");
 					else
-						warn(a_loc, "gnu attribute '" + name + "' ignored (non-standard, GCC/Clang compatibility)");
+						warn(a_loc, "gnu attribute '" + name + "' ignored (non-standard, GCC/Clang compatibility)", "ignored-attributes");
 				}
 				if (check_punct(",")) { advance(); continue; }
 				break;
@@ -2014,7 +2019,7 @@ struct Parser
 	void warn_alignas_ignored(bool has, const SourceLoc &loc)
 	{
 		if (!has) return;
-		warn(loc, "'_Alignas' attribute ignored");
+		warn(loc, "'_Alignas' attribute ignored", "ignored-attributes");
 	}
 	void reject_alignas(bool has, const SourceLoc &loc, const char *what)
 	{
@@ -2602,7 +2607,7 @@ struct Parser
 		if (gpre_packed)
 			warn(gpre_packed_loc, (check_keyword("struct") || check_keyword("union"))
 				? "attribute 'packed' is ignored, place it after \"struct\" to apply attribute to type declaration"
-				: "'packed' attribute ignored");
+				: "'packed' attribute ignored", "ignored-attributes");
 		const bool sc_static = last_static_, sc_extern = last_extern_, sc_typedef = last_typedef_;
 		// C23 _Alignas(...)：§6.7.2.1p6 多个取最大；类型形式取 _Alignof，常量形式取该常量。
 		// 前缀在此消费，避免后续类型解析（struct/typeof 递归）覆盖本声明的对齐值。
@@ -3095,7 +3100,7 @@ struct Parser
 				const unsigned g = consume_gnu_attributes_bind_packed(tk_packed);
 				if (tk_packed)
 					warn(gnu_packed_loc_, std::string("attribute 'packed' is ignored, place it after \"")
-						+ (is_union ? "union" : "struct") + "\" to apply attribute to type declaration");
+						+ (is_union ? "union" : "struct") + "\" to apply attribute to type declaration", "ignored-attributes");
 				if (g > sd_align) sd_align = g;
 			}
 			if (tag_qualified && !check_punct("{"))
@@ -3249,6 +3254,25 @@ struct Parser
 							advance(); // ':'
 							ExprPtr w = parse_assign();
 							m.bit_width = static_cast<int>(eval_const_int(w));
+							// P353：位域宽度诊断（匹配 clang -std=c23 行为）
+							{
+								const int bw = m.bit_width;
+								const bool named = !m.name.empty();
+								if (bw < 0)
+									error(m.loc, named
+										? "bit-field '" + m.name + "' has negative width (" + std::to_string(bw) + ")"
+										: "anonymous bit-field has negative width (" + std::to_string(bw) + ")");
+								else if (bw == 0 && named)
+									error(m.loc, "named bit-field '" + m.name + "' has zero width");
+								else if (bw > 0)
+								{
+									const unsigned tw = get_bitfield_unit_bits(m.type);
+									if (static_cast<unsigned>(bw) > tw)
+										error(m.loc, named
+											? "width of bit-field '" + m.name + "' (" + std::to_string(bw) + " bits) exceeds the width of its type (" + std::to_string(tw) + " bits)"
+											: "width of anonymous bit-field (" + std::to_string(bw) + " bits) exceeds the width of its type (" + std::to_string(tw) + " bits)");
+								}
+							}
 						}
 						else
 							check_alignas_min(mal, mal_loc, m.type); // P250：非位域成员同样不得弱于自然对齐
@@ -3759,10 +3783,14 @@ struct Parser
 			expect_punct("(");
 			// C23 init-statement: if (init; cond)
 			skip_attributes();
+			bool if_scoped = false;
 			if (is_type_start() && !(peek(1).kind == TokKind::Punct && peek(1).text == "::")) // P300: `类型名::` 属限定访问条件表达式、非 init-decl
 			{
+				var_scope_.emplace_back();
+				const_local_vals_.emplace_back();
+				if_scoped = true;
 				s->init_stmt = parse_local_decl_no_semi();
-				if (!s->init_stmt) { error(peek().loc, "expected init-declaration"); return s; }
+				if (!s->init_stmt) { error(peek().loc, "expected init-declaration"); if (if_scoped) { var_scope_.pop_back(); const_local_vals_.pop_back(); } return s; }
 				expect_punct(";");
 				s->expr = parse_expr();
 			}
@@ -3786,6 +3814,7 @@ struct Parser
 			s->then_branch = parse_stmt();
 			if (match_keyword("else"))
 				s->else_branch = parse_stmt();
+			if (if_scoped) { var_scope_.pop_back(); const_local_vals_.pop_back(); }
 			return s;
 		}
 		if (check_keyword("while"))
@@ -3828,11 +3857,18 @@ struct Parser
 			s->kind = StmtKind::For;
 			s->loc = advance().loc;
 			expect_punct("(");
+			// P353: for-init 声明拥有独立作域（C 6.8.5.3p1），遮蔽外层同名变量/形参
+			bool for_scoped = false;
 			// init
 			if (check_punct(";"))
 				advance();
 			else if (is_type_start() && !(peek(1).kind == TokKind::Punct && peek(1).text == "::")) // P300: `类型名::` 非 for-init 声明
+			{
+				var_scope_.emplace_back();
+				const_local_vals_.emplace_back();
+				for_scoped = true;
 				s->for_init = parse_local_decl();
+			}
 			else
 			{
 				auto es = std::make_shared<Stmt>();
@@ -3851,6 +3887,7 @@ struct Parser
 				s->for_incr = parse_expr();
 			expect_punct(")");
 			s->then_branch = parse_stmt();
+			if (for_scoped) { var_scope_.pop_back(); const_local_vals_.pop_back(); }
 			return s;
 		}
 		if (check_keyword("break"))
@@ -3877,10 +3914,14 @@ struct Parser
 			expect_punct("(");
 			// C23 init-statement: switch (init; cond)
 			skip_attributes();
+			bool sw_scoped = false;
 			if (is_type_start() && !(peek(1).kind == TokKind::Punct && peek(1).text == "::")) // P300: `类型名::` 属限定访问条件表达式、非 init-decl
 			{
+				var_scope_.emplace_back();
+				const_local_vals_.emplace_back();
+				sw_scoped = true;
 				s->init_stmt = parse_local_decl_no_semi();
-				if (!s->init_stmt) { error(peek().loc, "expected init-declaration"); return s; }
+				if (!s->init_stmt) { error(peek().loc, "expected init-declaration"); if (sw_scoped) { var_scope_.pop_back(); const_local_vals_.pop_back(); } return s; }
 				expect_punct(";");
 				s->expr = parse_expr();
 			}
@@ -3901,6 +3942,7 @@ struct Parser
 			}
 			expect_punct(")");
 			s->then_branch = parse_stmt(); // body (usually compound)
+			if (sw_scoped) { var_scope_.pop_back(); const_local_vals_.pop_back(); }
 			return s;
 		}
 		if (check_keyword("case"))
@@ -4034,7 +4076,7 @@ struct Parser
 			// 推断类型
 			s->var_type = auto_lvalue_convert(infer_auto_type(s->var_init));
 			local_var_types_[s->var_name] = s->var_type;
-			note_local_name(s->var_name);
+			note_local_name(s->var_name, s->var_ident_loc);
 			note_local_const(s->var_name, s->var_type, s->var_init); // P256
 			match_punct(";");
 			return s;
@@ -4134,7 +4176,7 @@ struct Parser
 			}
 			deduce_array_size(s->var_type, s->var_init);
 			local_var_types_[s->var_name] = s->var_type;
-			note_local_name(s->var_name);
+			note_local_name(s->var_name, s->var_ident_loc);
 			note_local_const(s->var_name, s->var_type, s->var_init); // P256
 			compound->body.push_back(std::move(s));
 		} while (match_punct(","));
@@ -4162,7 +4204,7 @@ struct Parser
 			s->var_init = parse_assign();
 			s->var_type = auto_lvalue_convert(infer_auto_type(s->var_init));
 			local_var_types_[s->var_name] = s->var_type;
-			note_local_name(s->var_name);
+			note_local_name(s->var_name, s->var_ident_loc);
 			return s;
 		}
 		// 简单声明: type name = expr
@@ -4180,7 +4222,7 @@ struct Parser
 			s->var_init = check_punct("{") ? parse_init_list() : parse_assign();
 		deduce_array_size(s->var_type, s->var_init);
 		local_var_types_[s->var_name] = s->var_type;
-		note_local_name(s->var_name);
+		note_local_name(s->var_name, s->var_ident_loc);
 		return s;
 	}
 	

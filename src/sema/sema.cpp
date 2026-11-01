@@ -163,7 +163,7 @@ public:
 			auto it = funcs_.find(kv.first);
 			if (it != funcs_.end() && it->second->return_type &&
 			    it->second->return_type->kind == TypeKind::Void)
-				warn(it->second->loc, "attribute 'nodiscard' cannot be applied to functions without return value");
+				warn(it->second->loc, "attribute 'nodiscard' cannot be applied to functions without return value", "ignored-attributes");
 		}
 		// P217：跨模块类型可见性门禁（主源引用导入的非 public struct/enum → 拒）。
 		//   ① 主源全局变量类型 ② 主源函数签名（返回 + 参数） ③ 主源 struct 成员类型。
@@ -235,6 +235,12 @@ public:
 		//   表达式引用未声明符号同样拒收）。cur_func_=nullptr，Return 已自然旁路“void 函数不应
 		//   返回值”类检查（见 check_stmt 中 Return 分支的 cur_func_ 守卫）。
 		check_top_level(tu);
+		// -Wunused-function：静态函数定义但未被引用（仅对有 body 且 source_module_key 为空的 main-module static 函数报，同 clang -Wall）
+		for (const auto &f : tu->funcs)
+		{
+			if (f.body && f.is_static && f.source_module_key.empty() && !used_func_names_.count(f.name))
+				warn(f.loc, "unused function '" + f.name + "'", "unused-function");
+		}
 	}
 
 	// 路 B 阶段1b：从合并后主 TU 按 source_module_key 分组，构建逐模块 public 视图 + 限定名映射。
@@ -300,7 +306,7 @@ public:
 					{ at = c.loc; have_loc = true; break; }
 			if (have_loc)
 				warn(at, "tag '" + kv.first + "' is exported by multiple imported modules (" + list +
-					"); unqualified references are an error, use a qualified name");
+					"); unqualified references are an error, use a qualified name", "ambiguous-import");
 		}
 		// 限定名映射：主源本层 imports 的 `as ModAlias`（无别名取文件 stem）→ resolved_module_key。
 		//   consts 表暂空（public const int 的跨模块导出面留待限定访问实现步补齐）。
@@ -415,13 +421,13 @@ public:
 				{
 					if (f.subsystem_windows)
 					{
-						warn(f.loc, "'subsystem' attribute in an imported module has no effect; it is only honored on the main module's entry function 'main' or 'WinMain'");
+						warn(f.loc, "'subsystem' attribute in an imported module has no effect; it is only honored on the main module's entry function 'main' or 'WinMain'", "ignored-attributes");
 					}
 					continue;
 				}
 				if (f.body && f.name == "WinMain") winmain_fn = &f;
 				if (f.subsystem_windows && f.name != "main" && f.name != "WinMain")
-					warn(f.loc, "'subsystem' attribute is only effective on the entry function 'main' or 'WinMain'");
+					warn(f.loc, "'subsystem' attribute is only effective on the entry function 'main' or 'WinMain'", "ignored-attributes");
 			}
 			if (winmain_fn)
 			{
@@ -463,7 +469,7 @@ public:
 		for (const auto &f : tu->funcs)
 			if (f.body && (f.name == "main" || f.name == "WinMain") && f.source_module_key.empty()) { has_user_main = true; break; } // P231：仅主模块
 		if (!has_bare && !has_user_main)
-			warn(SourceLoc{}, "colang: warning: no entry point (no top-level commands and no main); generating empty executable");
+			warn(SourceLoc{}, "colang: warning: no entry point (no top-level commands and no main); generating empty executable", "main");
 	}
 
 	bool ok() const { return !has_error_; }
@@ -544,7 +550,7 @@ private:
 		if (it->second->return_type->kind == TypeKind::Void) return;
 		const std::string &why = nodiscard_funcs_[e->name];
 		warn(e->loc, "ignoring return value of function declared with 'nodiscard' attribute" +
-			(why.empty() ? std::string() : ": " + why));
+			(why.empty() ? std::string() : ": " + why), "unused-result");
 	}
 
 	// —— P252：`_Alignas` 跨声明一致性（§6.7.2.1p4）——
@@ -622,7 +628,7 @@ private:
 	// P214：[[deprecated]] 引用点告警（不改退出码、不阻断编译）
 	void note_deprecated_use(const std::string &name, const std::string &msg, const SourceLoc &loc)
 	{
-		warn(loc, "'" + name + "' is deprecated" + (msg.empty() ? "" : (": " + msg)));
+		warn(loc, "'" + name + "' is deprecated" + (msg.empty() ? "" : (": " + msg)), "deprecated");
 	}
 	// —— 诊断 ——
 	void report(const SourceLoc &loc, const std::string &msg)
@@ -638,7 +644,7 @@ private:
 	}
 
 	// 告警：不置 has_error_，编译继续（与 main.cpp 的 is_warning 口径一致）
-	void warn(const SourceLoc &loc, const std::string &msg)
+	void warn(const SourceLoc &loc, const std::string &msg, const char *group = "")
 	{
 		Error e;
 		e.file = loc.file.empty() ? opts_.source_path : loc.file;
@@ -646,6 +652,7 @@ private:
 		e.pos.column = loc.column;
 		e.message = msg;
 		e.is_warning = true;
+		if (group && *group) e.warning_group = group;
 		errors_.push_back(std::move(e));
 	}
 
@@ -671,7 +678,8 @@ private:
 
 	// 带 note 附注的告警
 	void warn_with_note(const SourceLoc &loc, const std::string &msg,
-	                    const SourceLoc &note_loc, const std::string &note_msg)
+	                    const SourceLoc &note_loc, const std::string &note_msg,
+	                    const char *group = "")
 	{
 		Error e;
 		e.file = loc.file.empty() ? opts_.source_path : loc.file;
@@ -679,6 +687,7 @@ private:
 		e.pos.column = loc.column;
 		e.message = msg;
 		e.is_warning = true;
+		if (group && *group) e.warning_group = group;
 		Error n;
 		n.file = note_loc.file.empty() ? opts_.source_path : note_loc.file;
 		n.pos.line = note_loc.line;
@@ -1503,6 +1512,26 @@ private:
 		for (const auto &b : s->body)
 			if (has_default_label(b)) return true;
 		return false;
+	}
+
+	// -Wswitch：递归收集 switch 体内的 case 值和 default 标志（不进入内层 switch）
+	static void collect_case_info(const StmtPtr &s, bool &has_default, std::unordered_set<std::int64_t> &covered)
+	{
+		if (!s) return;
+		if (s->kind == StmtKind::Default) { has_default = true; return; }
+		if (s->kind == StmtKind::Switch) return; // 内层 switch 不算
+		if (s->kind == StmtKind::Case)
+		{
+			covered.insert(s->case_val);
+			collect_case_info(s->then_branch, has_default, covered);
+			for (const auto &b : s->body) collect_case_info(b, has_default, covered);
+			return;
+		}
+		collect_case_info(s->then_branch, has_default, covered);
+		collect_case_info(s->else_branch, has_default, covered);
+		collect_case_info(s->for_init, has_default, covered);
+		collect_case_info(s->init_stmt, has_default, covered);
+		for (const auto &b : s->body) collect_case_info(b, has_default, covered);
 	}
 
 	// nullptr：parser 以 Void* 建模的零字面量（int_val==0 且 type 为 Pointer）
@@ -2847,6 +2876,13 @@ private:
 				report(e->loc, "use of undeclared identifier '" + e->name + "'");
 			else
 			{
+				used_var_names_.insert(e->name); // -Wunused-variable：标记引用
+				used_func_names_.insert(e->name); // -Wunused-function：函数名作值引用（&foo / 函数指针赋值）
+				// -Wunused-but-set-variable：登记读上下文（受 suppress 标志控制）
+				if (!suppress_read_once_.empty() && suppress_read_once_ == e->name)
+					suppress_read_once_.clear();
+				else
+					read_var_names_.insert(e->name);
 				check_ambiguous_bare(e->name, e->loc); // P路 B 阶段1b：裁定③ host 裸名歧义
 				enforce_import_visibility(e->name, e->loc); // P212
 				// P214：[[deprecated]] 引用点告警（对象名；函数名作为值使用时同路径）
@@ -2930,6 +2966,12 @@ private:
 			}
 			// P332：`p += n` / `p -= n` 的左侧是不完整记录指针（定位在运算符起点 `loc`）
 			check_ptr_arith(e);
+			// -Wunused-but-set-variable：赋值 LHS 是简单变量时标记为“写上下文”，抑制紧随递归对它的 read 登记
+			if (L && L->kind == ExprKind::VarRef && !L->module_qualifier)
+			{
+				written_var_names_.insert(L->name);
+				suppress_read_once_ = L->name;
+			}
 			break;
 		}
 		case ExprKind::Unary:
@@ -2963,6 +3005,12 @@ private:
 				CTypePtr ut = resolve_type(e->lhs);
 				if (ut && ut->kind == TypeKind::Void)
 					report(e->loc, "indirection requires pointer operand ('void' invalid)");
+			}
+			// -Wunused-but-set-variable：++/-- 操作数是简单变量时标记为写上下文
+			if ((e->op == "++" || e->op == "--") && e->lhs && e->lhs->kind == ExprKind::VarRef && !e->lhs->module_qualifier)
+			{
+				written_var_names_.insert(e->lhs->name);
+				suppress_read_once_ = e->lhs->name;
 			}
 			break;
 		case ExprKind::Member:
@@ -3036,6 +3084,8 @@ private:
 				// P212：函数调用跨模块可见性检查（与 VarRef 同机制）。
 				check_ambiguous_bare(e->name, e->loc); // 路 B 阶段1b：裁定③ host 裸名歧义
 				enforce_import_visibility(e->name, e->loc);
+				used_func_names_.insert(e->name); // -Wunused-function：标记调用
+				used_var_names_.insert(e->name); // 函数指针调用时名称指向局部变量，同标记防误报
 				auto it = funcs_.find(e->name);
 				if (it != funcs_.end())
 				{
@@ -3231,6 +3281,9 @@ private:
 				check_aggregate_init(s->var_type, s->var_init);
 			if (!scopes_.empty() && !s->var_name.empty())
 				scopes_.back()[s->var_name] = {s->var_type, s->loc};
+			// -Wunused-variable：登记函数体内的局部变量（非 static/非 extern）
+			if (cur_func_ && !s->is_static && !s->is_extern && !s->var_name.empty())
+				declared_locals_.emplace_back(s->var_name, s->loc);
 			enforce_type_visible(s->var_type, s->loc); // P217：局部声明类型跨模块可见性
 			enforce_complete_type(s->var_type, s->loc, IctxVar); // P255：不完整类型按值分配前置诊断
 			reject_class_pointer(s->var_type, s->loc); // P300：禁 `C* p;` 指向类指针
@@ -3241,7 +3294,7 @@ private:
 			{
 				if (is_const_obj_type(s->var_type, 0))
 					warn(s->loc, "default initialization of an object of type " +
-						describe_type(s->var_type) + " leaves the object uninitialized");
+						describe_type(s->var_type) + " leaves the object uninitialized", "uninitialized");
 				else
 				{
 					std::string cm;
@@ -3251,10 +3304,10 @@ private:
 						if (mloc.line)
 							warn_with_note(s->loc, "default initialization of an object of type " +
 								describe_type(s->var_type) + " with const member leaves the object uninitialized",
-								mloc, "member '" + cm + "' declared 'const' here");
+								mloc, "member '" + cm + "' declared 'const' here", "uninitialized");
 						else
 							warn(s->loc, "default initialization of an object of type " +
-								describe_type(s->var_type) + " with const member leaves the object uninitialized");
+								describe_type(s->var_type) + " with const member leaves the object uninitialized", "uninitialized");
 					}
 				}
 			}
@@ -3287,7 +3340,7 @@ private:
 		{
 			// P249：[[noreturn]] 函数体内出现 return（与 clang 同文的函数名形）
 			if (cur_func_ && noreturn_funcs_.count(cur_func_->name))
-				warn(s->loc, "function '" + cur_func_->name + "' declared 'noreturn' should not return");
+				warn(s->loc, "function '" + cur_func_->name + "' declared 'noreturn' should not return", "unreachable-code");
 			bool is_void = cur_func_ && cur_func_->return_type &&
 				cur_func_->return_type->kind == TypeKind::Void;
 			if (s->expr)
@@ -3355,6 +3408,43 @@ private:
 			if (s->init_stmt) check_stmt(s->init_stmt, loop_d, switch_d);
 			if (s->expr) { check_cond_integer(s); check_expr(s->expr); }
 			check_stmt(s->then_branch, loop_d, switch_d + 1);
+			// -Wswitch：枚举型 switch 未覆盖所有枚举常量且无 default → 告警
+			if (s->expr)
+			{
+				CTypePtr dt = resolve_type(s->expr);
+				if (dt && dt->kind == TypeKind::Enum && !dt->tag.empty())
+				{
+					auto eit = enums_.find(dt->tag);
+					if (eit != enums_.end() && eit->second && !eit->second->constants.empty())
+					{
+						const EnumDef *ed = eit->second;
+						bool has_default = false;
+						std::unordered_set<std::int64_t> covered;
+						collect_case_info(s->then_branch, has_default, covered);
+						if (!has_default)
+						{
+							std::vector<std::string> missing;
+							for (const auto &ec : ed->constants)
+								if (!covered.count(ec.value))
+									missing.push_back(ec.name);
+							if (!missing.empty())
+							{
+								std::string msg;
+								if (missing.size() == 1)
+									msg = "enumeration value '" + missing[0] + "' not handled in switch";
+								else if (missing.size() == 2)
+									msg = "enumeration values '" + missing[0] + "' and '" + missing[1] + "' not handled in switch";
+								else if (missing.size() == 3)
+									msg = "enumeration values '" + missing[0] + "', '" + missing[1] + "', and '" + missing[2] + "' not handled in switch";
+								else
+									msg = std::to_string(missing.size()) + " enumeration values not handled in switch: '" +
+									      missing[0] + "', '" + missing[1] + "', '" + missing[2] + "'...";
+								warn(s->expr->loc, msg, "switch");
+							}
+						}
+					}
+				}
+			}
 			break;
 		case StmtKind::Case:
 		case StmtKind::Default:
@@ -3576,8 +3666,14 @@ private:
 		cur_source_module_key_ = f.source_module_key;
 		scopes_.clear();
 		scopes_.emplace_back(); // 形参作用域
+		param_list_.clear();
 		for (const auto &p : f.params)
-			if (!p.name.empty()) scopes_.back()[p.name] = {p.type, p.loc};
+			if (!p.name.empty()) { scopes_.back()[p.name] = {p.type, p.loc}; param_list_.emplace_back(p.name, p.loc); }
+		used_var_names_.clear();
+		declared_locals_.clear();
+		read_var_names_.clear();
+		written_var_names_.clear();
+		suppress_read_once_.clear();
 		labels_.clear();
 		collect_labels(f.body);
 		check_goto_class_crossing(f.body); // P300 §风险项#4：禁 goto 跨越需 RC 清理的类句柄声明
@@ -3586,11 +3682,23 @@ private:
 		// main 例外：C11 §5.1.2.2.3 规定 main 落到 } 等价于 return 0，clang 亦不告警。
 		if (f.return_type && f.return_type->kind != TypeKind::Void &&
 			f.name != "main" && falls_through(f.body))
-			warn(f.loc, "non-void function does not return a value in all control paths");
+			warn(f.loc, "non-void function does not return a value in all control paths", "return-type");
 		// P249：[[noreturn]] 函数体允许落到末尾（等价于“会返回”）
 		if (noreturn_funcs_.count(f.name) && falls_through(f.body))
-			warn(f.loc, "function declared 'noreturn' should not return");
+			warn(f.loc, "function declared 'noreturn' should not return", "unreachable-code");
 		check_stmt(f.body, 0, 0);
+		// -Wunused-variable：函数体内声明的局部变量未被引用则告警（形参不报，同 clang -Wall 行为）
+		for (const auto &[name, loc] : declared_locals_)
+			if (!used_var_names_.count(name))
+				warn(loc, "unused variable '" + name + "'", "unused-variable");
+		// -Wunused-but-set-variable：局部变量被赋值但从未读取（形参不报，同 clang -Wall 行为）
+		for (const auto &[name, loc] : declared_locals_)
+			if (used_var_names_.count(name) && written_var_names_.count(name) && !read_var_names_.count(name))
+				warn(loc, "variable '" + name + "' set but not used", "unused-but-set-variable");
+		// -Wunused-parameter：形参在函数体内从未引用（同 clang -Wextra 行为）
+		for (const auto &[name, loc] : param_list_)
+			if (!used_var_names_.count(name))
+				warn(loc, "unused parameter '" + name + "'", "unused-parameter");
 		cur_func_ = nullptr;
 		cur_source_module_key_.clear();
 	}
@@ -3638,6 +3746,16 @@ private:
 	std::unordered_map<std::string, SourceLoc> global_ident_locs_; // 全局变量名→声明位置
 	std::unordered_set<std::string> labels_;
 	std::unordered_set<std::string> dead_ends_; // 永不返回调用者的函数
+	// -Wunused-variable：跟踪函数体内局部变量声明与引用点
+	std::unordered_set<std::string> used_var_names_; // 函数内被引用过的变量名
+	std::vector<std::pair<std::string, SourceLoc>> declared_locals_; // 函数内声明的局部变量 (name, loc)
+	std::vector<std::pair<std::string, SourceLoc>> param_list_; // 形参列表 (name, loc)，用于 -Wunused-parameter
+	// -Wunused-but-set-variable：跟踪变量读/写上下文
+	std::unordered_set<std::string> read_var_names_;  // 变量被“读取”（非纯赋值左侧）
+	std::unordered_set<std::string> written_var_names_; // 变量被“写入”（赋值左侧/++/--操作数）
+	std::string suppress_read_once_; // 下一轮 VarRef 命中该名称时跳过 read 登记（消费后清空）
+	// -Wunused-function：跟踪被调用/引用的 static 函数名
+	std::unordered_set<std::string> used_func_names_;
 	const FuncDecl *cur_func_ = nullptr;
 	// P212：当前正在走查的代码归属模块 key（空 = 主源）。影响跨模块可见性检查开关。
 	std::string cur_source_module_key_;

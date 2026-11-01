@@ -52,6 +52,8 @@ void print_usage(const char *program)
 	std::printf("  -l <name>         link against external library <name> (also -l<name>, --lib <name>);"
 				" bare link name, e.g. -luser32\n");
 	std::printf("  -fno-diag-context do not print the source lines around each diagnostic\n");
+	std::printf("  -Werror          treat all warnings as errors\n");
+	std::printf("  -Wno-<group>     suppress warnings in <group> (e.g. -Wno-unused-result)\n");
 }
 
 void print_version()
@@ -272,8 +274,12 @@ void print_errors(const std::vector<colang::Error> &errors)
 	for (const colang::Error &error : errors)
 	{
 		const char *sev = error.is_warning ? "warning" : "error";
-		std::fprintf(stderr, "%s:%zu:%zu: %s: %s\n", error.file.c_str(), error.pos.line,
+		std::fprintf(stderr, "%s:%zu:%zu: %s: %s", error.file.c_str(), error.pos.line,
 			error.pos.column, sev, error.message.c_str());
+		// 告警尾随组名（clang 同形：message [-Wgroup]）
+		if (error.is_warning && !error.warning_group.empty())
+			std::fprintf(stderr, " [-W%s]", error.warning_group.c_str());
+		std::fprintf(stderr, "\n");
 		if (error.file != ctx_file || error.pos.line != ctx_line)
 		{
 			if (print_source_context(error.file, error.pos.line, error.pos.column))
@@ -299,6 +305,31 @@ bool has_fatal(const std::vector<colang::Error> &errors)
 		}
 	}
 	return false;
+}
+
+// 诊断过滤与升级：按 -Wno-<group> 抑制、按 -Werror 将剩余告警升级为错误。
+// 在 print_errors 前调用，实际过滤在本地副本上执行，不影响上游诊断列表。
+static std::vector<colang::Error> apply_w_diagnostics(
+	const std::vector<colang::Error> &errors,
+	const colang::CompileOptions &opts)
+{
+	std::vector<colang::Error> out;
+	out.reserve(errors.size());
+	for (const auto &e : errors)
+	{
+		if (e.is_warning && !e.warning_group.empty())
+		{
+			bool suppressed = false;
+			for (const auto &g : opts.wno_groups)
+				if (g == e.warning_group) { suppressed = true; break; }
+			if (suppressed) continue;
+		}
+		colang::Error copy = e;
+		if (opts.werror && copy.is_warning)
+			copy.is_warning = false; // 升级：打印成 error:，has_fatal 计数为致命
+		out.push_back(std::move(copy));
+	}
+	return out;
 }
 
 const char *tok_kind_name(colang::TokKind kind)
@@ -514,6 +545,17 @@ int main(int argc, char **argv)
 			g_diag_context = false;
 			continue;
 		}
+		// -W 系列：-Werror / -Wno-<group>
+		if (arg == "-Werror")
+		{
+			opts.werror = true;
+			continue;
+		}
+		if (arg.rfind("-Wno-", 0) == 0 && arg.size() > 5)
+		{
+			opts.wno_groups.push_back(arg.substr(5));
+			continue;
+		}
 		if (!arg.empty() && arg[0] == '-')
 		{
 			std::fprintf(stderr, "colang: error: unknown option '%s'\n", arg.c_str());
@@ -580,9 +622,15 @@ int main(int argc, char **argv)
 		return has_fatal(errors) ? 1 : 0;
 	}
 
-	// 编译成功：诊断列表中只剩非致命项（warning），照常呈现，不改变退出码
+	// 编译成功：诊断列表中只剩非致命项（warning），按 -Wno- 过滤、按 -Werror 升级后呈现。
 	if (!errors.empty())
-		print_errors(errors);
+	{
+		auto filtered = apply_w_diagnostics(errors, opts);
+		if (!filtered.empty())
+			print_errors(filtered);
+		if (opts.werror && !filtered.empty())
+			return 1; // -Werror: 告警升级为错误，退出码 1
+	}
 
 	// --lib/-l 仅作用于链接步：-c 只产目标文件，给出提示（不改变退出码）。
 	if (!opts.link_libs.empty() && opts.compile_only)
@@ -668,6 +716,8 @@ int main(int argc, char **argv)
 			if (opts.target.is_windows)
 				out_path += ".exe";
 		}
+		// 记录链接前的诊断数量——链接失败时仅打印新增的链接错误，避免重复输出已打印的编译 warning。
+		const std::size_t pre_link_size = errors.size();
 		// 链接层按 target 分平台：Windows → 进程内 lldCOFF；Linux → 进程内 lldELF。
 		const bool ok = opts.target.is_windows
 			? colang::link_exe(objs, out_path, state.windows_subsystem,
@@ -682,7 +732,9 @@ int main(int argc, char **argv)
 			std::filesystem::remove(tr, ec);
 		if (!ok)
 		{
-			print_errors(errors);
+			// 仅输出链接阶段新增的错误（sema warnings 已在上文 line 630 打印过）。
+			if (errors.size() > pre_link_size)
+				print_errors(std::vector<colang::Error>(errors.begin() + static_cast<std::ptrdiff_t>(pre_link_size), errors.end()));
 			std::fprintf(stderr, "colang: error: linking failed\n");
 			return 1;
 		}

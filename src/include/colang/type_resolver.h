@@ -119,10 +119,12 @@ inline unsigned get_bitfield_unit_bits(const CTypePtr &t)
 	case TypeKind::Char8: return 8;
 	case TypeKind::Char16: return 16;
 	case TypeKind::Char32: return 32;
+	case TypeKind::WChar: return 16;  // Win wchar_t=2B
 	case TypeKind::Short: return 16;
 	case TypeKind::Int: return 32;
 	case TypeKind::Long: return 32;   // Windows long=32
 	case TypeKind::LongLong: return 64;
+	case TypeKind::BitInt: return t->bit_width ? t->bit_width : 32;
 	default: return 32;
 	}
 }

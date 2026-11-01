@@ -3,6 +3,12 @@
 本记录按发布版本列出 Co（colang）语言/编译器的主要变化。
 版本策略：0.* 为开发测试版，1.* 为正式版，2.* 为自举版。
 
+## 0.5.1
+- **告警诊断分级体系落地**：新增命令行 `-Werror`（将告警升级为错误）与 `-Wno-<组名>`（按组名静音特定告警），每条告警输出尾随其组名标注 `[-Wxxx]`，可按需精确开关。
+- **补齐多个 clang `-Wall` / `-Wextra` 告警**：新增 `-Wunused-variable`、`-Wunused-function`、`-Wunused-but-set-variable`、`-Wswitch`（枚举 `switch` 未覆盖全部枚举值且无 `default`）、`-Wunused-parameter`，语义逐条与 clang 实测对齐；并修复调用无函数体的前置声明函数时告警被重复输出一次的问题。
+- **位域与整型宽度诊断符合性**：位域宽度、`_BitInt` / `wchar_t` 单位宽度、同作用域重定义、`for` / `if` / `switch` 初始化作用域等原先被静默接受的写法，现一律按 clang 句式与行列定位拒收。
+- **`winapi.co` 大幅扩容**：在 0.5.0 基础上新增进程/线程枚举、Shell/剪贴板/进程操作、Hook/键盘/鼠标输入、资源加载/电源/用户名、同步对象/内存映射/命名管道、文件属性/卷信息/安全令牌、堆/进程时间/句柄复制/IO 控制、优先级/控制台/环境字符串/符号链接/磁盘空间、控制台模式 / `VirtualQuery`、注册表枚举/删除、命名同步对象/可等待定时器/堆操作/页锁定等 API；现累计约 **481** 个 Win32 API 原型、**72** 个结构/联合体布局、**815** 个常量。全部结构体经 Windows SDK 10.0.26100.0 的 `sizeof` / `offsetof` 逐条实测核验。
+
 ## 0.5.0
 - **`.co` 源文件里 `long` / `unsigned long` 改为 8 字节**（Windows 目标），`long` 与 `long long` 现为同一类型；`.c` / `.h` 不变，仍按目标数据模型取宽度（Windows 4 字节 / Linux 8 字节）。断代影响三项：① `_Generic` 中 `long` 与 `long long` 不能再并列；② `.co` 里 `long` 变量取地址传入以 `int` / `unsigned int` 声明的 API 原型（`winapi.co` 已按 SDK 拼写、不使用 `long`）判为指针类型不相容而报错；③ 输出 8 字节整数需用 `%lld`，`%ld` 只读 4 字节会取错值。
 - `winapi.co` 常量段修正与补录（已对本段 509 条常量逐条比对 Windows SDK 10.0.26100.0 真值）：`SM_CXSCREEN` 78→`0`、`SOMAXCONN` -1→`0x7FFFFFFF`、`FILE_NOTIFY_CHANGE_LAST_WRITE` `0x8`→`0x10`、`PATCOPY` `0x00F00062`→`0x00F00021`——**使用这 4 个常量的代码运行行为会改变**（原先传入的是错值）。并补录 `FILE_NOTIFY_CHANGE_SIZE`、`SM_CYSCREEN`、`SM_XVIRTUALSCREEN`、`SM_YVIRTUALSCREEN`、`SM_CXVIRTUALSCREEN`、`SM_CYVIRTUALSCREEN`，此前需自写本地常量顶替的写法可回归 `winapi.co` 版。

@@ -27,6 +27,7 @@ struct Error
 	Pos pos;
 	std::string message;
 	bool is_warning = false; // #warning 等非致命诊断
+	std::string warning_group; // 告警组名（不带 -W 前缀，如 "unused-result"）；空串表示无组
 	std::vector<Error> notes; // 附注（severity 由打印逻辑固定为 "note"）
 };
 
