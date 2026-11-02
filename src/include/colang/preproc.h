@@ -77,7 +77,7 @@ private:
 
 	bool pull(Token &out, bool &at_eof);      // 从栈顶拉一 token（含 1-token 前瞻）
 	void unread(const Token &t);              // 退回一个 token
-	// 种入「实现预定义宏」（C §6.10.8.3：以下划线开头的名字为实现保留）。
+	// 种入「实现预定义宏」（C 标准：以下划线开头的名字为实现保留）。
 	// 供 colib 标准头做平台/架构分派；当前唯一支持目标 = Windows/x64(MSVC ABI)，
 	// 值对齐本机 clang/MSVC ground-truth。Linux 移植时在此按目标切换。
 	void seed_predefined_macros();
@@ -106,7 +106,7 @@ private:
 	bool handle_pragma(const std::vector<Token> &line);
 	bool handle_line(const std::vector<Token> &line);
 
-	// #if / #elif 常量表达式求值（§6.10.1）；成功写 result 返回 true
+	// #if / #elif 常量表达式求值（C 标准）；成功写 result 返回 true
 	bool eval_expr(const std::vector<Token> &line, std::size_t from, std::intmax_t &result);
 
 	// —— 对象式/函数式宏展开（P1.4/P1.5）——
@@ -121,7 +121,7 @@ private:
 	bool collect_args(const std::vector<PEntry> &buf, std::size_t open,
 		std::vector<std::vector<Token>> &args, std::size_t &end) const;
 	// 对函数式宏体做替换，产出逐 token 带隐藏集的序列：普通（非 #/## 操作数）参数的实参先独立
-	// 完整宏展开（§6.10.3.1）再代入（hide=∅），# 字符串化与 ## 粘贴用原样实参（paste 结果 hide=∅），
+	// 完整宏展开（C 标准）再代入（hide=∅），# 字符串化与 ## 粘贴用原样实参（paste 结果 hide=∅），
 	// 宏体字面 token 取 bodyHide（= 触发宏名 token 的 hide ∪ {本宏}，沿链传递累加）。in_if 透传给实参展开。
 	void substitute(const Macro &m, const std::vector<std::vector<Token>> &args,
 		std::vector<PEntry> &out, const SourceLoc &at, bool in_if,

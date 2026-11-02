@@ -27,7 +27,7 @@ Variable and parameter declarations:
 TAG                         name [ = initializer ] ;      // bare-tag form (`.co` only)
 ```
 
-Initializers: positional list `{ v0, v1, … }`; designated initializer `{ .member = value , … }` (may be out of order; unlisted members are zero-filled); array subscript `[ index ] = value`. Designators may **chain downward** into nested members/elements: `.a[2].b`, `[1][2]` (C11 §6.7.9 designator sequences).
+Initializers: positional list `{ v0, v1, … }`; designated initializer `{ .member = value , … }` (may be out of order; unlisted members are zero-filled); array subscript `[ index ] = value`. Designators may **chain downward** into nested members/elements: `.a[2].b`, `[1][2]` (C11 designator sequences).
 
 | Element | Meaning |
 | --- | --- |

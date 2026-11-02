@@ -1,5 +1,5 @@
 /* locale.h — colang 自制最小标准头
- * C §7.11 本地化。类别宏取本机 UCRT ground-truth 数值（LC_ALL=0 .. LC_TIME=5）。
+ * C 标准本地化。类别宏取本机 UCRT ground-truth 数值（LC_ALL=0 .. LC_TIME=5）。
  * struct lconv 字段布局按 C 标准顺序；实际使用 localeconv() 的代码多为指针访问。
  * 边界：面向 Windows/UCRT 宿主。 */
 #ifndef _COLANG_LOCALE_H

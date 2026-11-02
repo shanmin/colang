@@ -1,5 +1,5 @@
 /* assert.h — colang 自制最小标准头 (P9.9)
- * C §7.2.1.1：assert 为函数式宏。expr 求值为 0（假）时，向 stderr 写诊断
+ * C 标准：assert 为函数式宏。expr 求值为 0（假）时，向 stderr 写诊断
  * （含表达式原文、__FILE__、__LINE__）并调用 abort()；为非 0 时不作任何事。
  * 定义了 NDEBUG 时 assert 展开为 ((void)0)。
  *

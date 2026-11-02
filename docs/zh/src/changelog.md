@@ -3,6 +3,10 @@
 本记录按发布版本列出 Co（colang）语言/编译器的主要变化。
 版本策略：0.* 为开发测试版，1.* 为正式版，2.* 为自举版。
 
+## 0.5.2
+- **`math.h` 补齐 `long double` 版数学函数声明（C 标准全族 56 个）**：`asinhl` / `acoshl` / `atanhl` / `sqrtl` 等 `l` 后缀函数此前在 `math.h` 中**零声明**。colang 按 C 的隐式函数声明规则把未声明函数**按返回 `int` 处理**，调用点遂从整数寄存器取浮点结果——**编译、链接全部通过且零诊断，运行得到的是垃圾整数**（同一程序每次运行还可能不同）。本版补齐 56 个 `l` 后缀声明，原型逐条对照 Windows UCRT 头取真值（含 `nexttowardl` 第二参为 `long double`、`ilogbl` 返 `int`、`lrintl`/`lroundl` 返 `long`、`llrintl`/`llroundl` 返 `long long`、`scalblnl` 第二参为 `long` 等宿主特异处）。**输出正确性修复**：原先调用这些函数而取到错值的代码，现在取到正确值。
+- **新增自制最小 `complex.h`**：`#include <complex.h>` 此前因标准库无此头而直接报错。本版交付 `complex.h`，按 C 标准发出 `__STDC_NO_COMPLEX__`（如实告知实现不支持复数）。colang **仍不实现 `_Complex` / `_Imaginary` 复数类型**，本头有意**不定义 `I`**——把 `I` 定义成实数会让 `1.0 + 2.0 * I` 静默算成 `3.0`（错值且零诊断）；真写复数构造的源仍会得到显式诊断，不会退化成实数运算。只包含该头、不使用复数构造的程序现可正常编译运行。
+
 ## 0.5.1
 - **告警诊断分级体系落地**：新增命令行 `-Werror`（将告警升级为错误）与 `-Wno-<组名>`（按组名静音特定告警），每条告警输出尾随其组名标注 `[-Wxxx]`，可按需精确开关。
 - **补齐多个 clang `-Wall` / `-Wextra` 告警**：新增 `-Wunused-variable`、`-Wunused-function`、`-Wunused-but-set-variable`、`-Wswitch`（枚举 `switch` 未覆盖全部枚举值且无 `default`）、`-Wunused-parameter`，语义逐条与 clang 实测对齐；并修复调用无函数体的前置声明函数时告警被重复输出一次的问题。

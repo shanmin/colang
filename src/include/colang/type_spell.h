@@ -2,7 +2,7 @@
 // type_spell.h — 诊断用的**类型拼写**入口（clang 同形口径）
 //
 // 由 P252/P253 在 parser 内落地，P254 起提为公共头，供 parser（`_Alignas` 少诊断）
-// 与 sema（`const` 只读强制诊断）**共用同一拼写**——BACKLOG §3.1「双轨拼写只服务
+// 与 sema（`const` 只读强制诊断）**共用同一拼写**——内部待办队列「双轨拼写只服务
 // _Alignas 一条」的收拢起点：新带类型诊断一律走 `describe_type`，不再各自手拼。
 //
 // 覆盖：标量（含 unsigned 家族）/ struct·union·enum 标签 / _BitInt /
@@ -11,7 +11,7 @@
 // 双轨：sugar 轨保留书写处的 typedef 别名、plain 轨一律去别名；两轨不同才补 `(aka '…')`，
 //   与 clang 同形：`'MyInt' (aka 'int')`、`'int (*)(MyInt)' (aka 'int (*)(int)')`、
 //   `'int *const volatile'`、`'_Atomic(int)'`、`'MyInt[4]' (aka 'int[4]')`。
-// 仍不及 clang（已登 BACKLOG）：限定符写在声明符之后（`int x volatile;`）两家**均拒收**、但文本不同
+// 仍不及 clang（已登内部待办队列）：限定符写在声明符之后（`int x volatile;`）两家**均拒收**、但文本不同
 //   （clang `expected ';' after top level declarator` @20、colang `expected declaration or statement` @21）。
 //
 // 本头**只读 `CType` 的诊断专用位**（`alias`/`is_volatile`/`is_restrict`/`is_atomic`），

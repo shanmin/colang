@@ -1,5 +1,5 @@
 /* fenv.h — colang 自制最小标准头 (P9.19)
- * C §7.6：浮点环境。用户定案（ADR-104 相关）：#pragma STDC FENV_ACCESS 采「no-op 桩口径」——
+ * C 标准：浮点环境。用户定案（ADR-104 相关）：#pragma STDC FENV_ACCESS 采「no-op 桩口径」——
  *   colang 预处理器对非 once 的 #pragma 一律静默忽略（见 preproc.cpp handle_pragma），故该 pragma
  *   无需前端支持即天然被忽略；而 fe* 函数本身**直连宿主 UCRT 真实现**（非桩）。本机实测：
  *   fesetround/fegetround/feclearexcept/fesetenv(FE_DFL_ENV) 均可链可跑（clang 探针 RC=0）。

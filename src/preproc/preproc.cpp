@@ -239,7 +239,7 @@ bool parse_pp_integer(const std::string &s, std::intmax_t &out)
 	return true;
 }
 
-// —— #if 常量表达式递归下降求值器（§6.10.1）——
+// —— #if 常量表达式递归下降求值器（C 标准）——
 // 档序由低到高：?: → || → && → | → ^ → & → ==/!= → 关系 → 移位 → 加减 → 乘除 → 一元 → 本项
 class CondExpr
 {
@@ -302,7 +302,7 @@ private:
 			return cond;
 		}
 		++i_;
-		// ?: 短路（§6.5.15）：仅“被选中分支”正常求值，“未选中分支”仍解析以校验
+		// ?: 短路（C 标准）：仅“被选中分支”正常求值，“未选中分支”仍解析以校验
 		// 语法但抑制其求值期错误（如 0/0）。c-testsuite 00145：`-1 ? 3 : (0/0)`。
 		const bool take_mid = (cond != 0);
 		const bool saved = suppress_value_error_;
@@ -360,7 +360,7 @@ private:
 
 	std::intmax_t parse_or()
 	{
-		// || 短路（§6.5.13）：左侧非 0 时结果必为 1，右侧仅作 token 消费并
+		// || 短路（C 标准）：左侧非 0 时结果必为 1，右侧仅作 token 消费并
 		// 抑制其求值期错误（如 0/0），与 GCC/Clang 预处理器一致。
 		std::intmax_t lhs = parse_and();
 		while (ok_ && is_punct("||"))
@@ -378,7 +378,7 @@ private:
 	}
 	std::intmax_t parse_and()
 	{
-		// && 短路（§6.5.14）：左侧为 0 时结果必为 0，右侧仅作 token 消费并
+		// && 短路（C 标准）：左侧为 0 时结果必为 0，右侧仅作 token 消费并
 		// 抑制其求值期错误。c-testsuite 00145：`0 && (0/0)` 不得报除零。
 		std::intmax_t lhs = parse_bitor();
 		while (ok_ && is_punct("&&"))
@@ -604,7 +604,7 @@ private:
 		}
 		if (t.kind == TokKind::Char)
 		{
-			// 字符常量在 #if/#elif 中合法（§6.10.1）；与 parser/codegen 同源 co_decode_char 解码，
+			// 字符常量在 #if/#elif 中合法（C 标准）；与 parser/codegen 同源 co_decode_char 解码，
 			//   UCN（\u/\U）同样先展开（与 parser 处同口径）。
 			++i_;
 			return static_cast<std::intmax_t>(co_decode_char(co_expand_ucn(t.text)));
@@ -699,7 +699,7 @@ private:
 					return fail("expected ')' after __has_include header");
 				return has_include_(header) ? 1 : 0;
 			}
-			// __has_c_attribute(attr-name)：C23 §6.10.1。参数为属性名序列（如 nodiscard），
+			// __has_c_attribute(attr-name)：C23 标准。参数为属性名序列（如 nodiscard），
 			// 拼接所有 token 文本后交由回调判定（作用域名 :: 与未知名均不匹配 → 0）。
 			if (t.text == "__has_c_attribute" && has_c_attribute_)
 			{
@@ -889,7 +889,7 @@ bool Preprocessor::is_active() const
 	return cond_stack_.empty() ? true : cond_stack_.back().branch_active;
 }
 
-// —— 函数式宏展开的拼接/字符串化辅助（§6.10.3.4）——
+// —— 函数式宏展开的拼接/字符串化辅助（C 标准）——
 namespace
 {
 // 对拼接后的拼写重新切分为 pp-token（## 粘贴结果需重扫为单一 token）。
@@ -971,7 +971,7 @@ Token stringize_token(const std::vector<Token> &arg, const SourceLoc &at)
 }
 } // namespace
 
-// —— 宏展开（§6.10.3 / §6.10.8）——
+// —— 宏展开（C 标准/ C 标准）——
 // 逐 token 扫描：遇宏名（非蓝铅笔隐藏）则展开。对象式宏拉入替换体就地重扫；
 // 函数式宏仅当紧随 '(' 才构成调用，收集实参、替换（参数原样代入、# 字符串化、
 // ## 粘贴）后整段就地重扫。蓝铅笔集 blue 逐步加入本次宏名以防自递归。in_if 为真时
@@ -1024,7 +1024,7 @@ void Preprocessor::expand_seq(const std::vector<Token> &in, std::vector<Token> &
 		}
 		if (t.kind == TokKind::Identifier)
 		{
-			// 关键字伪宏（§6.10.8）：就地替换为终态 token（重定向到调用点位置），++i 不再重扫
+			// 关键字伪宏（C 标准）：就地替换为终态 token（重定向到调用点位置），++i 不再重扫
 			bool pseudo = true;
 			if (t.text == "__FILE__")
 			{
@@ -1198,7 +1198,7 @@ bool Preprocessor::collect_args(const std::vector<PEntry> &buf, std::size_t open
 }
 
 namespace {
-// C23 §6.10.3.4：处理函数式宏体中的 __VA_OPT__(content)。
+// C23 标准：处理函数式宏体中的 __VA_OPT__(content)。
 // 一次宏调用内所有 __VA_OPT__ 组共享同一 __VA_ARGS__ 的空/非空判定：
 //   va 非空 → 整组展开为 content（content 内嵌套 __VA_OPT__ 递归同样展开）；
 //   va 为空 → 整组（连同内层）删除。
@@ -1248,7 +1248,7 @@ void resolve_va_opt(const std::vector<Token> &body, std::vector<Token> &out,
 } // namespace
 
 // 函数式宏体替换：产出逐 token 带隐藏集的序列（P174）——普通（非 #/## 操作数）参数的实参先独立
-// 完整宏展开再代入（hide=∅，C23 §6.10.3.1），# 字符串化用原样实参（终态 String），
+// 完整宏展开再代入（hide=∅，C23 标准），# 字符串化用原样实参（终态 String），
 // ## 粘贴以原样实参左结合合并（连续 ## 归为一个粘贴 run，产物 hide=∅ 重置），宏体字面 token 取 bodyHide。
 void Preprocessor::substitute(const Macro &m, const std::vector<std::vector<Token>> &args,
 	std::vector<PEntry> &out, const SourceLoc &at, bool in_if,
@@ -1311,7 +1311,7 @@ void Preprocessor::substitute(const Macro &m, const std::vector<std::vector<Toke
 		return std::vector<Token>{x};
 	};
 
-	// C23 §6.10.3.1：普通（非 #/## 操作数）参数在代入前，实参先作独立序列完整宏展开
+	// C23 标准：普通（非 #/## 操作数）参数在代入前，实参先作独立序列完整宏展开
 	//（空蓝铅笔集——与当前宏的展开链无关），展开结果用于普通代入；#/## 仍取原样实参。
 	std::vector<std::vector<Token>> ex_args(args.size());
 	for (std::size_t p = 0; p < args.size(); ++p)
@@ -1389,7 +1389,7 @@ void Preprocessor::substitute(const Macro &m, const std::vector<std::vector<Toke
 			k = j;
 			continue;
 		}
-		// 普通形参代入：用已展开实参（§6.10.3.1；非 #/## 操作数）
+		// 普通形参代入：用已展开实参（C 标准；非 #/## 操作数）
 		{
 			const std::vector<Token> *e = nullptr;
 			if (is_param_name(bt) && expanded_for(bt.text, e))
@@ -1415,7 +1415,7 @@ void Preprocessor::expand_line(const std::vector<Token> &line, std::vector<Token
 bool Preprocessor::eval_expr(const std::vector<Token> &line, std::size_t from,
 	std::intmax_t &result)
 {
-	// §6.10.1：求值前先展开表达式中的宏（defined 操作数除外），剩余未展开标识符按 0
+	// C 标准：求值前先展开表达式中的宏（defined 操作数除外），剩余未展开标识符按 0
 	const std::vector<Token> expr(line.begin() + static_cast<std::ptrdiff_t>(from), line.end());
 	std::vector<Token> expanded;
 	expand_seq(expr, expanded, std::unordered_set<std::string>{}, true);
@@ -1454,7 +1454,7 @@ bool Preprocessor::eval_expr(const std::vector<Token> &line, std::size_t from,
 		return false;
 	};
 	auto has_c_attribute = [](const std::string &name) -> bool {
-		// C23 §6.7.11 标准属性 + Co 层新定义属性 lib（P214）；作用域名(::)与未知名一律 false
+		// C23 标准属性 + Co 层新定义属性 lib（P214）；作用域名(::)与未知名一律 false
 		return name == "deprecated" || name == "maybe_unused" || name == "nodiscard" ||
 		       name == "lib";
 	};
@@ -1553,7 +1553,7 @@ bool Preprocessor::handle_elif(const std::vector<Token> &line)
 	return true;
 }
 
-// C23 #elifdef / #elifndef（§6.10.1）：等价于“条件是标识符是否已定义”的 #elif。
+// C23 #elifdef / #elifndef（C 标准）：等价于“条件是标识符是否已定义”的 #elif。
 // 与其他 elif/ifdef 一样无条件分派（内部自行处理父级不活跃 / any_taken）。
 bool Preprocessor::handle_elifdef(const std::vector<Token> &line, bool negate)
 {
@@ -1796,7 +1796,7 @@ bool Preprocessor::handle_include(const std::vector<Token> &line)
 	return false;
 }
 
-// —— #embed（C23 §6.10.4）——
+// —— #embed（C23 标准）——
 // 语法：#embed "file" 或 #embed <file>  后接零或多个 (embed-param)。
 // 展开：每个字节产一个 0xNN 十六进制 Number token，字节间以逗号分隔（无尾逗号）；
 // 支持 limit(pp-number)/prefix·suffix·tail(字符串字面量)/if-empty({ 替换序列 })。
@@ -2243,7 +2243,7 @@ bool Preprocessor::handle_pragma(const std::vector<Token> &line)
 bool Preprocessor::handle_line(const std::vector<Token> &line)
 {
 	// #line <number> ["filename"]
-	// §6.10.3.4：#line 的参数行须先做宏替换（如 `#define line 1000` 后 `#line line`）。
+	// C 标准：#line 的参数行须先做宏替换（如 `#define line 1000` 后 `#line line`）。
 	// c-testsuite 00152。
 	const SourceLoc &at = line[0].loc;
 	if (line.size() < 3)
@@ -2492,7 +2492,7 @@ bool Preprocessor::run(std::vector<Token> &out)
 		errors_.push_back(Error{opts_.source_path, Pos{1, 1}, "unterminated conditional directive"});
 		return false;
 	}
-	// 阶段 6：相邻字符串字面量拼接（§6.4.5/6.7.9）。宏展开后 token 流中严格相邻的
+	// 阶段 6：相邻字符串字面量拼接（C 标准）。宏展开后 token 流中严格相邻的
 	// String token 必为拼接（逗号/分号/运算符均会隔开），故在此单点合并即可让下游
 	// （parser/sema/codegen/全局初始化折叠）一致视单个字面量。c-testsuite 00115。
 	// RC 方言例外：.rc 合法允许一行并列多个字符串 token（名/类型/文件），不做此合并。

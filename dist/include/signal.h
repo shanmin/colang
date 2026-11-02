@@ -1,5 +1,5 @@
 /* signal.h — colang 自制最小标准头 (P9.17)
- * C §7.14：sig_atomic_t / signal / raise / SIG_DFL / SIG_IGN / SIG_ERR / SIG* 信号号。
+ * C 标准：sig_atomic_t / signal / raise / SIG_DFL / SIG_IGN / SIG_ERR / SIG* 信号号。
  * 仅纳入 C 标准集合（不做 POSIX sigaction/sigset_t/NSIG 等扩展，见 ADR-104）。
  * 信号号取值随平台而变，用 P9.16 落地的 _WIN32 预定义宏分派：
  *   - Windows/UCRT ground-truth（本机 clang 实测）：SIGABRT=22 SIGFPE=8 SIGILL=4 SIGINT=2 SIGSEGV=11 SIGTERM=15

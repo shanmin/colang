@@ -22,7 +22,7 @@ extern char* strchr(const char *s, int c);
 extern char* strrchr(const char *s, int c);
 extern char* strstr(const char *haystack, const char *needle);
 
-/* Annex K（§K.3.7/K.3.8，P9.30 务实子集）：边界检查字符串/内存函数。
+/* Annex K（C 标准，P9.30 务实子集）：边界检查字符串/内存函数。
  * 仅在 #define __STDC_WANT_LIB_EXT1__ 1 后包含本头时可见。
  * 以下声明直连本机 UCRT 已导出的 ISO 同名符号（形参布局与 Annex K 一致）；
  * memcpy_s/memmove_s 按 Annex K 声明为 void（UCRT 实为 errno_t 返回，调用处忽略）。

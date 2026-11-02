@@ -12,7 +12,7 @@
 #ifndef _COLANG_STDCOUNTOF_H
 #define _COLANG_STDCOUNTOF_H
 
-/* C23 7.22：数组元素个数 = 整个数组字节数 / 首元素字节数 */
+/* C23 标准：数组元素个数 = 整个数组字节数 / 首元素字节数 */
 #define std_countof(a) (sizeof(a) / sizeof((a)[0]))
 
 #endif /* _COLANG_STDCOUNTOF_H */

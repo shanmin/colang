@@ -1,5 +1,5 @@
 /* time.h — colang 自制最小标准头 (P9.14)
- * C §7.27 日期与时间。宽度/结构体布局均取自本机 UCRT ground-truth
+ * C 标准日期与时间。宽度/结构体布局均取自本机 UCRT ground-truth
  * （用 workspace 内 clang.exe 编译系统 <time.h> 探针实测）：
  *   time_t = 8 字节(__int64)、clock_t = 4 字节(long)、
  *   struct tm = 9 个连续 int（tm_sec..tm_isdst，偏移 0..32，无 POSIX 扩展字段）、

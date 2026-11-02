@@ -445,7 +445,7 @@ LexResult Lexer::next(Token &out, Error &err)
 	pending_space_ = false; // 已消费本段间隔，下段重新累计
 	const char c = peek();
 
-	// 标识符起点：字面字符或内联 UCN `\uXXXX`/`\UXXXXXXXX`（ISO C §6.4.3）
+	// 标识符起点：字面字符或内联 UCN `\uXXXX`/`\UXXXXXXXX`（ISO C）
 	if (is_ident_nondigit(c) || (c == '\\' && (peek(1) == 'u' || peek(1) == 'U')))
 	{
 		std::string word;

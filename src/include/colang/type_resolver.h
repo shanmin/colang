@@ -56,7 +56,7 @@ inline IntPromo int_promo_of(const CTypePtr &t, unsigned long_bits = 32)
 	}
 }
 
-// 常用算术转换（§6.3.2.8）：等宽时混合/双无符号→无符号；不等宽由更宽者定符号
+// 常用算术转换（C 标准）：等宽时混合/双无符号→无符号；不等宽由更宽者定符号
 inline IntPromo int_uac(const IntPromo &a, const IntPromo &b)
 {
 	if (a.bits != b.bits)
@@ -77,7 +77,7 @@ inline CTypePtr int_ctype_of(unsigned bits, bool uns)
 	return t;
 }
 
-// 类型兼容性判定（C11 §6.5.1.1 _Generic 关联匹配用，环境无关）。
+// 类型兼容性判定（C11 标准 _Generic 关联匹配用，环境无关）。
 //   限定符在每一层都比较：依赖 lvalue 转换已将控制表达式顶层 const 剥除，
 //   使 `const int:` 关联永不命中、`int:` 命中；而指向/元素 const 显著（`int*` ≠ `const int*`）。
 inline bool types_compatible(const CTypePtr &a, const CTypePtr &b)
@@ -129,7 +129,7 @@ inline unsigned get_bitfield_unit_bits(const CTypePtr &t)
 	}
 }
 
-// <stdbit.h>（§7.18）：解析 stdc_<op>[_uc|_us|_ui|_ul|_ull]，返回后缀固定宽度（0=类型通用），输出 op 名 core
+// <stdbit.h>（C 标准）：解析 stdc_<op>[_uc|_us|_ui|_ul|_ull]，返回后缀固定宽度（0=类型通用），输出 op 名 core
 inline unsigned stdbit_parse(const std::string &name, std::string &core)
 {
 	if (name.rfind("stdc_", 0) != 0) { core = name; return 0; }
@@ -191,7 +191,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		//   `int *` 而**误拒合法 C**（P320 回归面）。
 		//   → 补查完整原型，返回**未 decay** 的 Function 型；衰减交各消费方的既有机制
 		//     （sema 的 compat_decay、codegen 的 gc_lvalue_convert），而 sizeof/typeof 语境
-		//     本属 §6.3.2.1 的退化例外，取到函数型本身正是所需。
+		//     本属 C 标准的退化例外，取到函数型本身正是所需。
 		return env.func_type(e->name);
 	}
 	// 复合字面量 (type){...}：类型由 parser 直接写入 InitList::type；
@@ -225,7 +225,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 	if (e->kind == ExprKind::Unary && e->op == "*")
 	{
 		CTypePtr pt = resolve_expr_type(e->lhs, env);
-		// 数组在 * 下按衰减后的指针处理（§6.5.3.2p3）：*arr 是「少一维的数组」，类型为其元素。
+		// 数组在 * 下按衰减后的指针处理（C 标准）：*arr 是「少一维的数组」，类型为其元素。
 		if (pt && (pt->kind == TypeKind::Pointer || pt->kind == TypeKind::Array)) return pt->base;
 		return nullptr;
 	}
@@ -250,7 +250,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 	{
 		CTypePtr at = resolve_expr_type(e->lhs, env);
 		if (at && at->kind == TypeKind::Array) return at->base;
-		// P323：指向函数的指针不可下标（C 6.5.2.1）——已由 sema 的 check_subscript 拒收，
+		// P323：指向函数的指针不可下标（C 标准）——已由 sema 的 check_subscript 拒收，
 		//   结果型按「未知」返回，避免下游再按函数型报一次 int-conversion 级联。
 		if (at && at->kind == TypeKind::Pointer)
 			return (at->base && at->base->kind == TypeKind::Function) ? nullptr : at->base;
@@ -267,7 +267,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 			return make_type(TypeKind::Int);
 		if (e->op == "-" || e->op == "+" || e->op == "~")
 		{
-			// P340：一元 `-`/`+`/`~` 施于浮点保持原类型（§6.5.3.3；整型提升只对整型生效）。
+			// P340：一元 `-`/`+`/`~` 施于浮点保持原类型（C 标准；整型提升只对整型生效）。
 			//   旧路一律过 int_promo_of，其 default 把 Float/Double 收成 {32,false}，令
 			//   `sizeof(-d)`/`sizeof(d+d)` 在 codegen 侧得 4，而 parser 自算那份给 8——两引擎分叉。
 			CTypePtr ot = resolve_expr_type(e->lhs, env);
@@ -320,7 +320,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		if (bop == "==" || bop == "!=" || bop == "<" || bop == ">" ||
 		    bop == "<=" || bop == ">=" || bop == "&&" || bop == "||")
 			return make_type(TypeKind::Int);
-		// P340：常用算术转换（§6.3.1.8）中浮点秩高于整型——`+ - * /` 两侧任一为浮点即取浮点秩高者。
+		// P340：常用算术转换（C 标准）中浮点秩高于整型——`+ - * /` 两侧任一为浮点即取浮点秩高者。
 		//   旧路只走 int_uac，令 `d+d`/`1+d`/`d/2` 在 codegen 侧全被当 int（parser 侧反而对）。
 		if (bop == "+" || bop == "-" || bop == "*" || bop == "/")
 		{
@@ -339,20 +339,20 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		}
 		return nullptr;
 	}
-	// 赋值表达式的结果类型 = 左值类型（C §6.5.16）；复合赋值同理（ptr += 2 → 指针）。
+	// 赋值表达式的结果类型 = 左值类型（C 标准）；复合赋值同理（ptr += 2 → 指针）。
 	//   缺此项使 (obj1 = obj2).array[3]、(ptr1 = ptr2)->array[3] 取不到结构体 tag，
 	//   成员访问按空 tag 造出 opaque %struct.（GEP into unsized type，CTS 0044/0054 族）。
 	if (e->kind == ExprKind::Assign)
 	{
 		return resolve_expr_type(e->lhs, env);
 	}
-	// 逗号表达式结果类型 = 最后一个子表达式（§6.5.17）；空列表回退 nullptr。
+	// 逗号表达式结果类型 = 最后一个子表达式（C 标准）；空列表回退 nullptr。
 	if (e->kind == ExprKind::Comma)
 	{
 		if (e->args.empty()) return nullptr;
 		return resolve_expr_type(e->args.back(), env);
 	}
-	// 三元表达式（§6.5.15）：任一臂为 void → 结果 void（C 6.5.15p5）；两臂同 tag 的 struct/union → 该类型；
+	// 三元表达式（C 标准）：任一臂为 void → 结果 void（C 标准）；两臂同 tag 的 struct/union → 该类型；
 	//   同型指针 → 该指针；其余仅在两臂类型兼容时采纳首臂，否则维持旧 nullptr 行为（最小 blast radius）。
 	if (e->kind == ExprKind::Ternary)
 	{
@@ -360,7 +360,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		CTypePtr b = e->args.size() > 1 ? resolve_expr_type(e->args[1], env) : nullptr;
 		if (!a) return b;
 		if (!b) return a;
-		// P335：C 6.5.15p5「if either the second or third operand has type void, the result has type void」
+		// P335：C 标准「if either the second or third operand has type void, the result has type void」
 		if (a->kind == TypeKind::Void || b->kind == TypeKind::Void)
 			return make_type(TypeKind::Void);
 		if (a->kind == TypeKind::Struct || a->kind == TypeKind::Union)
@@ -412,7 +412,7 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 	}
 	if (e->kind == ExprKind::StringLiteral)
 	{
-		// 前缀决定字面量元素类型（C §6.4.5）：L/u→wchar_t*(i16)、U→char32_t*(i32)、其余→char*。
+		// 前缀决定字面量元素类型（C 标准）：L/u→wchar_t*(i16)、U→char32_t*(i32)、其余→char*。
 		// 与 codegen::gen_expr 右值三路编码发射同口径（均据 co_str_lit_width），使 wchar_t *p = L"…"
 		// 与 MessageBoxW(L"…", …) 等宽字符实参在 Sema 通过。旧行为恒报 char*（忽略前缀、与右值发射不一致）。
 		const int w = co_str_lit_width(e->str_val);
@@ -434,9 +434,9 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		if (e->type && e->type->kind == TypeKind::Pointer) return e->type;
 		// 位精确字面量（wb/ub）携带 _BitInt 类型，供 sizeof(expr) 等取真实宽度
 		if (e->type && e->type->kind == TypeKind::BitInt) return e->type;
-		// 字面量携带的类型（§6.4.5.2 选定，含 unsigned int/long/long long）优先采用，
+		// 字面量携带的类型（C 标准选定，含 unsigned int/long/long long）优先采用，
 		// 供常用算术转换/cast 加宽取正确宽度与符号；无符号小字面量仍为 i32。
-		// 带前缀字符常量按其前缀携带 wchar_t/char8_t/char16_t/char32_t（§6.4.4.4），
+		// 带前缀字符常量按其前缀携带 wchar_t/char8_t/char16_t/char32_t（C 标准），
 		// 同样优先采用——否则 sizeof(L'A') 会落回 int 得 4（应为 2）。
 		if (e->type && (e->type->kind == TypeKind::LongLong ||
 				e->type->kind == TypeKind::Long ||

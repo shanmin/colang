@@ -57,10 +57,10 @@ extern void* bsearch(const void *key, const void *base, size_t nmemb, size_t siz
                     _colang_compar compar);
 extern int atexit(_colang_atexit_cb func);
 
-/* Annex K（§K.3，P9.30 务实子集）：
+/* Annex K（C 标准，P9.30 务实子集）：
  * 约束处理三件套 set_constraint_handler_s/abort_handler_s/ignore_handler_s 本机 UCRT 无 ISO 符号，
  * 由 colang 前端按名内建 lowering（原型仅供 sema 定型，实际 lowering 在 codegen 于正常解析之前按名拦截，
- * 声明不冲突）；非严格符合（详注释见 string.h/PROJECT.md）。
+ * 声明不冲突）；非严格符合（详注释见 string.h 及项目内部设计文档）。
  * 以下检索/排序直连 UCRT 已导出符号，比较器约定按 Annex K（qsort_s 首参 context、bsearch_s 末参 context）；
  * 本批未纳入回归实测（跨 ABI 比较器约定差异敏感）。 */
 #if defined(__STDC_WANT_LIB_EXT1__) && (__STDC_WANT_LIB_EXT1__ == 1)

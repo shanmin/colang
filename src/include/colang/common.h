@@ -114,7 +114,7 @@ inline unsigned char co_decode_char(const std::string &raw)
 }
 
 // 字符字面量编码前缀（跨层单一真值源）：raw 形如 L'A' / u'A' / U'A' / u8'A' / 'A'（前缀与引号均在其内）。
-// 返回 "u8" / "u" / "U" / "L" / ""（无前缀）。前缀决定字面量类型（ISO C §6.4.4.4）：
+// 返回 "u8" / "u" / "U" / "L" / ""（无前缀）。前缀决定字面量类型（ISO C）：
 //   L→wchar_t、u→char16_t、U→char32_t、u8→char8_t、无前缀→int。
 inline std::string co_char_lit_prefix(const std::string &raw)
 {
@@ -126,12 +126,12 @@ inline std::string co_char_lit_prefix(const std::string &raw)
 	return std::string();
 }
 
-// ---- 通用字符名 UCN（ISO C §6.4.3：\uXXXX / \UXXXXXXXX）----
+// ---- 通用字符名 UCN（ISO C：\uXXXX / \UXXXXXXXX）----
 // 跨层单一真值源：parser 用 co_ucn_validate 报诊断；各解码器入口先用 co_expand_ucn 把 UCN
 //   就地展开为 UTF-8 字节，随后沿用既有「按元素宽度/编码分派」（窄字节、UTF-16、UTF-32），
 //   不必在每种编码里各写一份 UCN 逻辑。当前范围＝**字面量内**（字符/字符串常量）；
 //   标识符里的 UCN（`int \u00e9;`）尚未支持。
-// 语法约束（§6.4.3p1）：\u 固定 4 位十六进制、\U 固定 8 位。
+// 语法约束（C 标准）：\u 固定 4 位十六进制、\U 固定 8 位。
 
 // 从 raw[i] 起解析一个 UCN：是 UCN 则返回消耗字节数并写 cp，否则返回 0（含位数/字符不足）。
 inline std::size_t co_ucn_parse(const std::string &raw, std::size_t i, uint32_t &cp)
@@ -427,7 +427,7 @@ inline std::string co_decode_string(const std::string &raw)
 // 字符串字面量前缀 → 元素字节宽度（跨层单一真值源，与 co_decode_string 的剥前缀口径完全一致）。
 // 前缀集对齐 co_decode_string/co_decode_char：u8→1、u→2、U→4、L→2（本机 wchar_t=2 字节 UTF-16，
 // ADR-104）、无前缀→1。识别方式同 co_decode_string：取首个双引号前的子串判定。供 codegen 右值
-// StringLiteral 按 C §6.4.5「前缀决定字面量元素类型」三路编码发射与类型解析据此分派。
+// StringLiteral 按 C 标准「前缀决定字面量元素类型」三路编码发射与类型解析据此分派。
 inline int co_str_lit_width(const std::string &raw)
 {
 	if (!raw.empty() && raw.front() != '"')
@@ -533,7 +533,7 @@ inline std::vector<uint32_t> co_decode_utf32(const std::string &raw)
 	return cps;
 }
 
-// 字符串字面量作为**数组对象**时的元素个数（含末尾 '\0'，ISO C §6.4.5p6/p7）。
+// 字符串字面量作为**数组对象**时的元素个数（含末尾 '\0'，ISO C）。
 // 与 co_str_lit_width 同源定元素宽度：宽 1（窄/u8）→ UTF-8 字节数、宽 2（L/u）→ UTF-16 码元数、
 //   宽 4（U）→ 码点数，各 +1 补终止符。供 sizeof(字面量) 等**不施加数组→指针退化**的语境使用。
 inline std::size_t co_str_lit_len(const std::string &raw)

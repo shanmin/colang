@@ -31,7 +31,7 @@ extern int fscanf(FILE *stream, const char *fmt, ...);
 extern FILE* fopen(const char *path, const char *mode);
 extern int fclose(FILE *stream);
 
-/* stdin/stdout/stderr — C §7.21.1。按目标平台分派（P2xx 引入数据模型/OS 宏后）：
+/* stdin/stdout/stderr — C 标准。按目标平台分派（P2xx 引入数据模型/OS 宏后）：
  *   Windows/UCRT：无名为 stderr 的数据符号，用 __acrt_iob_func(0/1/2) 实现三宏（不透明 FILE*）；
  *   Linux/glibc：stdin/stdout/stderr 为 extern FILE* 数据符号。 */
 #if defined(__linux__)
@@ -46,7 +46,7 @@ extern FILE* __acrt_iob_func(unsigned);
 #define stderr (__acrt_iob_func(2))
 #endif
 
-/* Annex K（§K.3.5，P9.30 务实子集）：边界检查格式化输出。直连本机 UCRT 导出的 ISO 同名符号。 */
+/* Annex K（C 标准，P9.30 务实子集）：边界检查格式化输出。直连本机 UCRT 导出的 ISO 同名符号。 */
 #if defined(__STDC_WANT_LIB_EXT1__) && (__STDC_WANT_LIB_EXT1__ == 1)
 extern int sprintf_s(char *s, rsize_t n, const char *fmt, ...);
 #endif

@@ -81,7 +81,7 @@ struct CType
 	// Array：元素数量（0 = 未指定）
 	std::size_t array_size = 0;
 
-	// Array（C99 VLA，§6.7.2.1）：维度为非常量表达式时置位，vla_dim 供 codegen 运行期求值。
+	// Array（C99 VLA，C 标准）：维度为非常量表达式时置位，vla_dim 供 codegen 运行期求值。
 	// 与 array_size==0（未指定/柔性）区分开：柔性数组无维度表达式，VLA 有运行期个数。
 	bool is_vla = false;
 	ExprPtr vla_dim;
@@ -128,8 +128,8 @@ inline CTypePtr make_array(CTypePtr elem, std::size_t n)
 	return t;
 }
 
-// 字符串字面量作**数组对象**时的类型（§6.4.5p6/p7）：char[N]/wchar_t[N]/char32_t[N]，N 含 '\0'。
-// 仅用于**不施加数组→指针退化**的语境（sizeof；§6.3.2.1 的例外）；其余表达式语境仍按
+// 字符串字面量作**数组对象**时的类型（C 标准）：char[N]/wchar_t[N]/char32_t[N]，N 含 '\0'。
+// 仅用于**不施加数组→指针退化**的语境（sizeof；C 标准的例外）；其余表达式语境仍按
 //   resolve_expr_type / gen_expr 退化为元素指针（如 `char *p = "abc"`、`_Generic("abc", char*:…)`）。
 inline CTypePtr ctype_of_string_literal(const std::string &raw)
 {
@@ -179,7 +179,7 @@ enum class ExprKind
 struct Expr;
 using ExprPtr = std::shared_ptr<Expr>;
 
-// 指定初始化器的一个设计符步（C11 §6.7.9p6 designator-list）：`.name` 或 `[index]`。
+// 指定初始化器的一个设计符步（C11 标准 designator-list）：`.name` 或 `[index]`。
 // 多个设计符可串接成链，如 `.ps[1].y`。
 struct DesigStep
 {
@@ -198,7 +198,7 @@ struct Expr
 	std::intmax_t int_val = 0;
 
 	// CharLiteral：编码前缀 "u8"/"u"/"U"/"L"（无前缀为空）。
-	//   按 ISO C §6.4.4.4，前缀决定字面量类型；parser 据此置 type 字段。
+	//   按 ISO C，前缀决定字面量类型；parser 据此置 type 字段。
 	std::string char_prefix;
 
 	// FloatLiteral
@@ -312,7 +312,7 @@ struct Stmt
 // ============================================================
 // parser 在声明位识别并记录 [[...]]，产物累积在本结构中，最终落到 FuncDecl/GlobalVar。
 // 本批仅落地两个属性：
-//   [[deprecated]] / [[deprecated("消息")]] —— ISO C23 §6.7.11 标准属性
+//   [[deprecated]] / [[deprecated("消息")]] —— ISO C23 标准属性
 //   [[lib("链接名")]]                     —— Co 层新定义属性（声明该符号由哪个导入库实现）
 // 其余标准属性（nodiscard/maybe_unused/…）与厂商限定名分别按「接受不生效」/「拒收报错」处理。
 // 「接受不生效」的位置（局部声明/语句位/typedef）不经本结构，直接整段消费。
@@ -331,7 +331,7 @@ struct DeclAttributes
 	bool subsystem_windows = false;
 	// 0.4.1 a2-follow：本列表中出现过的属性名拼写+定位（含 :: 限定链全名）。
 	//   供「类型语境」拒收逐名对齐 clang：`'X' attribute cannot be applied to types`；
-	//   空列表 [[::]] 无条目 → 合法零诊断（C23 §6.7.11p3）。
+	//   空列表 [[::]] 无条目 → 合法零诊断（C23 标准）。
 	std::vector<std::pair<SourceLoc, std::string>> spellings;
 };
 
@@ -385,7 +385,7 @@ struct GlobalVar
 	std::string deprecated_msg;
 	std::string lib_name;
 	unsigned align = 0;      // C23 _Alignas 强制对齐（字节；0 = 未指定）
-	// P252：`_Alignas` 跨声明一致性（§6.7.2.1p4）所需事实（比对在 sema 侧做）
+	// P252：`_Alignas` 跨声明一致性（C 标准）所需事实（比对在 sema 侧做）
 	bool align_specified = false; // 本条声明是否出现过 _Alignas（含 _Alignas(0)；与 align==0「未指定」不可混同）
 	unsigned align_effective = 0; // 本条的结果对齐 = max(_Alignas 值, 类型自然对齐)（clang「A vs B」取此值）
 	SourceLoc align_spec_loc;     // _Alignas 关键字位置（「redeclaration has different alignment」指此列）

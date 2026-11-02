@@ -98,7 +98,7 @@ struct CodeGenImpl
 	struct LoopContext {
 		llvm::BasicBlock *break_target;
 		llvm::BasicBlock *continue_target; // nullptr for switch
-		std::size_t rc_depth = 0;          // P300：入口 RC 帧深度，break/continue 释放至此（补 §5.5）
+		std::size_t rc_depth = 0;          // P300：入口 RC 帧深度，break/continue 释放至此（待补项见项目内部设计文档）
 		std::size_t vla_depth = 0;         // P348：入口 VLA 帧深度，break 回退栈至此
 		std::size_t vla_continue_depth = 0; // P348：continue 回退栈至此（switch 内取其外层循环的深度）
 	};
@@ -1337,7 +1337,7 @@ struct CodeGenImpl
 				agg_unfolded_ = false; // P310：聚合成员位为粘性标志，折叠前清零（仅服务本初始化器）
 				llvm::Constant *c = fold_global_init(gv.init, ty, &folded);
 				// P308：无运行期载体（纯 C 档 / `.co` 无顶层裸句且非 DLL/WinMain）却折不动，
-				//   且初始化器确实「加载」了有定义的非 const 全局 —— C §6.7.9p4 要求静态存储期
+				//   且初始化器确实「加载」了有定义的非 const 全局 —— C 标准要求静态存储期
 				//   初值为常量表达式，clang 实测报 `initializer element is not a compile-time
 				//   constant`（定位到被引用变量）。旧路径静默折 0、cc=0、零诊断（P306 补 const 链
 				//   后剩下的另一半）。类型门限整数/浮点/指针：P309 已把「地址常量算术」（`arr + 1`、`&x + 1`、
@@ -1805,7 +1805,7 @@ struct CodeGenImpl
 	}
 
 	// P312：判定「纯静态对象路径」——链上只允许 `.` 成员访问与 **Array 类型基**的下标，根为具名对象。
-	//   数组名退化（C §6.3.2.1）在初始化器里是地址常量（`oo.buf`、`oa[1].buf`、`g2[1]`、`oo.m[1]`），
+	//   数组名退化（C 标准）在初始化器里是地址常量（`oo.buf`、`oa[1].buf`、`g2[1]`、`oo.m[1]`），
 	//   但箭头形 / 解引用形 / 指针下标都要先**加载**指针值，不构成常量地址（clang 拒收），
 	//   故此处必须回 false，否则会误把指针变量**自身存储**当对象基址折出静默错值。
 	bool static_lvalue_chain(const ExprPtr &q, int depth)
@@ -1831,7 +1831,7 @@ struct CodeGenImpl
 		return false;
 	}
 
-	// P309：把「地址常量 ± 整型常量」拆成地址侧与常量侧（C §6.5.6 指针算术）。
+	// P309：把「地址常量 ± 整型常量」拆成地址侧与常量侧（C 标准指针算术）。
 	//   接受 `arr + 1`、`1 + arr`、`&x - 1`、`&arr[0] + 2` 及链式 `arr + 1 + 1`；
 	//   两侧都折得动整型常量时不算地址算术（交整型路径），`1 - arr` 亦不算（减法不交换）。
 	bool addr_arith_split(const ExprPtr &p, ExprPtr &out_base, intmax_t &out_n, bool &out_sub)
@@ -1918,7 +1918,7 @@ struct CodeGenImpl
 		while (p && p->kind == ExprKind::Cast)
 		{
 			// P313 边界：只剥「指针型 Cast」（重解读不改地址）。整型 Cast 包指针（`(long)arr`）
-			//   本身就不是常量表达式（C §6.6；探针 r8 j7：clang 报 11:27），照剥就会把
+			//   本身就不是常量表达式（C 标准；探针 r8 j7：clang 报 11:27），照剥就会把
 			//   「两个整型值相减」当成同对象指针差误收，且元素数与运行期字节差不一致 → 一律回 false。
 			//   注：整型 Cast 包**整个差**（`(long)(arr - arr)`）不经过此处，交 fold_int_const 的
 			//   Cast 分支（被转侧已是整型，clang 接受得 0，见 tests/p323）。
@@ -1974,7 +1974,7 @@ struct CodeGenImpl
 		return false;
 	}
 
-	// P313：同对象指针差折叠（C §6.5.6p9：两指针相减得「元素个数」而非字节数）。
+	// P313：同对象指针差折叠（C 标准：两指针相减得「元素个数」而非字节数）。
 	//   clang -std=c23 真值（探针 r11）：`&arr[1] - &arr[0]` = 1、`g2[1] - g2[0]` = 3、
 	//   `arr - (arr + 2)` = -2、`&oo.buf[3] - &oo.buf[0]` = 3；跨对象/异类型差不给常量
 	//   （探针 r11b 报 initializer element is not a compile-time constant）→ 回 false 维持
@@ -2112,7 +2112,7 @@ struct CodeGenImpl
 			return nullptr;   // 链上出现非常量/未知 → 交回调用方（旧行为）
 		}
 		// P312：数组名退化的**成员形与下标形**（`oo.buf`、`oa[1].buf`、`oo.m[1]`、`g2[1]`、`uu.c`）。
-		//   C §6.3.2.1：初始化器里的数组名（含经成员/下标得到的数组）同样退化为「指向首元素」
+		//   C 标准：初始化器里的数组名（含经成员/下标得到的数组）同样退化为「指向首元素」
 		//   的地址常量，clang 接受并折成 GEP；此前只能折「裸全局数组名」（下方 VarRef 分支），
 		//   成员/下标形折不动 → 落 ConstantPointerNull 静默错值，或因 P308 拒收面**误拒合法 C**。
 		//   仅收纯静态对象链（static_lvalue_chain），且结果类型必须是 Array（否则是标量加载）。
@@ -2269,10 +2269,10 @@ struct CodeGenImpl
 			//   `long q = (long)&f;` 从拒收退回静默折叠（探针 u7:9 丢诊断）→ 必须显式短路。
 			if (cast_is_ptr_to_int(e)) return false;
 			if (!fold_int_const(e->lhs, out)) return false;
-			// C 值转换（§6.3.1.3）：整型→整型 cast 须按目标位宽截断后按目标符号性重解读
+			// C 值转换（C 标准）：整型→整型 cast 须按目标位宽截断后按目标符号性重解读
 			// （gcc/clang 实现定义 = mod 2^N）。旧版对 cast 直接透传，全局初始化折叠丢符号：
 			// (unsigned short)(signed char)0x81<<2 折成 0x204、应为 0xFE04（CTS D 族 93 例）。
-			// _Bool 目标按非零化 0/1（C99 §6.3.2.1p3：任何非零值转 1，非按位截断）；
+			// _Bool 目标按非零化 0/1（C99 标准：任何非零值转 1，非按位截断）；
 			// 非整型目标（指针/struct/浮点等）维持原透传行为。
 			if (e->type)
 			{
@@ -2360,7 +2360,7 @@ struct CodeGenImpl
 			intmax_t l, r;
 			if (!fold_int_const(e->lhs, l) || !fold_int_const(e->rhs, r))
 			{
-				// P313：两侧都不是整型常量时再试「指针差」（地址常量 - 地址常量，C §6.5.6p9）。
+				// P313：两侧都不是整型常量时再试「指针差」（地址常量 - 地址常量，C 标准）。
 				//   旧路径整式回 false → 文件作用域标量 fallback 静默折 0，并诱发 P308 拒收面
 				//   误拒合法 C（`g2[1] - g2[0]`，与 P312 同构：补折即自愈，不动拒收判据）。
 				//   只认 `-`：`+` 无指针加法，`(long)(arr + 1)` 一类仍须回 false 交 P311 拒收。
@@ -2533,7 +2533,7 @@ struct CodeGenImpl
 	//   槽 0，指针/聚合重定位常量天然可表达——全局 union 初始化零值缺陷的修复主通道。
 	// 其余情形（被指的是**非首成员**，P238 指定初始化器）→ 位重解释：先摊成字节位模式，
 	//   再按首成员类型重建（首成员吃低 head_sz 字节、尾部吃余下字节）。含重定位时
-	//   摊平失败 → 全零，与改前行为一致（已知边界，见 PROJECT.md §3.2）。
+	//   摊平失败 → 全零，与改前行为一致（已知边界，见项目内部设计文档）。
 
 	llvm::Constant *union_body_const(llvm::StructType *sty, llvm::Constant *mc,
 		llvm::Type *mem_ty = nullptr)
@@ -2570,7 +2570,7 @@ struct CodeGenImpl
 	}
 
 	// union 常量槽：目标为具名 struct 且其 tag 是 union。标量或花括号初值均作用于
-	// 首成员（§6.7.9p19）；首成员通道直接产出 { <首成员类型>, [M x i8] } 常量，
+	// 首成员（C 标准）；首成员通道直接产出 { <首成员类型>, [M x i8] } 常量，
 	// 指针/聚合重定位因此可表达（旧表征只能给字节，遇非空指针落全零）。
 	llvm::Constant *fold_union_slot(llvm::StructType *sty, const ExprPtr &e)
 	{
@@ -2582,7 +2582,7 @@ struct CodeGenImpl
 		auto sd = struct_defs_.find(tag);
 		if (sd == struct_defs_.end() || sd->second->members.empty())
 			return llvm::Constant::getNullValue(sty);
-		// 指定初始化器（P238）：union 宿主的成员指定符必须落到**被指定**的成员（§6.7.9p12：
+		// 指定初始化器（P238）：union 宿主的成员指定符必须落到**被指定**的成员（C 标准：
 		// 「用设计符指定成员时初始化该成员」）。旧实现无条件取 args[0] 折进 members[0] ——
 		// `union { int i; long long q; } g = { .q = 0x1122334455667788 }` 被截成 32 位写进 i，
 		// 全局静默误编译（探针 `_tmp/p238_b.co`）。链式（`.p.y` / `.a[1]`）复用 P237 物理路径。
@@ -2605,7 +2605,7 @@ struct CodeGenImpl
 		CTypePtr fm = sd->second->members[0].type; // 首成员类型
 		llvm::Type *fmt = to_llvm_alloca_type(fm);
 		// 初始化式：首项是带括号子初始化器（或首成员标量）→ 整体折叠；
-		// 否则扁平项按 brace elision 全部归入首成员（§6.7.9p20），
+		// 否则扁平项按 brace elision 全部归入首成员（C 标准），
 		// 如 union{int *p[2];} u={&a,&a} 两项都属 p，旧实现只取首项 → 第 2 项丢失。
 		llvm::Constant *mc = nullptr;
 		if (fmt)
@@ -2669,7 +2669,7 @@ struct CodeGenImpl
 			ExprPtr sub = args[pos++];
 			return fold_global_init(sub, ty);
 		}
-		// union 包装：首成员为聚合时扁平项按 brace elision 依次折叠进该成员（§6.7.9p20），
+		// union 包装：首成员为聚合时扁平项按 brace elision 依次折叠进该成员（C 标准），
 		// 否则取一项（标量/括号）作用于首成员（顶层 fold_global_init 会检测 union→fold_union_slot）
 		if (ty->isStructTy())
 		{
@@ -2692,7 +2692,7 @@ struct CodeGenImpl
 		{
 			auto *aty = llvm::cast<llvm::ArrayType>(ty);
 			llvm::Type *ety = aty->getElementType();
-			// 字符串字面量整体初始化字符数组（§6.7.9p14）：在扁平游标中只占一项，
+			// 字符串字面量整体初始化字符数组（C 标准）：在扁平游标中只占一项，
 			// 不能按元素逐个消费（旧代码使 struct{char s[20];} x={"str",...} 的后续项全错位）。
 			if (pos < args.size() && args[pos] && args[pos]->kind == ExprKind::StringLiteral && ety->isIntegerTy())
 			{
@@ -2887,7 +2887,7 @@ struct CodeGenImpl
 		return path_leaf_addr(addr, ty, ct, path, lvl + 1);
 	}
 
-	// ── P239：指定符之后位置项的 DFS 续位（C11 §6.7.9p17） ────────────────
+	// ── P239：指定符之后位置项的 DFS 续位（C11 标准） ────────────────
 	// 设计符之后的位置项须从「被指定子对象的下一个子对象」起按 DFS 序续位（本级无兄弟则
 	// 逐层上溯）。旧实现一律把「顶层序号 +1」当续位点：`{ [1].x = 5, 6 }` 把 6 落 arr[2].x
 	// （clang 为 arr[1].y）、`.ps[0].x = 1, 2, 3, 4` 只留 ps[0].x、其余静默丢。故把续位
@@ -3046,7 +3046,7 @@ struct CodeGenImpl
 		if (!e->lhs || e->lhs->kind != ExprKind::VarRef) return nullptr;
 		const std::string &alias = e->lhs->name;
 		if (alias.empty() || e->name.empty() || !tu_view_) return nullptr;
-		if (vars_.count(alias)) return nullptr; // 同名局部变量遮蔽（C §6.2.1）：不是模块限定名
+		if (vars_.count(alias)) return nullptr; // 同名局部变量遮蔽（C 标准）：不是模块限定名
 		const std::string key = module_key_of_alias(alias);
 		if (key.empty()) return nullptr;
 		for (const auto &g : tu_view_->globals)
@@ -3105,7 +3105,7 @@ struct CodeGenImpl
 	}
 
 	// P307：限定枚举常量取值（`b.DIM`）。遮蔽判定与限定全局同口径：首段是本函数里的
-	//   同名变量时不是模块限定名（C §6.2.1）。
+	//   同名变量时不是模块限定名（C 标准）。
 	bool const_qual_enum_value(const ExprPtr &e, intmax_t &out)
 	{
 		if (!e || e->kind != ExprKind::Member || e->op != ".") return false;
@@ -3121,7 +3121,7 @@ struct CodeGenImpl
 	}
 
 	// P306：初始化器里的 const 全局引用取其初值表达式（裸名走 global_defs_，限定访问走 q_global）。
-	//   非 const 对象不是常量表达式（C §6.6p7），不在此折——维持原 fallback 行为。
+	//   非 const 对象不是常量表达式（C 标准），不在此折——维持原 fallback 行为。
 	const ExprPtr *const_global_ref_init(const ExprPtr &e)
 	{
 		if (!e) return nullptr;
@@ -3129,7 +3129,7 @@ struct CodeGenImpl
 		if (e->kind == ExprKind::VarRef)
 		{
 			if (e->name.empty()) return nullptr;
-			if (vars_.count(e->name)) return nullptr; // 同名局部变量遮蔽（C §6.2.1）：不是全局
+			if (vars_.count(e->name)) return nullptr; // 同名局部变量遮蔽（C 标准）：不是全局
 			auto it = global_defs_.find(e->name);
 			if (it != global_defs_.end()) g = it->second;
 		}
@@ -3207,7 +3207,7 @@ struct CodeGenImpl
 		if (!e || depth > 16) return false;
 		if (e->kind == ExprKind::VarRef)
 		{
-			if (e->name.empty() || vars_.count(e->name)) return false; // 局部遮蔽（§6.2.1）
+			if (e->name.empty() || vars_.count(e->name)) return false; // 局部遮蔽（C 标准）
 			auto it = global_defs_.find(e->name);
 			if (it == global_defs_.end()) return false;
 			const GlobalVar *g = it->second;
@@ -3253,7 +3253,7 @@ struct CodeGenImpl
 			qt->kind == TypeKind::Function;
 	}
 
-	// P308：初始化器是否「加载」了有定义的非 const 全局（C §6.7.9p4 拒收判据的必要条件）。
+	// P308：初始化器是否「加载」了有定义的非 const 全局（C 标准拒收判据的必要条件）。
 	//   clang -std=c23 真值：`int g = M;`、`int g = M + 1;`、`double d = M;` 均报
 	//   `initializer element is not a compile-time constant`，定位到被引用的 `M` 而非声明处；
 	//   而 `&M` 取址、`sizeof`、数组名/函数名（地址退化）都不是加载，clang 全部接受。
@@ -3309,7 +3309,7 @@ struct CodeGenImpl
 				return init_loads_nonconst_global(e->lhs, depth + 1, out_hit, true);
 			// P316：**跨对象指针差**（`other - arr`、`&oo.in.x - &arr[0]`、`&M - &N`、`ex - arr`、
 			//   `arr + 1 - other`、`(long)(other - arr)`）——两侧都是可解析的地址常量但**根不同**，
-			//   就不是常量表达式（C §6.5.9p9 只在同一数组对象内合法；探针 w1/w1b/w1d/w1e/w1g 里 clang
+			//   就不是常量表达式（C 标准只在同一数组对象内合法；探针 w1/w1b/w1d/w1e/w1g 里 clang
 			//   逐条报 `initializer element is not a compile-time constant`，**定位一律在整个初值表达式的起点**）。
 			//   旧路 fold_ptr_diff 判「不同根即不折」后落 null fallback → 静默 `global i32 0`、零诊断。
 			//   判据与折叠器**同源**（同根者早已折出真值、`folded=true` 根本走不到本入口）：
@@ -3356,7 +3356,7 @@ struct CodeGenImpl
 		case ExprKind::VarRef:
 		{
 			if (e->name.empty()) return false;
-			if (vars_.count(e->name)) return false; // 同名局部变量遮蔽（C §6.2.1）：不是全局
+			if (vars_.count(e->name)) return false; // 同名局部变量遮蔽（C 标准）：不是全局
 			auto it = global_defs_.find(e->name);
 			if (it == global_defs_.end()) return false;
 			// P310：被加载语境下的数组/struct/union 名也是真加载（`arr[0]`、`*arr` 经 `*` 分支、
@@ -3378,7 +3378,7 @@ struct CodeGenImpl
 				return true;
 			}
 			// P310：同文件成员访问（`oo.y`/`oo.in.x`/`op->in.x` clang 实测 r7 全报）。成员选择结果
-			//   为数组/struct/union/函数名时是地址退化常量（`char *p = s.buf;` 合法、§6.3.2.1），
+			//   为数组/struct/union/函数名时是地址退化常量（`char *p = s.buf;` 合法、C 标准），
 			//   不递归；标量结果（或类型解不出时保守继续，基侧仍有 under_deref 门）才递归基表达式；
 			//   外层已在被加载语境时无条件递归（`*(s.buf)` 等经 `*` 分支自会命中）。
 			if (!e->lhs) return false;
@@ -3445,7 +3445,7 @@ struct CodeGenImpl
 				}
 			}
 		}
-		// P336：文件作用域 _Bool(i1) 初值按 C 6.3.1.2「非零即真」折叠——修「指针/地址常量、
+		// P336：文件作用域 _Bool(i1) 初值按 C 标准「非零即真」折叠——修「指针/地址常量、
 		//   浮点常量、偶数整型」现静默折 0（运行期对偶见 P327 convert_value）。分支入口以 ty 精确
 		//   等于 i1 为门，非 bool 全局零影响；地址折叠排除显式 ptr→int cast，保 P308/P311/P321 拒收面
 		//   零回退（`bool g=(int)(intptr_t)arr`、`bool g=rv` 仍落末尾 fallback → out_folded=false → 拒收）。
@@ -3487,7 +3487,7 @@ struct CodeGenImpl
 			{
 				if (ty->isIntegerTy())
 					return llvm::ConstantInt::get(ty, static_cast<uint64_t>(v));
-				// C §6.3.1.4：无符号常量表达式须按值转浮点。fold_int_const 以 intmax_t 回绕，
+				// C 标准：无符号常量表达式须按值转浮点。fold_int_const 以 intmax_t 回绕，
 				// `18446744073709551615ULL` 得 -1，不重解释就会折成 -1.0（局部路径经 uitofp 正确）。
 				CTypePtr vt = get_expr_ctype(e);
 				if (!vt) vt = e->type;
@@ -3518,7 +3518,7 @@ struct CodeGenImpl
 			auto *aty = llvm::cast<llvm::ArrayType>(ty);
 			auto *elem = aty->getElementType();
 			// 必须走解码取内容字节（旧代码误用原始 str_val、把首尾引号与未展开转义当作
-			// 内容写入）。内容长 < N 时余位补 0，天然涵盖 '\0' 终止与显式定长截断（§6.7.9p14）。
+			// 内容写入）。内容长 < N 时余位补 0，天然涵盖 '\0' 终止与显式定长截断（C 标准）。
 			// 按元素位宽分派：宽字符数组（elem 位宽 > 8，即 wchar_t->i16）填 UTF-16 码元
 			// （修 plct 00220）；其余（char->i8）沿用 co_decode_string 逐字节路径、逐字不变（00115）。
 			std::vector<llvm::Constant*> elems;
@@ -3563,7 +3563,7 @@ struct CodeGenImpl
 				bool has_desig = false;
 				for (const auto &ae : e->args)
 					if (ae && ae->desig_index >= 0) { has_desig = true; break; }
-				// §6.7.9p14/p19：单字符串元素的花括号 char s[] = {"str"} ≡ = "str"，整串填入数组。
+				// C 标准：单字符串元素的花括号 char s[] = {"str"} ≡ = "str"，整串填入数组。
 				// 否则下方位置循环会把整串折进单个 char 元素→全零（CTS 0011 空输出族）。
 				if (!has_desig && e->args.size() == 1 && e->args[0] &&
 					e->args[0]->kind == ExprKind::StringLiteral && elem_ty->isIntegerTy())
@@ -3699,7 +3699,7 @@ struct CodeGenImpl
 						}
 						else
 						{
-							while (cpos < gm.size() && gm[cpos].name.empty()) ++cpos; // 匿名位域不占初始化位（§6.7.9）
+							while (cpos < gm.size() && gm[cpos].name.empty()) ++cpos; // 匿名位域不占初始化位（C 标准）
 							if (cpos < gm.size()) mname = gm[cpos].name;
 							++cpos;
 						}
@@ -3733,7 +3733,7 @@ struct CodeGenImpl
 					}
 					return llvm::ConstantStruct::get(sty, elems);
 				}
-				// brace elision（P185，C99 §6.7.9p7）：无指定符 + 首项非括号 + 平铺项数 > LLVM 槽数
+				// brace elision（P185，C99 标准）：无指定符 + 首项非括号 + 平铺项数 > LLVM 槽数
 				// （槽数 ≥ C 成员数，故项数超槽只能是在扁平填充某子聚合）→ 共享游标逐 LLVM 槽 elide_fold。
 				// 旧路径「一项一成员」，`struct C g={1,2,3,4}`（C{long a[4];}）标量 1 交 [4 x i64] 折叠得 null → 全零。
 				// 判据用「项数 > 槽数」（非「含聚合槽」、非「成员数」）：_Alignas padding 使槽多而项少→不触发
@@ -3814,7 +3814,7 @@ struct CodeGenImpl
 						}
 					}
 					// 指定初始化器名提升（P236）：`.提升名` 折叠到匿名聚合内的真实字段。
-					// 旧路径只认直接成员、失配回退 pos（此处恒 0）→ 值静默写进内层偏移 0（§6.7.9p17）。
+					// 旧路径只认直接成员、失配回退 pos（此处恒 0）→ 值静默写进内层偏移 0（C 标准）。
 					std::vector<unsigned> cpath;
 					if (!se->desig_field.empty() && gsd != struct_defs_.end()
 						&& find_member_cpath(gtag, se->desig_field, cpath) && cpath.size() > 1)
@@ -3872,7 +3872,7 @@ struct CodeGenImpl
 					}
 					if (idx >= sty->getNumElements()) break;
 					llvm::Type *ft = sty->getElementType(idx);
-					// 聚合成员 + 非括号项：按 brace elision 从当前游标递归折叠（§6.7.9p20）。
+					// 聚合成员 + 非括号项：按 brace elision 从当前游标递归折叠（C 标准）。
 					// 旧代码直接 fold_global_init(标量, 聚合类型) → getNullValue，使
 					// `struct{struct{int a;} inst;} x = {1}` 的嵌套成员恒为 0（CTS 0149 族）。
 					if (ft->isAggregateType())
@@ -3893,7 +3893,7 @@ struct CodeGenImpl
 				return llvm::ConstantStruct::get(sty, elems);
 				}
 				// 标量整数/浮点（含 enum）的花括号初始化 `T x = {v}`（旧代码 InitList 仅处理 array/struct，标量 ty 两分支都不命中
-				// →落到末尾 getNullValue → 0。CTS 0150 族全局 enum en={1}、int g={1} 全 0）：按 C §6.7.9 取首元素
+				// →落到末尾 getNullValue → 0。CTS 0150 族全局 enum en={1}、int g={1} 全 0）：按 C 标准取首元素
 				// 递归折叠（可嵌套 {{v}}）；空 {} 保持零初始化。**仅限整数/浮点标量**：指针类型不 return，
 				// 留给下方 pointer 块（保持复合字面量 (T){...} 取址/字符串数组退化等旧行为，否则 p41 会误取 args[0] 崩）。
 				if (ty->isIntegerTy() || ty->isFloatingPointTy())
@@ -3907,7 +3907,7 @@ struct CodeGenImpl
 		if (ty->isPointerTy())
 		{
 			// 字符串字面量初始化指针（char *p = "abc"; 及 struct{char *a;} x={"A";}）：按 C 数组→指针退化
-			// （§6.3.2.1）物化为静态常量字符数组全局、返回其首元素地址。旧代码无此形→落到下方
+			// （C 标准）物化为静态常量字符数组全局、返回其首元素地址。旧代码无此形→落到下方
 			// ConstantPointerNull，使全局指针成员初始化后为 null（CTS 0030 族 printf("%s") 得 (null)）。
 			if (e->kind == ExprKind::StringLiteral)
 			{
@@ -4675,7 +4675,7 @@ struct CodeGenImpl
 			emit_init_list_store(sub, addr, ty);
 			return;
 		}
-		// union 包装：首成员为聚合时扁平项按 brace elision 依次写入该成员（§6.7.9p20），
+		// union 包装：首成员为聚合时扁平项按 brace elision 依次写入该成员（C 标准），
 		// 否则取一项作用于首成员（store 到偏移 0）。
 		if (ty->isStructTy())
 		{
@@ -4708,7 +4708,7 @@ struct CodeGenImpl
 		{
 			auto *aty = llvm::cast<llvm::ArrayType>(ty);
 			llvm::Type *ety = aty->getElementType();
-			// 字符串字面量整体初始化字符数组（§6.7.9p14）：在扁平游标中只占一项
+			// 字符串字面量整体初始化字符数组（C 标准）：在扁平游标中只占一项
 			if (pos < args.size() && args[pos] && args[pos]->kind == ExprKind::StringLiteral && ety->isIntegerTy())
 			{
 				ExprPtr it = args[pos++];
@@ -4767,13 +4767,13 @@ struct CodeGenImpl
 	{
 		if (e->kind != ExprKind::InitList) return;
 		// union：LLVM 表示是「首成员大小的字节数组」（get_struct_type 的 is_union 分支），
-		//   初始化列表只初始化首个具名成员（C11 §6.7.9p12）。旧实现落到 struct 分支按
+		//   初始化列表只初始化首个具名成员（C11 标准）。旧实现落到 struct 分支按
 		//   [N x i8] 槽处理 → convert_value(ptr → [N x i8]) 造出 ptrtoint 到数组（非法 IR，
 		//   CTS 0059 族）。此处按 CType 判定 union 后直接写首成员类型。
 		if (ct && ct->kind == TypeKind::Union)
 		{
 			if (e->args.empty()) return;
-			// 指定初始化器（P238）：union 宿主的 `.成员 = v` 须落到**被指定**的成员（§6.7.9p12）。
+			// 指定初始化器（P238）：union 宿主的 `.成员 = v` 须落到**被指定**的成员（C 标准）。
 			// 旧实现无条件按首成员类型写入 —— `union { int i; long long q; } l = { .q = 0x1122334455667788 }`
 			// 被截成 32 位写进 i，局部同样静默误编译（探针 `_tmp/p238_b.co`）。
 			// 链式（`.p.y` / `.a[1]`）复用 P237 物理路径：union 层偏移恒 0、`path_leaf_addr` 已跳过 GEP。
@@ -4817,14 +4817,14 @@ struct CodeGenImpl
 					emit_init_list_store(first, ptr, fty, mt);
 				else
 				{
-					// 扁平列表：首成员为聚合时按 brace elision 依次写入该成员（§6.7.9p20），
+					// 扁平列表：首成员为聚合时按 brace elision 依次写入该成员（C 标准），
 					// 旧实现只取首项 → union{struct{8 位域}} x={0x00,0xff,...} 只初始化第 1 个位域。
 					std::size_t cur = 0;
 					elide_store(fty, ptr, e->args, cur);
 				}
 				return;
 			}
-			// 标量成员的括号包裹初值 `{ { 5 } }`（§6.7.9p11：标量初始化式可选加括号）：
+			// 标量成员的括号包裹初值 `{ { 5 } }`（C 标准：标量初始化式可选加括号）：
 			// 全局 fold_global_init 对 InitList + 标量会递归取首项，局部旧实现把内层 InitList
 			// 直接交 gen_expr → 值恒 0（静默）。此处同口径取首项（P238 顺手修）。
 			ExprPtr item = first;
@@ -4973,7 +4973,7 @@ struct CodeGenImpl
 		else if (ty->isStructTy())
 		{
 			auto *sty = llvm::cast<llvm::StructType>(ty);
-			// brace elision（P185，C99 §6.7.9p7）：无指定符 + 首项非括号 + 平铺项数 > LLVM 槽数
+			// brace elision（P185，C99 标准）：无指定符 + 首项非括号 + 平铺项数 > LLVM 槽数
 			// → 共享游标逐槽 elide_store（与全局 elide_fold 同构）。旧路径「一项一成员」位置消费，
 			// `struct C m = {5,6,7,8}`（C{long a[4];}）首项 store 到 a 后次项 idx 越界 break → 只写首元素。
 			// 判据「项数 > 槽数」：_Alignas padding 使槽多项少→不触发（保护定位消费）；槽数取自 LLVM、匿名子 struct 亦可判。
@@ -5232,7 +5232,7 @@ struct CodeGenImpl
 						emit_init_list_store(elem, ptr, ft);
 						continue;
 					}
-					// 聚合成员 + 非括号项：按 brace elision 从当前游标递归消费（§6.7.9p20）。
+					// 聚合成员 + 非括号项：按 brace elision 从当前游标递归消费（C 标准）。
 					// 该项本身若是 struct/union 值则须整体拷贝，不参与 elision。
 					CTypePtr et = get_expr_ctype(elem);
 					bool agg_value = et && (et->kind == TypeKind::Struct || et->kind == TypeKind::Union);
@@ -5397,7 +5397,7 @@ struct CodeGenImpl
 				}
 				llvm::Value *rv = gen_expr(s->expr);
 				llvm::Type *rt = F->getReturnType();
-				// 返回値隐式转换到函数返回类型（C §6.8.7.5）；void 不转。
+				// 返回値隐式转换到函数返回类型（C 标准）；void 不转。
 				//   P352：win64 下 rt 可为 first-class 聚合体（struct/array），而 colang 表达式值恒为
 				//   存储指针——交由 convert_value 新增的「ptr→聚合体 load」分支取回聚合值；非 win64
 				//   rt 恒为 ptr（旧降法），rv 亦 ptr，类型相等即不转。旧代码此处排除 struct/array 乃
@@ -5467,7 +5467,7 @@ vla_restore_emit(0);       // P348：同上
 			bool is_arr = (s->var_type && s->var_type->kind == TypeKind::Array);
 			bool is_struct = (s->var_type && (s->var_type->kind == TypeKind::Struct || s->var_type->kind == TypeKind::Union));
 			llvm::Type *ty = (is_arr || is_struct) ? to_llvm_alloca_type(s->var_type) : to_llvm_type(s->var_type);
-			// VLA（P208/P209，C99 §6.7.2.1）：数组链含任一运行期维（外/中/内皆可）。
+			// VLA（P208/P209，C99 标准）：数组链含任一运行期维（外/中/内皆可）。
 			// 旧路径 eval_const_int 把 `[len]` 折成 0 → `alloca [0 x double]` 零存储 → 写入即越界 AV
 			// （CTS 0066/0106/0062/0090/0189 族 clang 可运行而 colang 崩）。
 			// 多维线性化（P209）与 clang 同形：从内层剥「连续常量维」构成静态元素类型 S（遇首个
@@ -5567,7 +5567,7 @@ vla_restore_emit(0);       // P348：同上
 				else if (is_vla && (s->var_init->kind == ExprKind::InitList ||
 					s->var_init->kind == ExprKind::StringLiteral))
 				{
-					// VLA 初始化（§6.7.9p21：未列出的元素置零）：先按运行期总字节数 memset，
+					// VLA 初始化（C 标准：未列出的元素置零）：先按运行期总字节数 memset，
 					// 再以 `[k x elem]` 视图逐项写入——addr 指向连续 n 个元素，视图只描述前 k 个，
 					// 两者存储布局逐字相同（n < k 的输入属 UB，与 C 同口径）。
 					llvm::Value *bytes = builder.CreateMul(vla_n,
@@ -5609,7 +5609,7 @@ vla_restore_emit(0);       // P348：同上
 				{
 					// 标量（含 enum/typedef 标量）的花括号初始化 `T x = {v}`：旧代码直接 gen_expr(InitList)，
 					// 而 gen_expr 对 InitList 不产标量值→alloca 保持 0（CTS 0150 族 enum en={1}、int d={1} 全 0）。
-					// 按 C §6.7.9p2/p16：标量以单层（可嵌套）花括号包裹的单个表达式初始化，取首元素递归解包；空 {} → 零初始化。
+					// 按 C 标准：标量以单层（可嵌套）花括号包裹的单个表达式初始化，取首元素递归解包；空 {} → 零初始化。
 					// **仅限 LLVM 整数/浮点标量**：指针（复合字面量 (T){...} 赋值、数组退化）保持原 gen_expr 路径，否则 p41 会误取 args[0] 当标量存→解引用崩。
 					bool scalar_ty = ty && (ty->isIntegerTy() || ty->isFloatingPointTy());
 					ExprPtr init = s->var_init;
@@ -5750,7 +5750,7 @@ vla_restore_emit(0);       // P348：同上
 			if (!loop_stack_.empty())
 			{
 				// P300：break 仅终结当前 IR 路径，先按目标帧深度发射 release（不弹 C++ 栈，
-				//   块出域仍负责 pop），再 br 到出口，修循环体句柄泄漏（补 §5.5）。
+				//   块出域仍负责 pop），再 br 到出口，修循环体句柄泄漏（待补项见项目内部设计文档）。
 				release_rc_frames_emit(loop_stack_.back().rc_depth);
 				vla_restore_emit(loop_stack_.back().vla_depth); // P348：break 退出嵌套块时回退 VLA 栈
 				if (builder.GetInsertBlock()->empty() || !builder.GetInsertBlock()->back().isTerminator())
@@ -5864,7 +5864,7 @@ vla_restore_emit(0);       // P348：同上
 		}
 
 		// break 目标 = switch_end（C 语义：switch 内 break 跳出 switch）；
-		// continue 不是迭代语句（§6.8.6.2p2），switch 帧须继承最近外层循环的 continue 目标，
+		// continue 不是迭代语句（C 标准），switch 帧须继承最近外层循环的 continue 目标，
 		// 否则 switch 内的 continue 无处跳转，当前块会缺终止符触发 verifier 报错。
 		llvm::BasicBlock *cont_target = nullptr;
 		std::size_t cont_vla_depth = 0;
@@ -5953,7 +5953,7 @@ vla_restore_emit(0);       // P348：同上
 		if (vt->isPointerTy())
 			return builder.CreateICmpNE(v, llvm::ConstantPointerNull::get(
 				llvm::cast<llvm::PointerType>(vt)));
-		// 浮点非零判定：C §6.3.2.1p2「值不等于 0」用 fcmp（icmp 对浮点非法）。
+		// 浮点非零判定：C 标准「值不等于 0」用 fcmp（icmp 对浮点非法）。
 		// 用 UNE（无序或不等）：NaN 视为真，与 C 真值语义一致。
 		if (vt->isFloatingPointTy())
 			return builder.CreateFCmpUNE(v, llvm::ConstantFP::get(vt, 0.0));
@@ -5996,7 +5996,7 @@ vla_restore_emit(0);       // P348：同上
 			return builder.CreateLoad(target, v);
 		if (from->isPointerTy() && !target->isPointerTy())
 		{
-			// P327：指针 → _Bool(i1) 按 C 6.3.1.2「非空即真」，与 gen_cond 同源发 icmp ne null。
+			// P327：指针 → _Bool(i1) 按 C 标准「非空即真」，与 gen_cond 同源发 icmp ne null。
 			//   原 ptrtoint to i1 只留指针最低位 → 偶数地址判 false、奇数地址判 true（静默错值）。
 			//   指针 → 其他整型（long/uint 等）维持既有 ptrtoint。
 			if (target == llvm::Type::getInt1Ty(ctx))
@@ -6026,7 +6026,7 @@ vla_restore_emit(0);       // P348：同上
 			// i1（比较/布尔结果）转 FP 须按无符号 0/1：sitofp i1 true(有符号 1-bit = -1) 会得 -1.0，
 			// 而 C 关系运算 `b==a` 产 int 0/1 再转 FP 应为 0.0/1.0（CTS 0114 long double 族）。
 			if (from->getIntegerBitWidth() == 1) return builder.CreateUIToFP(v, target);
-			// C §6.3.1.4：无符号整型转浮点须按值（uitofp）。源位宽相同但 signed/unsigned
+			// C 标准：无符号整型转浮点须按值（uitofp）。源位宽相同但 signed/unsigned
 			// 共用同一 LLVM 整型（i32 既可能 int 也可能 unsigned int），符号性只能取自 CType；
 			// 缺判会把 `unsigned u=0x80000000; (double)u` 转成 -2147483648.0。
 			if (src_t && is_unsigned_int_type(src_t)) return builder.CreateUIToFP(v, target);
@@ -6054,7 +6054,7 @@ vla_restore_emit(0);       // P348：同上
 		return v;
 	}
 
-	// C §6.3.1.1/.1.2「默认参数提升」：传给变参省略号(...)的实参须做——
+	// C 标准「默认参数提升」：传给变参省略号(...)的实参须做——
 	//   窄整型(_Bool/char/short，位宽<32)按符号性扩展→int、float→double；
 	//   int/long/long long/double/指针原样。供「有原型变参函数的变参尾」(coerce_call_args)
 	//   与「隐式函数声明 int f() 全变参」两路共用（单一真值源）。
@@ -6077,8 +6077,8 @@ vla_restore_emit(0);       // P348：同上
 		return v;
 	}
 
-	// 将实参列表逐个隐式转换到函数类型的固定形参类型（C §6.5.2.2p5）。
-	// 变参尾（超出 getNumParams、匹配 ... 的实参）做默认参数提升（§6.5.2.2p6）。
+	// 将实参列表逐个隐式转换到函数类型的固定形参类型（C 标准）。
+	// 变参尾（超出 getNumParams、匹配 ... 的实参）做默认参数提升（C 标准）。
 	void coerce_call_args(llvm::FunctionType *ft, std::vector<llvm::Value *> &args,
 		const std::vector<CTypePtr> &arg_cts)
 	{
@@ -6144,7 +6144,7 @@ vla_restore_emit(0);       // P348：同上
 			return llvm::ConstantFP::get(llvm::Type::getDoubleTy(ctx), e->float_val);
 		case ExprKind::CharLiteral:
 		{
-			// int_val 已由 parser 解码为真实码值（跨层单一真值源）。带前缀者按 §6.4.4.4 在
+			// int_val 已由 parser 解码为真实码值（跨层单一真值源）。带前缀者按 C 标准在
 			//   字面量自身宽度发射（L/u→i16、U→i32、u8/无前缀→i8）；旧实现恒发 i8，
 			//   非 ASCII 宽字符值被截到首字节、宽度信息丢失。
 			llvm::Type *cty = llvm::Type::getInt8Ty(ctx);
@@ -6167,7 +6167,7 @@ vla_restore_emit(0);       // P348：同上
 			}
 			// 右值宽字符串字面量（L"…"/u"…"→i16、U"…"→i32）：按前缀三路降 UTF-16/UTF-32，
 			// 物化为 private constant 全局数组再退化为首元素指针（复用 fold_global_init 同款解码器、
-			// 同口径；C §6.4.5 前缀决定字面量元素类型）。旧路径恒发 i8、忽略前缀（§3.1 后置项）。
+			// 同口径；C 标准前缀决定字面量元素类型）。旧路径恒发 i8、忽略前缀（项目内部设计文档登记的后置项）。
 			llvm::Type *ety = (w == 2) ? static_cast<llvm::Type *>(llvm::Type::getInt16Ty(ctx))
 			                           : static_cast<llvm::Type *>(llvm::Type::getInt32Ty(ctx));
 			std::vector<llvm::Constant *> elems;
@@ -6253,7 +6253,7 @@ vla_restore_emit(0);       // P348：同上
 		}
 		case ExprKind::Call:
 		{
-			// 变参内建（标准 §7.16）：va_start/va_arg/va_end/va_copy。与 clang Win64 产出对齐：
+			// 变参内建（标准）：va_start/va_arg/va_end/va_copy。与 clang Win64 产出对齐：
 			// va_list 为 char*(ptr)；va_start/va_end/va_copy 走 llvm intrinsic（取 ap 地址）；
 			// va_arg 为纯指针算术（load ap、按 align8(sizeof(T)) 前移并回写、从旧址 load T）。
 			if (!e->lhs && (e->name == "va_start" || e->name == "va_end" ||
@@ -6292,7 +6292,7 @@ vla_restore_emit(0);       // P348：同上
 					return builder.CreateIntrinsic(llvm::Type::getVoidTy(ctx), llvm::Intrinsic::vacopy, {d, s});
 				}
 			}
-			// C23 <stdckdint.h>：ckd_add/ckd_sub/ckd_mul(result, a, b) 溢出判定（§7.20）。
+			// C23 <stdckdint.h>：ckd_add/ckd_sub/ckd_mul(result, a, b) 溢出判定（C 标准）。
 			// colang 直建 IR、clang 前端 __builtin_*_overflow 对生成码不可用，故按名特判 lowering。
 			// 语义（本机 clang ground-truth 校准）：溢出相对 *result 的类型 T 判定；在
 			// CW=max(w(a),w(b),w(T)) 上精确运算，*result 存回绕值；CW>TW 时额外做 T 可表示范围检查。
@@ -6365,13 +6365,13 @@ vla_restore_emit(0);       // P348：同上
 				builder.CreateStore(storev, raddr);
 				return builder.CreateZExt(overflow, llvm::Type::getInt32Ty(ctx));
 			}
-			// C23 <stdbit.h>（§7.18）：stdc_<op>[_uc|_us|_ui|_ul|_ull] 位操作内建。
+			// C23 <stdbit.h>（C 标准）：stdc_<op>[_uc|_us|_ui|_ul|_ull] 位操作内建。
 			// colang 直建 IR、本机 clang 无 stdbit.h，故按名特判 lowering 到 llvm.ctpop/ctlz/cttz + 算术。
-			// 语义严格对齐发布版 §7.18.3–7.18.16 Returns 条款：
+			// 语义严格对齐发布版 C 标准 Returns 条款：
 			//   计数类(leading/trailing/first/count_*/bit_width)→unsigned int；
 			//   bit_floor/bit_ceil→同宽无符号值；has_single_bit→bool(0/1)。
 			//   first_* =「该方向连续同类位计数，若未越界则 +1，全同类则 0」；bit_width=W-clz。
-			// 参数按无符号 W 位处理（signed 输入取其模 2^W 表示，§7.18 泛型说明）。
+			// 参数按无符号 W 位处理（signed 输入取其模 2^W 表示，C 标准泛型说明）。
 			if (!e->lhs && e->args.size() == 1 && e->name.rfind("stdc_", 0) == 0)
 			{
 				std::string core;
@@ -6459,7 +6459,7 @@ vla_restore_emit(0);       // P348：同上
 				ai->setAlignment(llvm::Align(16));
 				return ai;
 			}
-			// math.h 内建（C §7.12 务实子集）：宿主 UCRT 不导出部分 ISO 符号（如 fabsf），
+			// math.h 内建（C 标准务实子集）：宿主 UCRT 不导出部分 ISO 符号（如 fabsf），
 			// 且分类/关系函数（isnan/isgreater 等）在标准里本是宏；colang 按名 lowering 到
 			// LLVM intrinsic / fcmp，避免链接期未解析符号。
 			if (!e->lhs && !e->args.empty())
@@ -6485,7 +6485,7 @@ vla_restore_emit(0);       // P348：同上
 							return want->isFloatTy() ? builder.CreateFPTrunc(v, want) : builder.CreateFPExt(v, want);
 						if (v->getType()->isIntegerTy())
 						{
-							// C §6.3.1.4：无符号/i1 源按值转（uitofp），否则大值变负数
+							// C 标准：无符号/i1 源按值转（uitofp），否则大值变负数
 							if (v->getType()->getIntegerBitWidth() == 1 ||
 								(src && is_unsigned_int_type(src)))
 								return builder.CreateUIToFP(v, want);
@@ -6540,7 +6540,7 @@ vla_restore_emit(0);       // P348：同上
 					return as_bool(builder.CreateFCmpUNO(a, b)); /* isunordered */
 				}
 			}
-			// Annex K（C11 §K.3）务实子集（P9.30）：本机 UCRT 不提供 ISO 名的
+			// Annex K（C11 标准）务实子集（P9.30）：本机 UCRT 不提供 ISO 名的
 			// memset_s/strnlen_s 与约束 handler 三件套，故 colang 按名特判 lowering：
 			//   memset_s(s,smax,c,n) → 越界钳制（n>smax 取 smax；s 空或 smax=0 填 0）后 memset，返回非0/0；
 			//   strnlen_s(s,max)    → memchr(s,0,max) 定位 NUL（无则 max），s 空返 0；
@@ -6648,7 +6648,7 @@ vla_restore_emit(0);       // P348：同上
 					return old;
 				}
 			}
-			// stdatomic（C11 §7.17，P9.33 务实子集）：atomic_* 为编译器内建（clang 走 __c11_atomic_*），
+			// stdatomic（C11 标准，P9.33 务实子集）：atomic_* 为编译器内建（clang 走 __c11_atomic_*），
 			// colang 直建 IR 且不用 clang 前端，故按名特判 lowering 到 LLVM 原子指令。
 			// 务实：memory_order 实参一律忽略、统一按 seq_cst（最严格序，语义安全超集）；仅对
 			// 自然字长类型（int 等）保证 lock-free（x86-64 上 LLVM 原子指令天然 lock-free）。
@@ -6870,13 +6870,13 @@ vla_restore_emit(0);       // P348：同上
 							{llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0)});
 						args.push_back(fa);
 					}
-					// C §6.5.2.2p5：实参隐式转换到（固定）形参类型（如 int→size_t）
+					// C 标准：实参隐式转换到（固定）形参类型（如 int→size_t）
 					llvm::FunctionType *ft = callee->getFunctionType();
 					coerce_call_args(ft, args, arg_cts);
 					// 无原型（`int f();`）声明与带形参定义并存、或 K&R 式 `void out()` 定义被带实参调用：
 					//   声明处 LLVM 函数类型与实参数量/类型对不上，直接 CreateCall 会触发 verifier
 					//   「Incorrect number of arguments / Call parameter type does not match」。
-					//   C 对这种「未知形参」调用按 §6.5.2.2p6 做默认实参提升，故以实参实际签名单建
+					//   C 对这种「未知形参」调用按 C 标准做默认实参提升，故以实参实际签名单建
 					//   FunctionType 调用（opaque pointer 下 callee 本身即 ptr，无需 bitcast）。
 					bool sig_ok = ft->isVarArg() ? (args.size() >= ft->getNumParams())
 												 : (args.size() == ft->getNumParams());
@@ -6902,7 +6902,7 @@ vla_restore_emit(0);       // P348：同上
 					}
 					return finalize_call_result(get_expr_ctype(e), builder.CreateCall(callee, args));
 				}
-				// 未声明的函数：按 C 语言实现「隐式函数声明」（§6.5.2.2p4 + §6.3.1.1/.1.2，
+				// 未声明的函数：按 C 语言实现「隐式函数声明」（C 标准+ C 标准，
 				// C89/C99 规则；C23 已移除，本项目按用户决策实现之）：
 				//   1) 隐式声明为 int f()——返回 int、**无原型**（未知形参），LLVM 表为 int(...)
 				//      纯变参（不再像旧写法那样把每个实参塞进固定 i32 形参——那会让指针/long/
@@ -6911,7 +6911,7 @@ vla_restore_emit(0);       // P348：同上
 				//      指针/数组退化指针/int/long/long long/double 原样保持，再按变参 ABI 传递。
 				{
 					llvm::Type *I32 = llvm::Type::getInt32Ty(ctx);
-					// 默认参数提升（§6.3.1.1/.1.2）：隐式声明 int f() 全变参，每个实参都提升——
+					// 默认参数提升（C 标准）：隐式声明 int f() 全变参，每个实参都提升——
 					//   与有原型变参函数共用同一 helper（单一真值源，行为与旧内联写法逐字一致）。
 					for (size_t i = 0; i < args.size(); ++i)
 						args[i] = default_arg_promote(args[i],
@@ -7111,7 +7111,7 @@ vla_restore_emit(0);       // P348：同上
 	}
 
 	// —— 二元运算符 ——
-	// C 常用算术转换（§6.3.2.8）整数分支：把两侧提升到较宽整型（至少 i32；指针按 64 位）。
+	// C 常用算术转换（C 标准）整数分支：把两侧提升到较宽整型（至少 i32；指针按 64 位）。
 	// 窄者符号扩展、宽者截断；i32↔i32 保持不变（不改变现有整数代码的 IR）。
 	std::pair<llvm::Value *, llvm::Value *> usual_arith_int(llvm::Value *l, llvm::Value *r)
 	{
@@ -7153,7 +7153,7 @@ vla_restore_emit(0);       // P348：同上
 			bool rhs_ptr = rhs_t && (rhs_t->kind == TypeKind::Array || rhs_t->kind == TypeKind::Pointer);
 			if (!lhs_ptr && rhs_ptr)
 			{
-				// C §6.5.2.1p2：E1[E2] 等价于 *((E1)+(E2))，整数写在前面（`4[intb]`、`b[a]`）
+				// C 标准：E1[E2] 等价于 *((E1)+(E2))，整数写在前面（`4[intb]`、`b[a]`）
 				// 也合法。旧实现一律把 lhs 当指针 → GEP/SExt 作用在 i32 上
 				// （CTS 0048/0053/0151 族 "SExt only operates on integer"）。
 				ptr = gen_expr(e->rhs);
@@ -7210,7 +7210,7 @@ vla_restore_emit(0);       // P348：同上
 			if (op == "/") return builder.CreateFDiv(l, r);
 			if (op == "%") return builder.CreateFRem(l, r);
 			if (op == "==") return builder.CreateFCmpOEQ(l, r);
-			// C §6.5.9/IEEE-754：!= 须取「无序非等」——任一操作数为 NaN 时结果为真（NaN != NaN）。one 会判假（CTS 0099 NaN 族）。
+			// C 标准：!= 须取「无序非等」——任一操作数为 NaN 时结果为真（NaN != NaN）。one 会判假（CTS 0099 NaN 族）。
 			if (op == "!=") return builder.CreateFCmpUNE(l, r);
 			if (op == "<") return builder.CreateFCmpOLT(l, r);
 			if (op == "<=") return builder.CreateFCmpOLE(l, r);
@@ -7293,7 +7293,7 @@ vla_restore_emit(0);       // P348：同上
 			if (cmp) return builder.CreateZExt(cmp, llvm::Type::getInt32Ty(ctx));
 			return l;
 		}
-		// 整数路径：按操作数 C 类型做整型提升 + 常用算术转换（§6.3.2.8），据符号选有/无符号指令
+		// 整数路径：按操作数 C 类型做整型提升 + 常用算术转换（C 标准），据符号选有/无符号指令
 		IntPromo lp = int_promo_of(get_expr_ctype(e->lhs), long_bits_());
 		IntPromo rp = int_promo_of(get_expr_ctype(e->rhs), long_bits_());
 		bool lext = is_unsigned_int_type(get_expr_ctype(e->lhs));
@@ -7340,7 +7340,7 @@ vla_restore_emit(0);       // P348：同上
 			// 解引用：根据指针元素类型确定 load 宽度
 			llvm::Value *ptr = gen_expr(e->lhs);
 			CTypePtr pt = get_expr_ctype(e->lhs);
-			// 数组操作数先按 §6.5.3.2p3 衰减为「指向首元素的指针」再解引用：
+			// 数组操作数先按 C 标准衰减为「指向首元素的指针」再解引用：
 			//   *arr 即首元素左值。元素仍是数组（多维）或 struct/union 时按地址建模，
 			//   直接返回指针；元素为标量时须 load（否则 *v 得到地址而非 v[0]）。
 			if (pt && pt->kind == TypeKind::Array)
@@ -7392,11 +7392,11 @@ vla_restore_emit(0);       // P348：同上
 				// P330：`sizeof(vp[1])`（void 表达式）同 GNU 口径 = 1。
 				if (et && et->kind == TypeKind::Void)
 					return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 1);
-				// VLA 的 sizeof 是运行期表达式（§6.5.3.4p2：结果为元素个数乘元素大小）。
+				// VLA 的 sizeof 是运行期表达式（C 标准：结果为元素个数乘元素大小）。
 				// 旧路径 to_llvm_alloca_type 得 [0 x elem] → 返 0。
 				if (et && et->kind == TypeKind::Array && type_has_vla_dim(et))
 				{
-					// sizeof(VLA) 运行期求值（§6.5.3.4p2）= 叶元素个数 × 叶存储大小；
+					// sizeof(VLA) 运行期求值（C 标准）= 叶元素个数 × 叶存储大小；
 					// 多维 VLA（P209）各维之积皆计入。
 					llvm::Value *cnt = vla_leaf_count(et);
 					llvm::Value *bytes = builder.CreateMul(cnt,
@@ -7481,7 +7481,7 @@ vla_restore_emit(0);       // P348：同上
 			}
 			return e->postfix ? pold : pnv;
 		}
-		// 一元 +/-：浮点操作数走 FNeg/直通；整型按 C 整型提升（§6.3.1.1）——窄整型（含
+		// 一元 +/-：浮点操作数走 FNeg/直通；整型按 C 整型提升（C 标准）——窄整型（含
 		// unsigned char/short）先据其**实际符号性** widen_int 提升到 int/long（无符号零扩展、
 		// 有符号符号扩展），再 0-sub/直通。此前用 to_i32 一律符号扩展，把 unsigned short 的
 		// 0xFFFF 误当 -1，致 -(unsigned short)(-1) 判非负、PTYPE 符号错（c-testsuite 00200）。
@@ -7504,7 +7504,7 @@ vla_restore_emit(0);       // P348：同上
 		}
 		if (e->op == "~")
 		{
-			// 一元 ~ 按操作数**实际整数类型**取反（§6.3.1.1 整型提升）：窄整型提升到 int（i32），
+			// 一元 ~ 按操作数**实际整数类型**取反（C 标准整型提升）：窄整型提升到 int（i32），
 			// long/long long 保持其位宽（i64）。此前一律 to_i32 把 64 位操作数截到 i32 取反，
 			// 且赋值回 i64 时符号扩展，致 ~(long long)0x8000000000000000 得 0xffffffffffffffff
 			// （应 0x7fffffffffffffff，CTS 0132）。
@@ -7686,7 +7686,7 @@ vla_restore_emit(0);       // P348：同上
 				else if (ld_ty->isFloatingPointTy() || rhs->getType()->isFloatingPointTy())
 				{
 					// 浮点复合赋值：按 double 运算（与 gen_binary 一致），右侧 double 操作数不再被误截到 float；
-					// 左值为整型而右值为浮点（C §6.3.2.8 常用算术转换）同样走此路：整型先转 double，
+					// 左值为整型而右值为浮点（C 标准常用算术转换）同样走此路：整型先转 double，
 					// 存回由函数尾部 convert_value(rhs, stor_ty) 截回左值真实存储类型（修 IR 校验「add i32, double」）。
 					llvm::Type *dty = llvm::Type::getDoubleTy(ctx);
 					llvm::Value *a = to_fp(lhs_val, dty, lhs_ct);
@@ -7865,7 +7865,7 @@ vla_restore_emit(0);       // P348：同上
 			return t;
 		}
 	}
-	// §6.3.1.8 常用算术转换（整型，秩保持）：结果保 Long/LongLong 不塌 Int。
+	// C 标准常用算术转换（整型，秩保持）：结果保 Long/LongLong 不塌 Int。
 	static CTypePtr gc_usual_arith(const CTypePtr &a, const CTypePtr &b)
 	{
 		if (!a || !b) return make_type(TypeKind::Int);
@@ -7915,7 +7915,7 @@ vla_restore_emit(0);       // P348：同上
 		{
 		case ExprKind::IntLiteral:
 		case ExprKind::CharLiteral:
-			// 带前缀字符常量按其前缀类型参与 _Generic 匹配（§6.4.4.4，控制表达式不做整型提升）：
+			// 带前缀字符常量按其前缀类型参与 _Generic 匹配（C 标准，控制表达式不做整型提升）：
 			//   _Generic(L'A', wchar_t: …, int: …) 应命中 wchar_t。
 			if (e->type && (e->type->kind == TypeKind::LongLong || e->type->kind == TypeKind::Long ||
 				e->type->kind == TypeKind::Int || e->type->kind == TypeKind::BitInt ||
@@ -7927,7 +7927,7 @@ vla_restore_emit(0);       // P348：同上
 			if (e->type && e->type->kind == TypeKind::Float) return e->type;
 			return make_type(TypeKind::Double);
 		case ExprKind::StringLiteral:
-			// 前缀决定字面量元素类型（C §6.4.5）：L/u→wchar_t*(i16)、U→char32_t*(i32)、其余→char*。
+			// 前缀决定字面量元素类型（C 标准）：L/u→wchar_t*(i16)、U→char32_t*(i32)、其余→char*。
 			// 与 gen_expr 右值三路编码发射同口径（均据 co_str_lit_width）；使 wchar_t *p = L"…" 与
 			// MessageBoxW(L"…", …) 实参在 Sema 通过。旧行为恒报 char*（与右值发射不一致）。
 		{
@@ -8078,7 +8078,7 @@ vla_restore_emit(0);       // P348：同上
 		return resolve_expr_type(e, env);
 	}
 
-	// sizeof 操作数的类型：字符串字面量须按**数组对象**计（§6.3.2.1：sizeof 是不发生数组→指针
+	// sizeof 操作数的类型：字符串字面量须按**数组对象**计（C 标准：sizeof 是不发生数组→指针
 	//   退化的语境），而 get_expr_ctype 按左值转换后的元素指针建模 → 直接用它会把 sizeof("abc") 错得 8。
 	//   其余表达式一律沿用 get_expr_ctype（变量/成员/下标的数组类型本就不退化）。
 	CTypePtr sizeof_operand_ctype(const ExprPtr &e)
@@ -8375,7 +8375,7 @@ vla_restore_emit(0);       // P348：同上
 		return builder.CreateLoad(llvm::Type::getInt1Ty(ctx), result);
 	}
 
-	// —— 三元 cond ? then : else ——（C §6.5.15：仅求值被选中的一支；结果可为 void）
+	// —— 三元 cond ? then : else ——（C 标准：仅求值被选中的一支；结果可为 void）
 	// 修正缺陷 #25：旧实现无条件用 select，既急切求值两臂（副作用重复）、又不支持 void 臂。
 	// 改为与 gen_short_circuit 同构的控制流：CondBr 分入 then/else 块各只求值一臂，
 	// 在各自“结束块”内完成类型统一后再 Br 到 merge，最后 phi 合流（void 则不合流）。
@@ -8399,7 +8399,7 @@ vla_restore_emit(0);       // P348：同上
 
 		const bool tvoid = tv->getType()->isVoidTy();
 		const bool evoid = ev->getType()->isVoidTy();
-		// 结果类型：任一臂为 void → 整体 void；否则按 C §6.5.15 统一：
+		// 结果类型：任一臂为 void → 整体 void；否则按 C 标准统一：
 		//   同型即用；任一臂为浮点 → 取 double（整型臂 SIToFP 提升）；其余异型回退 i32（沿用旧策略）
 		llvm::Type *rt = nullptr;
 		if (!tvoid && !evoid)
@@ -8484,7 +8484,7 @@ vla_restore_emit(0);       // P348：同上
 		if (val->getType()->isIntegerTy() && target->isFloatingPointTy())
 		{
 			// 同 convert_value：i1 按无符号 0/1 转 FP，避免 sitofp i1 true = -1.0；
-			// 无符号源按值转（uitofp），否则 `(double)0x80000000u` 得负数（C §6.3.1.4）。
+			// 无符号源按值转（uitofp），否则 `(double)0x80000000u` 得负数（C 标准）。
 			if (val->getType()->getIntegerBitWidth() == 1) return builder.CreateUIToFP(val, target);
 			if (is_unsigned_int_type(get_expr_ctype(e->lhs))) return builder.CreateUIToFP(val, target);
 			return builder.CreateSIToFP(val, target);
@@ -8519,7 +8519,7 @@ vla_restore_emit(0);       // P348：同上
 		if (t == llvm::Type::getInt1Ty(ctx)) return builder.CreateZExt(v, llvm::Type::getInt32Ty(ctx)), builder.CreateUIToFP(builder.CreateZExt(v, llvm::Type::getInt32Ty(ctx)), fp_ty);
 		if (t->isIntegerTy())
 		{
-			// C §6.3.1.4：无符号源按值转（uitofp），否则大值变负数
+			// C 标准：无符号源按值转（uitofp），否则大值变负数
 			if (src_t && is_unsigned_int_type(src_t)) return builder.CreateUIToFP(v, fp_ty);
 			return builder.CreateSIToFP(v, fp_ty);
 		}

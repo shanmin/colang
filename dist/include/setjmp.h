@@ -1,8 +1,8 @@
 /* setjmp.h — colang 自制最小标准头 (P9.15)
- * C §7.13：setjmp / longjmp / jmp_buf。仅纳入 C 标准三件套（不做 POSIX sigsetjmp 等厂商扩展，见 ADR-104）。
+ * C 标准：setjmp / longjmp / jmp_buf。仅纳入 C 标准三件套（不做 POSIX sigsetjmp 等厂商扩展，见 ADR-104）。
  * jmp_buf 尺寸/对齐取自本机 UCRT ground-truth：sizeof(jmp_buf)=256、_Alignof=16。
  *   UCRT _setjmp 用 16 字节对齐的 movaps 存 XMM 态，缓冲区欠对齐则 longjmp 回跳访问违例。
- *   标准 C（§6.7.2.1）规定对齐说明符只适用于对象/位域，不得用于 typedef——故不能写
+ *   C 标准规定对齐说明符只适用于对象/位域，不得用于 typedef——故不能写
  *   `typedef _Alignas(16) long long jmp_buf[32];`（clang/gcc 均报错）。合规做法：以带
  *   _Alignas(16) 成员的 struct 包裹数组，再 typedef 该 struct 的数组，使每个 jmp_buf
  *   对象天然继承 struct 的 16 字节对齐（取代早期 codegen 对 [32 x i64] 落位类型的硬对齐 hack）。

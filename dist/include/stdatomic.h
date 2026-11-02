@@ -1,5 +1,5 @@
 /* stdatomic.h — colang 自制最小标准头 (P9.33)
- * C11 §7.17 原子标量（atomic）。atomic_* 自由函数为「编译器内建」（clang 前端走 __c11_atomic_*），
+ * C11 标准原子标量（atomic）。atomic_* 自由函数为「编译器内建」（clang 前端走 __c11_atomic_*），
  * colang 直建 IR、不用 clang 前端，故由 codegen 按名特判 lowering 到 LLVM 原子指令（atomicrmw/
  * cmpxchg/load·store ordering/fence），此处**不作函数声明**（与 stdbit/ckd/annexK 内建同路数）。
  * 务实子集：memory_order 实参一律被忽略、统一按 seq_cst；仅对自然字长类型（int 等）保证 lock-free

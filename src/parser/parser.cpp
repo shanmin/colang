@@ -72,7 +72,7 @@ struct Parser
 	{
 		return is_co_source_file(file) ? TypeKind::LongLong : TypeKind::Long;
 	}
-	// C §6.4.5 字面量扫描（诊断符合性 + 崩溃防线）。pp-number 文法容许数字后接任意标识符字符，
+	// C 标准字面量扫描（诊断符合性 + 崩溃防线）。pp-number 文法容许数字后接任意标识符字符，
 	//   旧实现把整串直交 std::stod/stoull：尾随杂字符被**静默丢弃**（`1w`→int 1、`1.0z`→1.0、
 	//   `08`→0、`0b`→0），且 `0x`/超宽常量会令 stoull/stod 抛未捕获异常（0xC0000409 零诊断崩溃，
 	//   取证 _tmp/sc_crash.log）。判据、句式、caret 落点逐条对齐本机 clang 23.1.0，实现照 clang
@@ -288,7 +288,7 @@ struct Parser
 	bool last_typedef_ = false;
 	bool last_public_ = false; // P211 Co 层：public 存储类位（仅顶层函数/全局有意义）
 	unsigned last_alignas_ = 0; // parse_decl_specifiers 捕获的 _Alignas 强制对齐（字节；0=未指定）
-	// P250：_Alignas 约束检查（§6.7.2.1p3/p4/p6）所需的两项旁路信息
+	// P250：_Alignas 约束检查（C 标准）所需的两项旁路信息
 	SourceLoc last_alignas_loc_;  // 本声明 _Alignas 的位置（诊断指向；仅在 last_alignas_!=0 时有效）
 	SourceLoc gnu_alignas_loc_;   // GNU __attribute__((aligned)) 记录位置（脱糖并入 _Alignas 时供诊断指向）
 		unsigned gnu_decl_align_ = 0;   // GNU __attribute__((aligned)) 提升通道（本声明 aligned 最大值；0=无）：仅取 max 抬升对齐，不触发 _Alignas 约束拒收
@@ -319,7 +319,7 @@ struct Parser
 	// 局部变量名 -> 类型（typeof/auto 推断用，作用域简化为全局累积）
 	std::unordered_map<std::string, CTypePtr> local_var_types_;
 	// struct/union/enum 标签的块作用域栈：块内重定义同名 tag 时重命名为唯一 tag，
-	//   避免覆盖文件作用域的同名定义（C §6.2.1p4：tag 是有作用域的标识符）。
+	//   避免覆盖文件作用域的同名定义（C 标准：tag 是有作用域的标识符）。
 	//   每层 map：块内写的 tag → 实际 tag（无重命名时与写名相同）。
 	std::vector<std::unordered_map<std::string, std::string>> tag_scope_;
 	int block_depth_ = 0;
@@ -328,7 +328,7 @@ struct Parser
 	//   需先判断该名是否被内层变量声明隐藏（C 同名空间，内层声明隐藏外层 enumerator）。
 	std::vector<std::unordered_set<std::string>> var_scope_;
 	// P256：局部 const int 值作用域栈（与 var_scope_ 并列压弹）：每层 名→已折常量。
-	//   仅登记「初值解析期可折叠」的 const 限定整数局部；内层遮蔽外层/import const（C §6.2.1 同名空间）。
+	//   仅登记「初值解析期可折叠」的 const 限定整数局部；内层遮蔽外层/import const（C 标准同名空间）。
 	std::vector<std::unordered_map<std::string, std::int64_t>> const_local_vals_;
 	// P306：限定访问 `owner.NAME` 的 public const 值（owner＝消费方可书写限定名，P304 typedef 种子同口径）。
 	//   种子是平铺的 name→value（P256 裸名口径），此处另建限定名索引，供 `p.K` 作 case 标签/
@@ -384,7 +384,7 @@ struct Parser
 
 	// 块作用域内的 struct/union 定义：先决定实际 tag，并在解析成员之前登记前置声明，
 	//   使成员中的递归自引用（如 struct tnode *left）落到同一 tag。
-	//   同块内已声明过 → 沿用映射；否则一律取唯一内部名（C §6.2.1p4：块内定义遮蔽外层同名 tag，
+	//   同块内已声明过 → 沿用映射；否则一律取唯一内部名（C 标准：块内定义遮蔽外层同名 tag，
 	//   且文件作用域中后出现的同名定义不得覆盖它）。空 tag（匿名）不参与。
 	std::string begin_definition_tag(const std::string &tag, bool is_union)
 	{
@@ -1066,8 +1066,8 @@ struct Parser
 	// C23 [[attribute]]（P214：由「整段吞掉」改为「识别并记录」）
 	// ============================================================
 	// 旧实现发现 `[[` 就一路找 `]]`，未闭合时吞到 EOF 且零诊断。现按属性名分派：
-	//   已落地：deprecated / deprecated("msg")（ISO C23 §6.7.11）、lib("链接名")（Co 层新定义）
-	//   P249 落地：nodiscard / noreturn（§6.7.11：前者返还值丢弃告警，后者永不返回登记）
+	//   已落地：deprecated / deprecated("msg")（ISO C23 标准）、lib("链接名")（Co 层新定义）
+	//   P249 落地：nodiscard / noreturn（C 标准：前者返还值丢弃告警，后者永不返回登记）
 	//   已识别、本批不生效：maybe_unused / fallthrough / trap / pure /
 	//                     stable / assert / assume / incomplete / reproducible_constant /
 	//                     unsequenced / misleading_casefall（静默接受；maybe_unused/fallthrough
@@ -1096,7 +1096,7 @@ struct Parser
 					advance(); // ]
 					break;
 				}
-				// [[::]] 空属性列表（C23 §6.7.11p3 合法、无效果）
+				// [[::]] 空属性列表（C23 标准合法、无效果）
 				//   0.4.0：`::` 现为单 Punct token（class 作用域解析），旧 ':' ':' 两连形态一并兼容。
 				if (check_punct("::") || (check_punct(":") && peek(1).text == ":"))
 				{
@@ -1244,9 +1244,9 @@ struct Parser
 				error(loc, "'subsystem' attribute expects \"windows\" or \"console\"");
 			return true;
 		}
-		// P249：[[nodiscard]] / [[noreturn]]（§6.7.11 标准属性，本批落地语义）
+		// P249：[[nodiscard]] / [[noreturn]]（C 标准属性，本批落地语义）
 		//   重复标注：clang 容忍（实测 [[nodiscard, nodiscard]] 无诊断），此处同样幂等接受、
-		//   保留首个理由串；与 [[deprecated]] 的「重复即报错」保留差异（见 BACKLOG）。
+		//   保留首个理由串；与 [[deprecated]] 的「重复即报错」保留差异（已登内部待办队列）。
 		if (name == "nodiscard")
 		{
 			if (!out.nodiscard)
@@ -1256,7 +1256,7 @@ struct Parser
 			}
 			return true;
 		}
-		// 拼写等价：[[noreturn]] 与 C11 遗留拼写 [[_Noreturn]] 同一属性（§6.7.11 表 6.8 标准属性名前带下划线的同一性规则）
+		// 拼写等价：[[noreturn]] 与 C11 遗留拼写 [[_Noreturn]] 同一属性（C 标准的标准属性名同一性规则：带下划线前缀与无名条目相同）
 		if (name == "noreturn" || name == "_Noreturn")
 		{
 			out.noreturn_attr = true;
@@ -1307,10 +1307,10 @@ struct Parser
 		}
 	}
 
-	// 0.4.1 a2-follow（C23 §6.7.11 位点补齐）：类型语境拒收——属性跟在数组/参数表尾声明符之后、
+	// 0.4.1 a2-follow（C23 标准位点补齐）：类型语境拒收——属性跟在数组/参数表尾声明符之后、
 	//   类型说明符与声明符之间、'*' 与声明符之间，皆视作「附着于类型」。clang 逐名报
 	//   `'X' attribute cannot be applied to types`（rc=1；T1/T2/P1/P2/Q3/Q4/Q7/Q10/Q11 探针，不随属性名变化）。
-	//   空列表 [[::]] 无名字条目 → 零诊断放行（§6.7.11p3 合法）。
+	//   空列表 [[::]] 无名字条目 → 零诊断放行（C 标准合法）。
 	void reject_attributes_type_context()
 	{
 		DeclAttributes post;
@@ -1561,7 +1561,7 @@ struct Parser
 		unsigned long_bits() const { return static_cast<unsigned>(self->target.sizeof_long) * 8u; }
 	};
 
-	// P321：C23 `auto` 的推导须施加**左值转换**（§6.3.2.1：数组→元素指针、函数→函数指针）。
+	// P321：C23 `auto` 的推导须施加**左值转换**（C 标准：数组→元素指针、函数→函数指针）。
 	//   真值（本机 clang 23.1.0 `-std=c23`）：`auto p = f;` 与 `auto q = arr;` 的 `sizeof` 皆得 8；
 	//   而 `typeof(arr)` 得 16、`typeof(f)` 得函数型——typeof/sizeof 属退化的**例外**语境。
 	//   故衰减只挂在两个 auto 声明处，**不得写进 infer_auto_type 本体**（sizeof 与 typeof 共用
@@ -1579,7 +1579,7 @@ struct Parser
 	CTypePtr infer_auto_type(const ExprPtr &e)
 	{
 		if (!e) return make_type(TypeKind::Int);
-		// P340：§6.3.1.1 整型提升——rank < int 的整型（char/short 系）提升为 int，char32 提升为
+		// P340：C 标准整型提升——rank < int 的整型（char/short 系）提升为 int，char32 提升为
 		//   unsigned int，浮点与更大整型原样返回。用于一元 `-`/`+`/`~` 与两侧同型的整型二元运算，
 		//   使常量折叠侧与 clang 同值（`sizeof(c + c)`/`sizeof(-c)` 皆为 4）。
 		auto promote_int = [](const CTypePtr &t) -> CTypePtr {
@@ -1595,7 +1595,7 @@ struct Parser
 				return t;
 			}
 		};
-		// P340：§6.3.1.8 整型常用算术转换——先各自整型提升，再取 rank 高者（同 rank 则有符号合并）。
+		// P340：C 标准整型常用算术转换——先各自整型提升，再取 rank 高者（同 rank 则有符号合并）。
 		//   非整型返回 Int 作“未知”近似（浮点已在调用前分流、指针不受影响）。
 		auto int_rank = [](TypeKind k) -> int {
 			switch (k)
@@ -1685,7 +1685,7 @@ struct Parser
 			}
 			if (e->op == "!")
 				return make_type(TypeKind::Int);
-			// 一元算术 / 位取反：§6.3.1.1 整型提升（`sizeof(-c)`/`sizeof(~c)` clang 为 4，旧路得 1）。
+			// 一元算术 / 位取反：C 标准整型提升（`sizeof(-c)`/`sizeof(~c)` clang 为 4，旧路得 1）。
 			if (e->op == "-" || e->op == "+" || e->op == "~")
 				return promote_int(infer_auto_type(e->lhs));
 			// 自增自减：结果类型 = 操作数类型（不参与整型提升）
@@ -1750,7 +1750,7 @@ struct Parser
 				bool anyF = (l && l->kind == TypeKind::Float) || (r && r->kind == TypeKind::Float);
 				if (anyD) return make_type(TypeKind::Double);
 				if (anyF) return make_type(TypeKind::Float);
-				// 整型：P340 补 §6.3.1.8 常用算术转换——`1 + 1LL` 旧路退成 int（得 4），
+				// 整型：P340 补 C 标准常用算术转换——`1 + 1LL` 旧路退成 int（得 4），
 				//   现按整型提升 + rank 高者取值（clang 为 8）。
 				return usual_int_arith(l, r);
 			}
@@ -2006,7 +2006,7 @@ struct Parser
 		return c;
 	}
 
-	// —— P250：_Alignas 语境约束（§6.7.2.1p3/p4/p6）——
+	// —— P250：_Alignas 语境约束（C 标准）——
 	// p3/p4：对齐说明符只能用于对象的声明（含 struct/union 成员），不得用于函数、typedef、
 	//   形参、位域、register 对象。修前 colang 全静默接受（六类越界均 rc=0），clang 均报错。
 	void reject_alignas_only_objects(bool has, const SourceLoc &loc)
@@ -2076,7 +2076,7 @@ struct Parser
 		return natural;
 	}
 
-	// 判定数组维度是否为整型常量表达式（C99 VLA 判据，§6.5.2.1p1/§6.7.2.1）。
+	// 判定数组维度是否为整型常量表达式（C99 VLA 判据，C 标准）。
 	// 口径与 clang 实测一致：含 VarRef / Call 即非常量——C 里 `const int n = 5; int a[n];`
 	// 仍是 VLA（const 限定的变量不是整数常量表达式，与 C++ 不同）。
 	// 枚举常量已折成 IntLiteral；sizeof/_Alignof 结果为 size_t 常量（其操作数为 VLA 的
@@ -2137,7 +2137,7 @@ struct Parser
 	}
 
 	// P306：名是否为变量（所在作用域任意层的局部变量，或已声明的文件作用域变量）。
-	//   限定符被同名变量遮蔽时（C §6.2.1）`p.K` 是真实成员访问，不按模块常量折。
+	//   限定符被同名变量遮蔽时（C 标准）`p.K` 是真实成员访问，不按模块常量折。
 	bool name_is_variable(const std::string &name) const
 	{
 		for (const auto &sc : var_scope_)
@@ -2218,8 +2218,8 @@ struct Parser
 			if (e->op == "sizeof" || e->op == "alignof") return true;
 			return is_const_int_expr(e->lhs);
 		case ExprKind::Cast:
-			// P256：cast 包浮点字面量亦属整数常量表达式（C §6.6 允许算术常量转整数，
-			//   §6.3.1.5 向零截断）——`(int)22.22e+2` 作 case 标签合法（CTS 0151_0087）。
+			// P256：cast 包浮点字面量亦属整数常量表达式（C 标准允许算术常量转整数，
+			//   C 标准向零截断）——`(int)22.22e+2` 作 case 标签合法（CTS 0151_0087）。
 			//   若不在此放行，内层 FloatLiteral 被判非恒定→case 诊断闸门误杀。
 			return is_const_int_expr(e->lhs)
 				|| (e->lhs && e->lhs->kind == ExprKind::FloatLiteral);
@@ -2255,14 +2255,14 @@ struct Parser
 		}
 		case ExprKind::Cast:
 		{
-			// 显式类型转换常量：递归求值源值后按目标类型做 C 值转换（§6.3.1.3）。
+			// 显式类型转换常量：递归求值源值后按目标类型做 C 值转换（C 标准）。
 			// 旧缺本分支 → (char)/(short)/(unsigned) 等 cast case 标签落 default 折成 0，
 			// 使 `switch((char)1){case (char)1:...}` 匹配不到（CTS 0150/0054/0149 declarator 矩阵族）。
 			// 截断/重解读须与 codegen fold_int_const 一致：按目标位宽 mod 2^N、有符号且最高位
 			// 置位则回绕为负；指针/浮点/struct 等非标量目标不截断透传。
 			int64_t v = eval_const_int(e->lhs);
 			// P256：源为浮点字面量（如 case (int)22.22e+2）：eval_const_int 对 FloatLiteral
-			//   落 default 得 0，此处先按 §6.3.1.5 向零截断取整，再走目标类型转换链。
+			//   落 default 得 0，此处先按 C 标准向零截断取整，再走目标类型转换链。
 			if (e->lhs && e->lhs->kind == ExprKind::FloatLiteral)
 				v = static_cast<int64_t>(e->lhs->float_val);
 			if (e->type)
@@ -2309,7 +2309,7 @@ struct Parser
 				// sizeof(数组/结构/指针) 在数组维度/枚举/static_assert 语境误折成 int 大小 4（CTS 0119/0011 暴露）。
 				if (e->lhs)
 				{
-					// sizeof 是数组→指针退化的例外语境（§6.3.2.1）：字符串字面量作操作数时保持数组类型
+					// sizeof 是数组→指针退化的例外语境（C 标准）：字符串字面量作操作数时保持数组类型
 					//   （char[N]/wchar_t[N]/char32_t[N]，N 含 '\0'），否则 infer_auto_type 给出元素指针→得指针宽 8。
 					CTypePtr ot = e->lhs->kind == ExprKind::StringLiteral
 						? ctype_of_string_literal(e->lhs->str_val)
@@ -2379,7 +2379,7 @@ struct Parser
 		}
 	}
 
-	// _Static_assert(const_expr [, "msg"]); —— ISO C §6.7.4 静态断言声明（C11 起；C23 起消息可省）。
+	// _Static_assert(const_expr [, "msg"]); —— ISO C 静态断言声明（C11 起；C23 起消息可省）。
 	// 三处语境共用本函数：文件作用域（parse_global_decl_or_func）、块作用域（parse_stmt）、
 	//   struct/union 成员表（parse_decl_specifiers 的成员循环）——三者均不产生 AST 语句/IR，
 	//   只在编译期折叠条件并诊断。消息按字面量解码后输出（不带原文双引号，与 clang 同形）。
@@ -2423,7 +2423,7 @@ struct Parser
 		if (match_keyword("public")) is_public = true;
 		// typedef 检测
 		bool is_typedef = match_keyword("typedef");
-		// 0.4.1 a2（C23 §6.7.11 收紧中置位）：属性列表不得出现在声明说明符之间（存储类/typedef 之后）。
+		// 0.4.1 a2（C23 标准收紧中置位）：属性列表不得出现在声明说明符之间（存储类/typedef 之后）。
 		//   clang 一律报错 `an attribute list cannot appear here`（rc=1）；P214 曾在此把中置位
 		//   当「声明属性」收编（过度接受）。前置位属性已在函数起始（parse_attributes）消费，
 		//   `[[lib]]`/`[[subsystem]]`/`[[nodiscard]]` 等合法前置书写不受影响；形参前置属性走
@@ -2554,7 +2554,7 @@ struct Parser
 
 	CTypePtr parse_decl_specifiers(bool top_public = false)
 	{
-		// 声明说明符可任意顺序出现（C §6.7.1p1：如 `volatile static int` / `struct S static x`）。
+		// 声明说明符可任意顺序出现（C 标准：如 `volatile static int` / `struct S static x`）。
 		// 存储类在此统一消费并记入 last_*_，由调用方与前置已消费的存储类合并。
 		last_static_ = false;
 		last_extern_ = false;
@@ -2609,7 +2609,7 @@ struct Parser
 				? "attribute 'packed' is ignored, place it after \"struct\" to apply attribute to type declaration"
 				: "'packed' attribute ignored", "ignored-attributes");
 		const bool sc_static = last_static_, sc_extern = last_extern_, sc_typedef = last_typedef_;
-		// C23 _Alignas(...)：§6.7.2.1p6 多个取最大；类型形式取 _Alignof，常量形式取该常量。
+		// C23 _Alignas(...)：C 标准多个取最大；类型形式取 _Alignof，常量形式取该常量。
 		// 前缀在此消费，避免后续类型解析（struct/typeof 递归）覆盖本声明的对齐值。
 		unsigned acc = 0;
 		for (;;)
@@ -2670,7 +2670,7 @@ struct Parser
 			if (cnst_front) alias_add_qual(r->alias, false);
 			if (vol_front) alias_add_qual(r->alias, true);
 		}
-		// C23 §6.7：限定符/存储类可出现在类型说明符之后（int const x / struct S static s2）。
+		// C23 标准：限定符/存储类可出现在类型说明符之后（int const x / struct S static s2）。
 		//   指针限定符（int * const p）的 const 在 * 之后、不在此路径，仍由 parse_declarator_rec/parse_pointer_suffix 处理。
 		for (;;)
 		{
@@ -2707,7 +2707,7 @@ struct Parser
 		return r;
 	}
 
-	// 类型说明符组合允许任意顺序（C §6.7.2p2，如 `int long unsigned`）。
+	// 类型说明符组合允许任意顺序（C 标准，如 `int long unsigned`）。
 	// 既有实现按 canonical 顺序线性匹配；此处在进入 core 前探测连续类型关键字个数，
 	// ≥2 则整体收集后归一化，否则仍走原线性分支（单关键字组合行为不变）。
 	int type_combo_len() const
@@ -2772,7 +2772,7 @@ struct Parser
 		int long_count = 0;
 		// ADR-106：`long_count == 1` 的定型要看**首个 long token 自身的来源文件**（见 long_kind）。
 		std::string long_file;
-		// §6.7.2p2 说明符组合校验。旧此路只「收集 + 归一化」，非法组合（`signed float`、`int int`、
+		// C 标准说明符组合校验。旧此路只「收集 + 归一化」，非法组合（`signed float`、`int int`、
 		//   `long float`、`unsigned char8_t` …）静默折成某个类型、符号位丢弃且零诊断。
 		//   判据与拼写对齐本机 clang 23.1.0 真值（逐条取证 _tmp/sc_probe.log：clang 容忍
 		//   `short short` / `signed signed` / `unsigned unsigned` 重复，此处一并容忍以免误杀）。
@@ -2875,7 +2875,7 @@ struct Parser
 				: saw_wchar ? std::string("wchar_t") : std::string();
 			if (!bad.empty()) error(sign_loc, "'" + bad + "' cannot be signed or unsigned");
 		}
-		// 归一化（§6.7.2p2 组合表）：先定底层类型，再叠加符号
+		// 归一化（C 标准组合表）：先定底层类型，再叠加符号
 		TypeKind k = TypeKind::Int;
 		if (saw_void) k = TypeKind::Void;
 		else if (saw_bool) k = TypeKind::Bool;
@@ -2967,7 +2967,7 @@ struct Parser
 			{
 				// typeof(expr) —— 解析表达式并推断类型
 				ExprPtr inner = parse_assign();
-				// typeof 取**表达式自身的类型**、不施加左值转换（与 sizeof 同属 §6.3.2.1 的退化例外）：
+				// typeof 取**表达式自身的类型**、不施加左值转换（与 sizeof 同属 C 标准的退化例外）：
 				//   字符串字面量应得 char[N]/wchar_t[N]/char32_t[N]（N 含 '\0'），而非元素指针。
 				//   `auto` 推导相反——C23 auto 经左值转换、字面量得元素指针（实测 clang = sizeof 8），
 				//   故仅在此处对字面量取不衰变口径，`auto` 路径（infer_auto_type）保持不变。
@@ -3131,7 +3131,7 @@ struct Parser
 				sd.loc = peek().loc;
 				while (!check_punct("}") && !at_end())
 				{
-					// struct 内静态断言（§6.7.2.1 允许 static_assert-declaration 作成员声明）：不占成员槽
+					// struct 内静态断言（C 标准允许 static_assert-declaration 作成员声明）：不占成员槽
 					if (check_keyword("_Static_assert") || check_keyword("static_assert"))
 					{
 						parse_static_assert_decl();
@@ -3235,7 +3235,7 @@ struct Parser
 						}
 						dtype = parse_pointer_suffix(dtype);
 						StructMember m;
-						if (!check_punct(":")) // 匿名位域（type : width，无成员名，§6.7.2.1p5）
+						if (!check_punct(":")) // 匿名位域（type : width，无成员名，C 标准）
 						{ const Token &id = expect_identifier(); m.name = id.text; m.loc = id.loc; }
 						else m.loc = mem_decl_loc;
 						m.type = parse_array_suffix(dtype);
@@ -3676,7 +3676,7 @@ struct Parser
 			if (!base)
 				base = make_type(TypeKind::Int); // fallback
 			CTypePtr t;
-			// 前导 '(' 消歧（§6.7.6p6）：其后为类型/typedef 名/void/.../空 → 函数指示符参数表（退化为指针）；
+			// 前导 '(' 消歧（C 标准）：其后为类型/typedef 名/void/.../空 → 函数指示符参数表（退化为指针）；
 			//   否则（* / ( / [ / 普通标识符）→ 分组/具名声明符，委托 Decorator。
 			if (check_punct("(") && starts_parameter_type_list())
 			{
@@ -3696,7 +3696,7 @@ struct Parser
 				t = d(base);
 				p.name = std::move(pname);
 			}
-			// 退化调整（§6.7.6.3）：数组形参 → 元素指针；顶层函数指示符形参 → 函数指针
+			// 退化调整（C 标准）：数组形参 → 元素指针；顶层函数指示符形参 → 函数指针
 			while (t && t->kind == TypeKind::Array)
 				t = make_pointer(t->base);
 			if (t && t->kind == TypeKind::Function)
@@ -3857,7 +3857,7 @@ struct Parser
 			s->kind = StmtKind::For;
 			s->loc = advance().loc;
 			expect_punct("(");
-			// P353: for-init 声明拥有独立作域（C 6.8.5.3p1），遮蔽外层同名变量/形参
+			// P353: for-init 声明拥有独立作域（C 标准），遮蔽外层同名变量/形参
 			bool for_scoped = false;
 			// init
 			if (check_punct(";"))
@@ -3991,7 +3991,7 @@ struct Parser
 			s->then_branch = parse_stmt();
 			return s;
 		}
-		// _Static_assert 在块作用域是声明（§6.7.4），不产生代码：折后返回空语句占位
+		// _Static_assert 在块作用域是声明（C 标准），不产生代码：折后返回空语句占位
 		// C23 [[attribute]] 出现后的静态断言照常处理（skip_attributes 已在入口调用）
 		if (check_keyword("_Static_assert") || check_keyword("static_assert"))
 		{
@@ -4031,7 +4031,7 @@ struct Parser
 		bool is_extern = match_keyword("extern");
 		// 块级 typedef
 		bool is_td = match_keyword("typedef");
-		// 0.4.1 a2（C23 §6.7.11 收紧中置位）：同全局声明——存储类/typedef 之后残留 `[[` 即真中置位，
+		// 0.4.1 a2（C23 标准收紧中置位）：同全局声明——存储类/typedef 之后残留 `[[` 即真中置位，
 		//   clang 报 `an attribute list cannot appear here`（局部 `static [[deprecated]] int x;` 实测 rc=1）。
 		//   局部前置位属性已由上方 skip_attributes() 消费，不触发此分支。
 		if (check_punct("[") && peek(1).kind == TokKind::Punct && peek(1).text == "[")
@@ -4053,7 +4053,7 @@ struct Parser
 		//   仅在各落点取 max 经 apply_type_align 纯提升，绝不并入 al（al 供 _Alignas 专用 check_alignas_min）。
 		const unsigned bgnu = gnu_decl_align_;
 		if (!base_type && !last_auto_) return nullptr;
-		// 0.4.1 a2-follow：局部同构——类型说明符之后、声明符之前的 [[...]] ＝类型位拒收（clang 局部/全局同一套 §6.7.11）。
+		// 0.4.1 a2-follow：局部同构——类型说明符之后、声明符之前的 [[...]] ＝类型位拒收（clang 局部/全局同一套 C 标准）。
 		if (base_type && check_punct("[") && peek(1).kind == TokKind::Punct && peek(1).text == "[")
 			reject_attributes_type_context();
 		// C23 auto 类型推断: 解析 name + init，然后推断类型
@@ -4122,7 +4122,7 @@ struct Parser
 		auto compound = std::make_shared<Stmt>();
 		compound->kind = StmtKind::Compound;
 		compound->loc = peek().loc;
-		// P250：register 对象不得带 _Alignas（§6.7.2.1p3）
+		// P250：register 对象不得带 _Alignas（C 标准）
 		reject_alignas(last_register_ && al_has, al_loc, "a variable with 'register' storage class");
 		do
 		{
@@ -4159,7 +4159,7 @@ struct Parser
 			s->var_align = al > bgnu_here ? al : bgnu_here;
 			if (match_punct("="))
 				s->var_init = check_punct("{") ? parse_init_list() : parse_assign();
-			// 0.4.1 a2-follow：初始化器之后的 [[...]] 非法位（§6.7.9 属性在初始化器之前）——clang 报 cannot appear here（L3 探针）。
+			// 0.4.1 a2-follow：初始化器之后的 [[...]] 非法位（C 标准属性在初始化器之前）——clang 报 cannot appear here（L3 探针）。
 			if (check_punct("[") && peek(1).kind == TokKind::Punct && peek(1).text == "[")
 			{
 				error(peek().loc, "an attribute list cannot appear here");
@@ -4234,7 +4234,7 @@ struct Parser
 		e->loc = expect_punct("{").loc;
 		while (!check_punct("}") && !at_end())
 		{
-			// 指定初始化器（C11 §6.7.9p6）：`.name` / `[expr]` 可串接成设计符链（如 `.ps[1].y`）。
+			// 指定初始化器（C11 标准）：`.name` / `[expr]` 可串接成设计符链（如 `.ps[1].y`）。
 			int di = -1;
 			std::string df;
 			std::vector<DesigStep> dchain;
@@ -4413,7 +4413,7 @@ struct Parser
 	using DeclaratorFn = std::function<CTypePtr(CTypePtr)>;
 
 	// P331：标识符位置沿当前声明符递归传出，后缀参数表不共享出参，避免参数名覆盖对象名。
-	// abstract_decl：C §6.7.6 abstract-declarator 语境（cast / 复合字面量的类型名）——此语境
+	// abstract_decl：C 标准 abstract-declarator 语境（cast / 复合字面量的类型名）——此语境
 	//   括号内仍是抽象声明符，文法不允许出现具名声明符，见 parse_direct_rec 的同名分支。
 	DeclaratorFn parse_declarator_rec(std::string &name, std::vector<Param>* own = nullptr, SourceLoc* ident_loc = nullptr, bool abstract_decl = false)
 	{
@@ -4576,7 +4576,7 @@ struct Parser
 		// 位点后置：声明符尾 GNU __attribute__（aligned 记入提升通道；其余属性就地警告忽略）。
 		const unsigned gnu_post = consume_gnu_attributes();
 		const unsigned gnu_here = gnu_pre > gnu_post ? gnu_pre : gnu_post;
-		// 0.4.1 a2-follow：C23 声明符后正位 [[...]]（§6.7.11）——尾为数组/'(参数表)' → 类型语境拒收（A1/P1 探针）；
+		// 0.4.1 a2-follow：C23 声明符后正位 [[...]]（C 标准）——尾为数组/'(参数表)' → 类型语境拒收（A1/P1 探针）；
 		//   尾为简单标识符（含指针前缀，Q5 `int *p [[deprecated]];` rc=0）→ 附着于对象，与前置位归并（DUP1 容忍重复）。
 		DeclAttributes attrs_eff = attrs; // （避开同函数 P252 块的局部 eff，C4456）
 		if (check_punct("[") && peek(1).kind == TokKind::Punct && peek(1).text == "[")
@@ -4726,7 +4726,7 @@ struct Parser
 				if (ae && (ae->desig_index >= 0 || !ae->desig_field.empty())) { has_desig = true; break; }
 			if (!has_desig)
 			{
-				// §6.7.9p14/p19：单字符串元素的花括号 char s[] = {"str"} ≡ = "str"，
+				// C 标准：单字符串元素的花括号 char s[] = {"str"} ≡ = "str"，
 				// 大小按字符串内容 +1（'\0'）；否则会落到下方 args.size()=1。
 				// 仅字符型元素生效（排除指针数组 char *p[]={"abc"} → 应 size=1、非 strlen+1）。
 				if (init->args.size() == 1 && init->args[0] &&
@@ -4749,7 +4749,7 @@ struct Parser
 					ty->array_size = init->args.size(); // 标量元素或逐元素带括号 → 每项一元素
 				return;
 			}
-			// §6.7.9: 省略大小时，数组大 = (最大下标)+1；需考虑 `[N]` 指定符。
+			// C 标准: 省略大小时，数组大 = (最大下标)+1；需考虑 `[N]` 指定符。
 			//   位置式初始化按序占位，指定式 `[N]=` 跳转至 N且下一位置从 N+1 起。
 			//   不能用 args.size()（如 {5,[2]=2,3} 为 3 个元素但最大下标 3 → 应 4）。
 			std::size_t next_pos = 0, maxv = 0;
@@ -4763,7 +4763,7 @@ struct Parser
 			ty->array_size = static_cast<long long>(maxv);
 			return;
 		}
-		// §6.7.9p14：字符数组由字符串字面量初始化时，大小为内容元素数 + 1（含 '\0'）。
+		// C 标准：字符数组由字符串字面量初始化时，大小为内容元素数 + 1（含 '\0'）。
 		// 按数组元素宽度分派编码（前缀无关，沿用 P177「按元素宽度驱动」）：
 		//   1 字节（char/char8_t）→ UTF-8 字节数；2 字节（wchar_t/char16_t）→ UTF-16 码元数；
 		//   4 字节（char32_t）→ UTF-32 码点数（修 plct 00220 同域、补全 charN_t）。
@@ -4935,7 +4935,7 @@ struct Parser
 		return is_type_lead(peek(off)) || is_qualified_tag_at(off);
 	}
 
-	// 站在声明符起始 '('：判断其后是否为函数指示符参数表（vs 分组声明符）。§6.7.6p6
+	// 站在声明符起始 '('：判断其后是否为函数指示符参数表（vs 分组声明符）。C 标准
 	bool starts_parameter_type_list() const
 	{
 		const Token &n = peek(1);
@@ -5159,7 +5159,7 @@ struct Parser
 					tn = parse_pointer_suffix(tn);
 					if (check_punct("["))
 						tn = parse_array_suffix(tn);
-					// P340：`sizeof (T){...}`——复合字面量作操作数（§6.5.2.5）。判据只认 `{`：
+					// P340：`sizeof (T){...}`——复合字面量作操作数（C 标准）。判据只认 `{`：
 					//   clang 对 `sizeof (int)(1+2)` 报 "expression cannot be followed by a postfix
 					//   '(' operator"、对 `sizeof (int) 1` 报 "expected ','"（均 rc=1），而
 					//   `sizeof (int) - 1` 走 type-name 形 + 减法（= 3）。
@@ -5568,7 +5568,7 @@ struct Parser
 			advance();
 			auto e = std::make_shared<Expr>();
 			e->loc = t.loc;
-			// C §6.4.5 扫描与校验：判据、句式、caret 落点逐条对齐本机 clang 23.1.0（取证
+			// C 标准扫描与校验：判据、句式、caret 落点逐条对齐本机 clang 23.1.0（取证
 			//   _tmp/sc_probe.log、_tmp/p4_verify.log、_tmp/p4_probe2.log），结构照 clang
 			//   LiteralSupport.cpp `NumericLiteralParser`。旧此把 pp-number 整串直交 std::stod/stoull：
 			//   尾随杂字符被**静默丢弃**（`1w`→int 1、`1.0z`→1.0、`08`→0、`0b`→0），
@@ -5600,7 +5600,7 @@ struct Parser
 				//   未捕获 → 0xC0000409 零诊断崩溃，取证 _tmp/sc_crash.log dbl_overflow）
 				try { e->float_val = is_hexfloat ? parse_hex_float(numtxt) : std::stod(numtxt); }
 				catch (const std::exception &) { e->float_val = std::numeric_limits<double>::infinity(); }
-				// C §6.4.5 浮点后缀定型（P9.24）：f/F → float；无后缀 / l/L → double。
+				// C 标准浮点后缀定型（P9.24）：f/F → float；无后缀 / l/L → double。
 				//   （本机 Windows long double==double，故 L 亦落 double，与 clang -std=c23 一致。）
 				if (sscan.is_float)
 					e->type = make_type(TypeKind::Float);
@@ -5651,7 +5651,7 @@ struct Parser
 				}
 				else
 				{
-					// C §6.4.5.2：按后缀(u/U, l/L, ll/LL)与进制(十进制 vs 八/十六进制)，
+					// C 标准：按后缀(u/U, l/L, ll/LL)与进制(十进制 vs 八/十六进制)，
 					// 从候选类型序列中选出能容纳该值的最小类型（LLP64：int=32, long=32, long long=64）。
 					// 十进制候选恒不含无符号型；八/十六进制可选到 unsigned int/long/long long。
 					//   u/ll 形状由后缀状态机给出（旧此反向刺 u/l 字符，会把 `1lull` 这类
@@ -5659,7 +5659,7 @@ struct Parser
 					const bool uns = sscan.uns;
 					const unsigned lcnt = sscan.long_count;
 					const bool decimal = ns.base == 10; // 单独 "0" 亦计十进制（clang radix=10）
-					// ADR-106：`.co` 内 `long` 与 `long long` 同为 64 位——候选序列按 §6.4.5.2
+					// ADR-106：`.co` 内 `long` 与 `long long` 同为 64 位——候选序列按 C 标准
 					//   把 `long` 项并入 64 位后去重。判定取**字面量 token 自身的来源文件**（逐 token）。
 					const bool co64 = is_co_source_file(t.loc.file);
 					struct Cand { TypeKind tk; bool uns; unsigned bits; };
@@ -5680,7 +5680,7 @@ struct Parser
 					}
 					else if (uns && lcnt == 0)
 						list = { {TypeKind::Int,true,32},{TypeKind::Long,true,32},{TypeKind::LongLong,true,64} };
-					else if (uns && lcnt >= 2) // ull / ULL 等（两个 l + u）：§6.4.5.2 候选仅 unsigned long long
+					else if (uns && lcnt >= 2) // ull / ULL 等（两个 l + u）：C 标准候选仅 unsigned long long
 						list = { {TypeKind::LongLong,true,64} };
 					else if (uns) // ul / uL（一个 l + u）
 						list = { {TypeKind::Long,true,32},{TypeKind::LongLong,true,64} };
@@ -5731,7 +5731,7 @@ struct Parser
 			e->kind = ExprKind::StringLiteral;
 			e->loc = t.loc;
 			e->str_val = t.text;
-			// 通用字符名（\uXXXX/\UXXXXXXXX）语法/码点校验（ISO C §6.4.3）；
+			// 通用字符名（\uXXXX/\UXXXXXXXX）语法/码点校验（ISO C）；
 			//   展开为 UTF-8 字节由 co_decode_string 入口统一完成（单一真值源）。
 			const std::string ucn = co_ucn_validate(t.text);
 			if (!ucn.empty()) error(t.loc, ucn);
@@ -5780,7 +5780,7 @@ struct Parser
 		}
 		if (t.kind == TokKind::Identifier)
 		{
-			// enum 常量名优先匹配——但内层同名局部变量/形参隐藏外层 enumerator（C §6.2.1：同一命名空间）。
+			// enum 常量名优先匹配——但内层同名局部变量/形参隐藏外层 enumerator（C 标准：同一命名空间）。
 			//   缺此判定时 `int tks04 = 0; tks04++;` 被折叠成字面量 103，store 到常量触发 verifier
 			//   「Store operand must be a pointer」（CTS 0151 族）。
 			auto ec = enum_constants_.find(t.text);
@@ -5807,11 +5807,11 @@ struct Parser
 			e->kind = ExprKind::CharLiteral;
 			e->loc = t.loc;
 			e->str_val = t.text;
-			// 带前缀字符常量按 ISO C §6.4.4.4 定型：L→wchar_t、u→char16_t、U→char32_t、
+			// 带前缀字符常量按 ISO C 定型：L→wchar_t、u→char16_t、U→char32_t、
 			//   u8→char8_t；无前缀仍为 int。类型随字面量携带，供 sizeof/_Generic/常用算术转换
 			//   取真实宽度与符号（旧实现不记前缀、一律当 int，sizeof(L'A') 误得 4）。
 			e->char_prefix = co_char_lit_prefix(t.text);
-			// 通用字符名（\uXXXX/\UXXXXXXXX）语法/码点校验（ISO C §6.4.3）——
+			// 通用字符名（\uXXXX/\UXXXXXXXX）语法/码点校验（ISO C）——
 			//   位数不足、码点落在代理区或越过 0x10FFFF 均在此报错。口径取 C23（本项目为单一
 			//   C 超集方言，不按 -std 门控）：C11 曾禁止用 UCN 表示 <0xA0 的普通字符，C23 已放宽。
 			{

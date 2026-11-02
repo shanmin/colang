@@ -112,7 +112,7 @@ All object pointers are 8 bytes wide. `void*` converts **implicitly** to and fro
 
 ### Types of literals
 
-An integer literal takes the **first type in the C §6.4.5.2 candidate sequence that can hold the value**; the suffix determines the candidate set.
+An integer literal takes the **first type in the C standard candidate sequence that can hold the value**; the suffix determines the candidate set.
 
 | Literal | `.c` / `.h` | `.co` |
 | --- | --- | --- |

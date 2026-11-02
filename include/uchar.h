@@ -1,5 +1,5 @@
 /* uchar.h — colang 自制最小标准头
- * C11 §7.28：char16_t / char32_t 与 UTF 转换。char16_t/char32_t 在 colang 中为内置
+ * C11 标准：char16_t / char32_t 与 UTF 转换。char16_t/char32_t 在 colang 中为内置
  * 关键字类型（见 ADR-104，不重复 typedef），本头仅补齐 mbstate_t 与转换函数声明。
  * 边界：面向 Windows/UCRT 宿主（mbrtoc16/c16rtomb/mbrtoc32/c32rtomb 由 UCRT 提供）。 */
 #ifndef _COLANG_UCHAR_H

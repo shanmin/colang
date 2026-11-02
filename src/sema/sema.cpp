@@ -536,7 +536,7 @@ private:
 		}
 	}
 
-	// P249：[[nodiscard]] 引用点诊断（C23 §6.7.11）。显式 `(void)f();` 属于有意丢弃返回值，
+	// P249：[[nodiscard]] 引用点诊断（C23 标准）。显式 `(void)f();` 属于有意丢弃返回值，
 	//   不告警（与 clang 一致）；void 返回函数本无返回值，内层已另有无效标注告警。
 	void note_discarded_nodiscard(const ExprPtr &e)
 	{
@@ -553,7 +553,7 @@ private:
 			(why.empty() ? std::string() : ": " + why), "unused-result");
 	}
 
-	// —— P252：`_Alignas` 跨声明一致性（§6.7.2.1p4）——
+	// —— P252：`_Alignas` 跨声明一致性（C 标准）——
 	// 两条诊断（文本与定位均与 clang 同形）：
 	//   ① 「有声明带 _Alignas、定义没带」→ error '_Alignas' must be specified on definition if
 	//      it is specified on any declaration（指定义的**标识符**，clang 同列）。定义含暂定定义
@@ -720,7 +720,7 @@ private:
 		return t && (t->kind == TypeKind::Pointer || t->kind == TypeKind::Array);
 	}
 
-	// P323：下标基型判据（C 6.5.2.1 只许数组或指向**对象**的指针——指向函数的指针不可下标）。
+	// P323：下标基型判据（C 标准只许数组或指向**对象**的指针——指向函数的指针不可下标）。
 	//   修前直接复用 is_ptr_or_array，把 `Pointer{Function}` 与数组一并放行 → `fp[1]`/`tbl[0][0]`
 	//   零诊断（运行期按函数体字节取址，实测 AV 与错值）。
 	static bool is_subscriptable(const CTypePtr &t)
@@ -808,7 +808,7 @@ private:
 
 	// —— 0.4.1 类型相容性判定（赋值 / 初始化 / 实参三处共用）——
 	// 与 `same_type`（原型冲突、忽略限定符）和 `types_compatible`（_Generic、逐层比限定符）语义均不同：
-	//   这里回答「一个值能否赋入该对象」（C 6.5.16.1），且**只区分能对齐 clang 文本**的几类。
+	//   这里回答「一个值能否赋入该对象」（C 标准），且**只区分能对齐 clang 文本**的几类。
 	//   刻意不判（Skip）而一律放行：整数↔指针（clang 走 -Wint-conversion 且带 `; take the address with &`
 	//   fix-it）、目标丢限定符（clang 仅 warning）、Void、任一侧类型推断不出——防误伤。
 	// ground-truth（clang 23.1.0 `-std=c23`，_tmp/p_compat_*.c 探针，2026-10-28）：
@@ -855,7 +855,7 @@ private:
 		}
 	}
 
-	// 判型侧衰减（C 6.3.2.1）：数组→元素指针、函数→函数指针
+	// 判型侧衰减（C 标准）：数组→元素指针、函数→函数指针
 	static CTypePtr compat_decay(const CTypePtr &t)
 	{
 		if (!t) return nullptr;
@@ -865,7 +865,7 @@ private:
 	}
 
 	// P322：只判「整型常量表达式」的字面值，**算不出即 Unknown**（调用方据此放行）。
-	//   C 6.3.2.3p3 把「值为 0 的整型常量表达式」定义为空指针常量；clang 对 `int *p = 1 - 1;`
+	//   C 标准把「值为 0 的整型常量表达式」定义为空指针常量；clang 对 `int *p = 1 - 1;`
 	//   只发 -Wnon-literal-null-conversion（warning、cc=0，探针 u10h 十一形）⇒ 本仓必须放行。
 	//   AST 上只能确定字面量/一元/二元三类；`sizeof`、Cast、变量与调用一律 Unknown。
 	static bool try_eval_int(const ExprPtr &e, std::intmax_t &out)
@@ -918,7 +918,7 @@ private:
 		return v == 0 ? IntEval::Zero : IntEval::NonZero;
 	}
 
-	// 「整型 - 指针」是非法二元式（C 6.5.6p2：减法的合法组合只有「指针-整型」与
+	// 「整型 - 指针」是非法二元式（C 标准：减法的合法组合只有「指针-整型」与
 	//   「指针-指针」）——clang 报 `invalid operands to binary expression ('long' and 'SH *')`
 	//   并把整个式子定型为 poison，因此外层赋值**不再**报 int-conversion
 	//   （ground-truth：探针 u10j:5 `1 - ip` / u10j:9 `(arr - ip) - ip` 均无该条；
@@ -1042,7 +1042,7 @@ private:
 		return false;
 	}
 
-	// —— P317：指针差的 pointee 相容（C 6.5.9p4：两个操作数须指向相容类型）——
+	// —— P317：指针差的 pointee 相容（C 标准：两个操作数须指向相容类型）——
 	// **不得复用 `pointee_compat`**：它与本判据在两条规则上正好相反。
 	//   · `void *` ↔ 对象指针：赋值相容（可隐式互转，那里判 Ok），指针差 clang **拒**
 	//     （探针 x5.c：`7:13 'void *' and 'int *' are not pointers to compatible types`）；
@@ -1100,7 +1100,7 @@ private:
 		return e && e->kind == ExprKind::Ternary;
 	}
 
-	// P335：三元式含 Void 臂时不再「整体不判」（clang C 6.5.15p5 结果即 void，
+	// P335：三元式含 Void 臂时不再「整体不判」（clang C 标准 结果即 void，
 	//   相容检查自然命中 VoidValue，无 pointer-type-mismatch 误拒风险）。
 	bool ternary_has_void_arm(const ExprPtr &e)
 	{
@@ -1159,7 +1159,7 @@ private:
 	}
 
 	// ============================================================
-	// P324：聚合初始化器 `{...}` 元素位类型相容（C 6.7.9）
+	// P324：聚合初始化器 `{...}` 元素位类型相容（C 标准）
 	//   每个元素位按其目标子类型做一次 assign_compat（等价标量初始化/赋值口径），
 	//   不合法即报 compat_init_msg 文案、定位在该元素表达式自身 loc。
 	//   游标镜像 codegen::elide_fold（brace elision），但工作在 CType 层（非 llvm::Type）：
@@ -1174,7 +1174,7 @@ private:
 		return t && (t->kind == TypeKind::Array || t->kind == TypeKind::Struct || t->kind == TypeKind::Union);
 	}
 
-	// P349：字符串字面量可整体初始化的元素型（§6.7.9p14「array of character type」）。
+	// P349：字符串字面量可整体初始化的元素型（C 标准「array of character type」）。
 	//   `unsigned char` 在 CType 里是 Char + is_unsigned=true（与 char 同 kind）→ 一并覆盖。
 	static bool is_char_elem(const CTypePtr &t)
 	{
@@ -1239,7 +1239,7 @@ private:
 		}
 		if (to->kind == TypeKind::Array)
 		{
-			// 字符串字面量整体初始化字符数组（§6.7.9p14）：不逐元素（不触及元素位）
+			// 字符串字面量整体初始化字符数组（C 标准）：不逐元素（不触及元素位）
 			if (args.size() == 1 && args[0] && args[0]->kind == ExprKind::StringLiteral) return;
 			// P349：brace elision 形态（`struct T {u8 s[4]; u8 a;} t = {"abc", 1};`）——此时 args 是
 			//   外层花括号内容、字符串只是其中一项，上一条判据不成立（旧行为把游标降到元素 u8，
@@ -1260,7 +1260,7 @@ private:
 			if (to->tag.empty()) { pos++; return; }
 			const StructDef *sd = find_struct_def_by_tag(to->tag);
 			if (!sd || !sd->is_definition || sd->members.empty()) { pos++; return; } // 不完整 → 放行并消费一项防错位
-			agg_consume(sd->members[0].type, args, pos, depth); // union 仅填首成员（§6.7.9p19）
+			agg_consume(sd->members[0].type, args, pos, depth); // union 仅填首成员（C 标准）
 			return;
 		}
 		// struct：逐 C 成员位共享游标
@@ -1932,7 +1932,7 @@ private:
 		}
 	}
 
-	// P300 Co class（§4.4）：class 具引用语义，禁声明/使用「指向类的指针」（`C*`）。
+	// P300 Co class（详见项目内部设计文档）：class 具引用语义，禁声明/使用「指向类的指针」（`C*`）。
 	//   剥 Pointer/Array 层、遍历 Function 返回/参数，遇 `Pointer -> Class` 即报。
 	//   区别于 enforce_type_visible（仅主源跨模块门禁），本检查无条件执行（语言性质、非可见性）。
 	void reject_class_pointer(const CTypePtr &t, const SourceLoc &loc)
@@ -1952,7 +1952,7 @@ private:
 		}
 	}
 
-	// P300 Co class（§4.4/§4.5）：类句柄的类型相容性——声明初始化与赋值均要求源与目标同类，
+	// P300 Co class（详见项目内部设计文档）：类句柄的类型相容性——声明初始化与赋值均要求源与目标同类，
 	//   拒绝跨类（`Box b = counter;`）、非句柄右值（`Box c = 5;`）与不匹配的 new（`Box b = new Counter();`）。
 	//   否则 codegen 会按「声明类」发 retain/release，对异类对象执行错误 dtor、或对非指针值解引用。
 	//   保守原则：源类型推断不出（resolve_type 返回 null）即跳过，绝不误伤合法方言（如链式赋值中间态）。
@@ -1984,7 +1984,7 @@ private:
 	//   剥层规则：沿 Array 下探（记 saw_array），遇 Pointer/Function 立即停（不完整类型经指针合法），
 	//   落到 Struct/Union 且 tag 非空、find_struct_def_by_tag 为空 ⇒ 不完整、报错。Enum 不纳入（越界）。
 	//   P301：主源与子模块同口径。此前仅主源触发（cur_source_module_key_ 空），子模块里按值用到
-	//   不完整类型时会一路漏给 codegen，opaque %struct. 作 alloca 使 LLVM 直接崩溃（ADR 见 PROJECT.md）。
+	//   不完整类型时会一路漏给 codegen，opaque %struct. 作 alloca 使 LLVM 直接崩溃（决策记录见项目内部设计文档）。
 	enum IncompleteCtx { IctxVar, IctxField, IctxGlobal };
 
 	void enforce_complete_type(const CTypePtr &t, const SourceLoc &loc, IncompleteCtx ctx)
@@ -2021,7 +2021,7 @@ private:
 		}
 	}
 
-	// P329：下标基指向**不完整记录**（C 6.5.2.1 要求指向完整对象类型；clang 同文拒收
+	// P329：下标基指向**不完整记录**（C 标准要求指向完整对象类型；clang 同文拒收
 	//   `subscript of pointer to incomplete type 'struct I'`）。判据与 P255 的
 	//   enforce_complete_type **同源**（find_struct_def_by_tag 落空即不完整）：
 	//   · 只收 Struct/Union——clang 接受 `enum E; enum E *ep; ep[1];`（仅 MS 扩展 warning）；
@@ -2038,7 +2038,7 @@ private:
 		return b;
 	}
 
-	// P333：`sizeof` / `_Alignof` 的操作数是**不完整记录**（C 6.5.3.4 要求操作数类型完整；clang 同文
+	// P333：`sizeof` / `_Alignof` 的操作数是**不完整记录**（C 标准要求操作数类型完整；clang 同文
 	//   拒收 `invalid application of 'sizeof' to an incomplete type 'struct I'`）。判据与 P255/P329
 	//   **同源**（find_struct_def_by_tag 落空即不完整）：只收 Struct/Union——Enum 前置声明必放行
 	//   （`enum E; enum E *ep; sizeof(*ep)` clang cc=0，仅 MS 扩展 warning）；匿名内联记录按完整。
@@ -2611,8 +2611,8 @@ private:
 		return true;
 	}
 
-	// —— P317：指针差的类型相容（C 6.5.9p4）——
-	// 两侧先按 C 6.3.2.1 衰减（数组名→元素指针、函数名→函数指针），均为指针才入判据；
+	// —— P317：指针差的类型相容（C 标准）——
+	// 两侧先按 C 标准衰减（数组名→元素指针、函数名→函数指针），均为指针才入判据；
 	//   文案两侧取**衰减后**的指针拼写（`sa - arr` → `'short *' and 'int *'`），
 	//   typedef 侧由 describe_type 自带 aka 双轨（探针 w9.c：`'SH *' (aka 'short *') and 'int *'`）。
 	// 定在**运算符** loc（`e->op_loc`）：P316 的常量性文案定在表达式起点，两面各归其位。
@@ -2632,7 +2632,7 @@ private:
 	}
 
 	// —— P332：不完整记录指针的算术 ——
-	// C 6.5.6p2/p3 要求算术所用指针指向**完整对象类型**；clang 同文拒收
+	// C 标准 要求算术所用指针指向**完整对象类型**；clang 同文拒收
 	//   `arithmetic on a pointer to an incomplete type 'struct I'`。判据与 P255/P329/P333
 	//   **同源**（复用 incomplete_subscript_base：Struct/Union + tag 非空 + 查不到定义；
 	//   Enum 必放行、`void *` 按 P330 口径放行、匿名内联记录按完整）。形状覆盖（p332a~ar 实测）：
@@ -2700,7 +2700,7 @@ private:
 	}
 
 	// —— P323：下标基型（check_expr 与文件域链共用同一处判据）——
-	// 任一侧可下标即放行（C 6.5.2.1 只要求其一；`arr[f]` 的另一侧由既有判据各归其位）。
+	// 任一侧可下标即放行（C 标准只要求其一；`arr[f]` 的另一侧由既有判据各归其位）。
 	// 有函数型基则报 clang 那句（印未 decay 的原型、定在基址起点）；否则报 clang 的
 	//   `subscripted value is not an array, pointer, or vector` 并定在**该层 `[` 的列**
 	//   （P328：`op_loc` 由 parser 的后缀 `[` 分支填写；函数句仍用 `loc`，P323 已与 clang
@@ -2759,7 +2759,7 @@ private:
 
 	// P334：指针操作数在结构非法位置——clang
 	//   `invalid operands to binary expression ('X' and 'Y')`。
-	//   规则（C 6.5.6/6.5.5/6.5.10）：
+	//   规则（C 标准）：
 	//     + : ptr + ptr 非法
 	//     - : int - ptr 非法
 	//     * / % & | ^ << >> : 任一侧指针非法
@@ -2935,7 +2935,7 @@ private:
 					else check_write_target(L, e->loc);
 				}
 			}
-			// P300 Co class（§4.5）：类句柄赋值须源/目标同类，拒绝跨类/非句柄右值。
+			// P300 Co class（详见项目内部设计文档）：类句柄赋值须源/目标同类，拒绝跨类/非句柄右值。
 			if (L) check_class_handle_compat(resolve_type(L), e->rhs, e->loc);
 			// P331：复合赋值的任一侧是 `void` 值时 clang 只报 invalid operands 一句
 			//   （`vp[1] += 1` → ('void' and 'int')、`x += vp[1]` → ('int' and 'void')），不叠相容句。
@@ -3193,7 +3193,7 @@ private:
 			break;
 		case ExprKind::Generic:
 		{
-			// 0.4.1：C11 6.5.1.1 —— 关联列表内同一类型不得重复出现（default 不受限）
+			// 0.4.1：C11 标准 —— 关联列表内同一类型不得重复出现（default 不受限）
 			for (std::size_t i = 0; i < e->args.size(); ++i)
 			{
 				const ExprPtr &ai = e->args[i];
@@ -3365,7 +3365,7 @@ private:
 			{
 				report(s->loc, "non-void function should return a value");
 			}
-			// P300 Co class（§4.4）：返类函数须返无主值（new / 返句柄的调用），禁 `return c;`
+			// P300 Co class（详见项目内部设计文档）：返类函数须返无主值（new / 返句柄的调用），禁 `return c;`
 			//   返局部拥有句柄（否则 callee 计数与 caller release 会双重释放）。
 			if (s->expr && cur_func_ && cur_func_->return_type &&
 				cur_func_->return_type->kind == TypeKind::Class)
@@ -3469,7 +3469,7 @@ private:
 		}
 	}
 
-	// P300 Co class（§风险项#4）：按前序线性序收集 goto/label/class 句柄声明，供 check_goto_class_crossing 判跨越。
+	// P300 Co class（内部风险项）：按前序线性序收集 goto/label/class 句柄声明，供 check_goto_class_crossing 判跨越。
 	void collect_goto_cross(const StmtPtr &s, int &seq,
 		std::unordered_map<std::string, int> &label_seq,
 		std::vector<int> &decl_seqs, std::vector<std::string> &decl_names,
@@ -3503,7 +3503,7 @@ private:
 		}
 	}
 
-	// P300 Co class（§风险项#4）：禁止 goto 跨越「需自动清理（RC release）的 class 句柄声明」。
+	// P300 Co class（内部风险项）：禁止 goto 跨越「需自动清理（RC release）的 class 句柄声明」。
 	//   heap-only 句柄出域按 RC 帧 release，等价于 C++「带非平凡析构的对象」：goto 前跳越过其初始化、
 	//   或后跳回到其声明之前，均使目标路径上该句柄槽未初始化/重复注册，出域 release 打在栈垃圾上崩溃
 	//   （本批 codegen 对前跳仅保守不释放、无法自证安全，故在 sema 层拒非法写法）。
@@ -3676,10 +3676,10 @@ private:
 		suppress_read_once_.clear();
 		labels_.clear();
 		collect_labels(f.body);
-		check_goto_class_crossing(f.body); // P300 §风险项#4：禁 goto 跨越需 RC 清理的类句柄声明
+		check_goto_class_crossing(f.body); // P300 内部风险项：禁 goto 跨越需 RC 清理的类句柄声明
 		check_jump_bypass_vla(f.body);     // P348：禁 goto/case 跳过 VLA 初始化（stackrestore 支配性）
 		// 非 void 函数可能执行到末尾而无 return（C 为 UB，clang 默认 -Wreturn-type 告警）。
-		// main 例外：C11 §5.1.2.2.3 规定 main 落到 } 等价于 return 0，clang 亦不告警。
+		// main 例外：C11 C 标准规定 main 落到 } 等价于 return 0，clang 亦不告警。
 		if (f.return_type && f.return_type->kind != TypeKind::Void &&
 			f.name != "main" && falls_through(f.body))
 			warn(f.loc, "non-void function does not return a value in all control paths", "return-type");

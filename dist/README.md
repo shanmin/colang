@@ -4,7 +4,7 @@
 
 colang 是 **Co 语言**的编译器（`Co ≈ C + object`，尽量兼容 C 语法并对齐 C23）。
 本发布包提供编译器可执行文件及其自制标准头。语言规范的完整说明见下方文档站；
-项目背景与源码构建见源代码仓库。当前为**开发/测试版本（0.4.1）**，特性仍在演进。
+项目背景与源码构建见源代码仓库。当前为**开发/测试版本（0.5.2）**，特性仍在演进。
 
 ## 地址
 
@@ -16,7 +16,7 @@ colang 是 **Co 语言**的编译器（`Co ≈ C + object`，尽量兼容 C 语�
 ```
 dist/
 ├── colang.exe              编译器可执行文件
-├── include/                Co 自制标准头（stdio.h、stdint.h、threads.h 等 34 个，
+├── include/                Co 自制标准头（stdio.h、stdint.h、threads.h 等 37 个，
 │                            含 Win32 API 模块 winapi.co）
 ├── LICENSE                 Apache License 2.0 全文
 ├── NOTICE                  第三方归属说明

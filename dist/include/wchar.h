@@ -1,5 +1,5 @@
 /* wchar.h — colang 自制最小标准头 (P9.18)
- * C §7.29：宽字符支持。类型宽度/符号按 target triple 分派（本机 Win/MSVC 参考 ground-truth）：
+ * C 标准：宽字符支持。类型宽度/符号按 target triple 分派（本机 Win/MSVC 参考 ground-truth）：
  *   wchar_t：Windows-msvc=2/unsigned（`__WCHAR_TYPE__=unsigned short`、`__WCHAR_UNSIGNED__=1`），Linux-gnu=4/signed（glibc wchar_t=int）；
  *   wint_t：按 target 分派——Windows/UCRT=unsigned short（= wchar_t）、Linux/glibc=unsigned int（≠ wchar_t=int）；
  *     WEOF = ~(wint_t)0（Win=0xFFFF、Linux=0xFFFFFFFF）。
@@ -18,7 +18,7 @@
 
 /* wchar_t：内置关键字类型（宽度/符号性随 target 分派，Win=i16/unsigned、Linux=i32/signed），此处不重复 typedef。 */
 
-/* wint_t：按 target 分派（C11 §7.29.1 + POSIX 要求能容纳 WEOF）：
+/* wint_t：按 target 分派（C11 标准与 POSIX 均要求能容纳 WEOF）：
  *   Windows/UCRT: wint_t = unsigned short（与 wchar_t 同宽同符、UCRT 实测 ground-truth）；
  *   Linux/glibc: wint_t = unsigned int（与 wchar_t=int 不同符号、glibc bits/types/wint_t.h 实测）。
  *   统一 WEOF = ~(wint_t)0：Win=0xFFFF、Linux=0xFFFFFFFF，与两家 SDK 实际定义一致。 */
