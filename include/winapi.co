@@ -17,52 +17,57 @@
 //
 // 排列顺序：各库段内按函数名字母序（case-sensitive，A/W 变体自然相邻）；段序 kernel32→user32→gdi32。
 
-// —— Win32 基础类型别名（模块内，不导出）——
-//   目的：让本文件内部声明与 SDK 头文件逐字同形（写 `DWORD cbSize;` 而非 `unsigned int cbSize;`）。
-//   性质：colang 的 typedef 名不跨模块（导入方看不到，实测显式 `import DWORD` 亦报未声明），
-//   故这是纯模块内别名——消费方仍按 struct 名用成员，对外契约零变化。
+// —— Win32 基础类型别名（public · 导出给 import 方）——
+//   目的：让本文件内部声明与 SDK 头文件逐字同形（写 `DWORD cbSize;` 而非 `unsigned int cbSize;`），
+//   并让消费方的 Win32 代码也能按同一套 SDK 拼写声明形参/局部量（不必一律退回 `unsigned int`）。
+//   历史订正：0.3.0 落地时把本段判为「纯模块内别名」而刻意不加 `public`，依据是「colang 的 typedef
+//   名不跨模块（实测显式 `import DWORD` 亦报未声明）」——该前提已被 ADR-115（0.4.1.40）推翻：
+//   只有 `public typedef` 进导出面，裸 `typedef` 确实不跨，加了即可跨。故本段已全部补上 `public`
+//   （外部报告 C-02 的落点；只改可见性标注，底层类型与宽度一字未动）。
+//   副作用：这些名字现参与跨模块同名判定，消费方本地若另写同名 typedef/标签会与之相冲——
+//   按「winapi 已收录的符号本模块不再手写」的既有纪律处理。
 //   每个别名与其底层类型严格同一：结构体布局/ABI 与改前逐字节一致（改前/改后全 39 类型
 //   sizeof 与关键字段偏移 A/B 比对必须全等）。
 //   沿既有设计保留的例外：WPARAM 与句柄族作 void*；SDK 中为函数指针的回调成员（lpfnHook/lpfn）及不透明保留字段（pidlRoot/pvReserved/lpReserved）仍作 void*。
 //   拼写取型：本文件不再出现 long/unsigned long——32 位一律写 int/unsigned int、64 位写 long long/unsigned long long。
 //   ADR-106 已落地（0.5.0）：`.co` 内 long/unsigned long 恒 8 字节，故 SDK 里的 DWORD/LONG（各 4 字节）
 //   必须写 int/unsigned int；沿用 long 会把字段撑到 8 字节、连带搞乱全部结构体布局。
-typedef unsigned int DWORD;               // DWORD = unsigned int (4)
-typedef unsigned int ULONG;               // ULONG = unsigned int (4)
-typedef unsigned int UINT;                // UINT  = unsigned int (4)
-typedef int LONG;                         // LONG  = int (4)
-typedef int INT;                          // INT   = int (4)
-typedef int BOOL;                         // BOOL  = int (4)
-typedef unsigned short WORD;              // WORD  = unsigned short (2)
-typedef unsigned char BYTE;               // BYTE  = unsigned char (1)
-typedef long long LONGLONG;               // LONGLONG = long long (8)
-typedef unsigned long long ULONGLONG;     // ULONGLONG = unsigned long long (8)
-typedef unsigned long long DWORDLONG;     // DWORDLONG = unsigned long long (8)
-typedef long long LONG_PTR;               // LONG_PTR = long long (8)
-typedef unsigned long long ULONG_PTR;     // ULONG_PTR = unsigned long long (8)
-typedef unsigned long long UINT_PTR;      // UINT_PTR = unsigned long long (8)
-typedef unsigned long long DWORD_PTR;     // DWORD_PTR = unsigned long long (8)
-typedef long long LPARAM;                 // LPARAM = long long (8)
-typedef long long LRESULT;                // LRESULT = long long (8)
-typedef unsigned int COLORREF;            // COLORREF = unsigned int (4)
-typedef wchar_t WCHAR;                    // WCHAR = wchar_t (2)
-typedef void *HANDLE;                     // 句柄族一律 void* (8)
-typedef void *HWND;
-typedef void *HDC;
-typedef void *HINSTANCE;
-typedef void *HMENU;
-typedef void *HICON;
-typedef void *HCURSOR;
-typedef void *HBRUSH;
-typedef void *HRGN;
-typedef void *LPVOID;
-typedef void *WPARAM;                     // 本文件既有映射：WPARAM 作 void*（SDK 为 UINT_PTR）
-typedef char *LPSTR;
-typedef const char *LPCSTR;
-typedef wchar_t *LPWSTR;
-typedef const wchar_t *LPCWSTR;
-typedef unsigned char *LPBYTE;
-typedef long long (*WNDPROC)(HWND, UINT, WPARAM, LPARAM);   // 即 LRESULT (CALLBACK*)(HWND,UINT,WPARAM,LPARAM)
+public typedef unsigned int DWORD;               // DWORD = unsigned int (4)
+public typedef unsigned int ULONG;               // ULONG = unsigned int (4)
+public typedef unsigned int UINT;                // UINT  = unsigned int (4)
+public typedef int LONG;                         // LONG  = int (4)
+public typedef int INT;                          // INT   = int (4)
+public typedef int BOOL;                         // BOOL  = int (4)
+public typedef unsigned short WORD;              // WORD  = unsigned short (2)
+public typedef unsigned char BYTE;               // BYTE  = unsigned char (1)
+public typedef long long LONGLONG;               // LONGLONG = long long (8)
+public typedef unsigned long long ULONGLONG;     // ULONGLONG = unsigned long long (8)
+public typedef unsigned long long DWORDLONG;     // DWORDLONG = unsigned long long (8)
+public typedef long long LONG_PTR;               // LONG_PTR = long long (8)
+public typedef unsigned long long ULONG_PTR;     // ULONG_PTR = unsigned long long (8)
+public typedef unsigned long long UINT_PTR;      // UINT_PTR = unsigned long long (8)
+public typedef unsigned long long DWORD_PTR;     // DWORD_PTR = unsigned long long (8)
+public typedef long long LPARAM;                 // LPARAM = long long (8)
+public typedef long long LRESULT;                // LRESULT = long long (8)
+public typedef unsigned int COLORREF;            // COLORREF = unsigned int (4)
+public typedef wchar_t WCHAR;                    // WCHAR = wchar_t (2)
+public typedef void *HANDLE;                     // 句柄族一律 void* (8)
+public typedef void *HWND;
+public typedef void *HDC;
+public typedef void *HINSTANCE;
+public typedef void *HMENU;
+public typedef void *HICON;
+public typedef void *HCURSOR;
+public typedef void *HBRUSH;
+public typedef void *HRGN;
+public typedef void *LPVOID;
+public typedef void *WPARAM;                     // 本文件既有映射：WPARAM 作 void*（SDK 为 UINT_PTR）
+public typedef char *LPSTR;
+public typedef const char *LPCSTR;
+public typedef wchar_t *LPWSTR;
+public typedef const wchar_t *LPCWSTR;
+public typedef unsigned char *LPBYTE;
+public typedef long long (*WNDPROC)(HWND, UINT, WPARAM, LPARAM);   // 即 LRESULT (CALLBACK*)(HWND,UINT,WPARAM,LPARAM)
 
 // —— Win32 结构布局（public · x64/LLP64 自然对齐；此处只留跨段共用或无函数原型引用的通用结构，按依赖序 POINT→RECT→LARGE_INTEGER→MINMAXINFO→FILE_NOTIFY_INFORMATION→TOOLINFOW→GUID→LUID→NMHDR→NMCUSTOMDRAW→CREATESTRUCTW→DRAWITEMSTRUCT→MEASUREITEMSTRUCT）——
 //   单库专用结构（仅被同一个库的函数引用）不留在本段，就近定义在对应库段的「<lib> 专用结构」小节、紧邻其使用者；判据＝原型区里该 struct 只出现在一个库段。
@@ -824,7 +829,6 @@ public const unsigned int HIGH_PRIORITY_CLASS = 0x00000080;
 public const unsigned int ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000;
 public const unsigned int NORMAL_PRIORITY_CLASS = 0x00000020;
 public const unsigned int BELOW_NORMAL_PRIORITY_CLASS = 0x00004000;
-public const unsigned int IDLE_PRIORITY_CLASS = 0x00000040;
 
 // 符号链接标志（CreateSymbolicLinkW 的 dwFlags）
 public const unsigned int SYMBOLIC_LINK_FLAG_DIRECTORY = 0x1;
@@ -836,7 +840,6 @@ public const int THREAD_PRIORITY_ABOVE_NORMAL = 1;
 public const int THREAD_PRIORITY_NORMAL = 0;
 public const int THREAD_PRIORITY_BELOW_NORMAL = -1;
 public const int THREAD_PRIORITY_LOWEST = -2;
-public const int THREAD_PRIORITY_IDLE = -15;
 
 // —— advapi32：[[lib("advapi32")]] 安全令牌/权限族（OpenProcessToken/AdjustTokenPrivileges/LookupPrivilegeValueW）——
 [[lib("advapi32")]] public int AdjustTokenPrivileges(void *TokenHandle, int DisableAllPrivileges, struct TOKEN_PRIVILEGES *NewState, unsigned int BufferLength, struct TOKEN_PRIVILEGES *PreviousState, unsigned int *ReturnLength);
@@ -1949,7 +1952,7 @@ public struct TEXTMETRICW
 [[lib("gdi32")]] public int FillRgn(void *hDC, void *hRgn, void *hBrush);
 
 // —— gdi32 批次 XIII 补充（追加于段末、块内字母序；字体度量 A/W）——
-[[lib("gdi32")]] public int GetTextMetricsA(void *hDC, struct TEXTMETRICA *lptm);
+[[lib("gdi32")]] public int GetTextMetricsA(void *hDC, void *lptm);
 [[lib("gdi32")]] public int GetTextMetricsW(void *hDC, struct TEXTMETRICW *lptm);
 
 // —— comdlg32 专用常量（仅本段函数使用；定义紧邻其使用者）——

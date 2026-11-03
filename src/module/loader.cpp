@@ -364,12 +364,19 @@ void merge_bundle(TranslationUnit &main_tu,
                   std::unordered_map<std::string, TUPtr> &cache,
                   const std::vector<std::string> &postorder)
 {
+	// 路 B 闭包（⑥）：主源视图（key=""）先入表，供 sema/codegen 空 key 视角解析——
+	//   逐字等于现状 main_tu.imports，不改任何既有主源行为。
+	main_tu.module_import_views.emplace_back(std::string(), main_tu.imports);
 	std::size_t imported_stmt_prefix = 0;
 	for (auto rit = postorder.rbegin(); rit != postorder.rend(); ++rit)
 	{
 		auto it = cache.find(*rit);
 		if (it == cache.end() || !it->second) continue;
 		TranslationUnit &sub = *it->second;
+		// 路 B 闭包（⑥）：登记子模块自身 imports 视图（resolved_module_key 已由 load 回填）。
+		//   仅供按模块视角解 alias.Tag；**不并入 main_tu.imports**（维持下方「sub.imports 不搬」
+		//   不变量），故既有裸名/可见性走查逐字不变。
+		main_tu.module_import_views.emplace_back(*rit, sub.imports);
 		// 拓序前插时子模块顶层裸语句项数（供 imported_stmt_prefix 累加）。
 		const std::size_t sub_stmt_count = sub.top_level_body.size();
 		// P212 归属标记：将子模块中所有顶层项的 source_module_key = 规范化绝对路径（*rit）。

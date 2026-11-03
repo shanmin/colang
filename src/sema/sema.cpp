@@ -65,14 +65,55 @@ public:
 			// 同一 TU 内重复函数定义（无论参数是否相同）：C 约束违例
 			if (it->second->body && f.body)
 				report(f.loc, "redefinition of '" + f.name + "'");
-			// 原型与定义的返回类型冲突
-			else if (!same_type(it->second->return_type, f.return_type))
+			// 原型/定义/多次声明：整函数类型须声明相容（C 6.7.6.3）。修前只比返回类型，
+			//   `void f(int); void f(char);` 漏报。形参顶层限定符不计；空形参表按 C23 口径
+			//   即零参原型（`void f(); void f(int);` 判冲突）——统一交 decl_compatible，
+			//   与块作用域 note_local_name 同一判据。
+			else if (!decl_func_compatible(*it->second, f))
 				report(f.loc, "conflicting types for '" + f.name + "'");
 			// 调用元数检查须看带定义的条目
 			if (f.body && !it->second->body)
 				funcs_[f.name] = &f;
 		}
-		for (const auto &g : tu->globals) { globals_[g.name] = g.type; global_keys_[g.name] = g.source_module_key; if (!g.is_extern || !global_ident_locs_.count(g.name)) global_ident_locs_[g.name] = g.ident_loc; }
+		// 文件作用域对象重声明：同模块内类型须相容（C 6.2.7），带初值定义唯一（C 6.9.2）。
+		//   修前 globals_ 直接 last-wins、完全不比较类型，`extern int a; extern long a;` 漏报。
+		//   tentative definition（无初值、非 extern）可任意重复；extern 纯声明亦可重复。
+		//   跨模块同名（per-module 闭包）仍合法共存，仅同 key 内判。
+		std::unordered_map<std::string, std::unordered_set<std::string>> global_inited;
+		for (const auto &g : tu->globals)
+		{
+			const std::string &mkey = g.source_module_key;
+			auto it = globals_.find(g.name);
+			if (it == globals_.end())
+			{
+				globals_[g.name] = g.type;
+				global_keys_[g.name] = mkey;
+				if (g.init) global_inited[mkey].insert(g.name);
+				if (!g.is_extern || !global_ident_locs_.count(g.name)) global_ident_locs_[g.name] = g.ident_loc;
+				continue;
+			}
+			if (per_module_ && global_keys_[g.name] != mkey)
+			{
+				globals_[g.name] = g.type;
+				global_keys_[g.name] = mkey;
+				if (g.init) global_inited[mkey].insert(g.name);
+				if (!g.is_extern || !global_ident_locs_.count(g.name)) global_ident_locs_[g.name] = g.ident_loc;
+				continue;
+			}
+			const SourceLoc dloc = g.ident_loc.file.empty() ? g.loc : g.ident_loc;
+			if (!decl_compatible(it->second, g.type))
+			{
+				report(dloc, "conflicting types for '" + g.name + "'");
+				continue; // 类型已冲突，不再按重定义二次报
+			}
+			if (g.init && global_inited[mkey].count(g.name))
+				report(dloc, "redefinition of '" + g.name + "'");
+			else if (g.init)
+				global_inited[mkey].insert(g.name);
+			globals_[g.name] = g.type;
+			global_keys_[g.name] = mkey;
+			if (!g.is_extern || !global_ident_locs_.count(g.name)) global_ident_locs_[g.name] = g.ident_loc;
+		}
 		// P214：[[deprecated]] 登记表（name → 消息）。与 funcs_/globals_ 的「规范条目」归并不依赖顺序：
 		//   原型与定义分属两条 AST 记录，任一处标注即对整个实体生效。
 		for (const auto &f : tu->funcs)
@@ -310,14 +351,26 @@ public:
 		}
 		// 限定名映射：主源本层 imports 的 `as ModAlias`（无别名取文件 stem）→ resolved_module_key。
 		//   consts 表暂空（public const int 的跨模块导出面留待限定访问实现步补齐）。
-		for (const auto &d : tu->imports)
+		// 路 B 闭包（⑥）：按视角建 alias→key。主源视图（key=""）逐字等于修前 catalog_.qualified；
+		//   各子模块视图来自 merge_bundle 登记的 module_import_views，供子模块代码解 typedef
+		//   referent 折的 owner 前缀。by_module 条目两路都补（限定名可解析到空视图）。
+		auto fill_view = [&](const std::string &vkey, const std::vector<ImportDecl> &imps)
 		{
-			if (d.resolved_module_key.empty()) continue;
-			const std::string alias = d.module_alias.empty() ? stem_of_key(d.resolved_module_key) : d.module_alias;
-			catalog_.qualified[alias] = d.resolved_module_key;
-			// 确保被 import 但无 public 导出的模块也有条目（限定名可解析到空视图）。
-			catalog_.by_module.emplace(d.resolved_module_key, View{});
-		}
+			auto &m = qualified_view_[vkey];
+			for (const auto &d : imps)
+			{
+				if (d.resolved_module_key.empty()) continue;
+				const std::string alias = d.module_alias.empty() ? stem_of_key(d.resolved_module_key) : d.module_alias;
+				m[alias] = d.resolved_module_key;
+				// 确保被 import 但无 public 导出的模块也有条目（限定名可解析到空视图）。
+				catalog_.by_module.emplace(d.resolved_module_key, View{});
+			}
+		};
+		fill_view(std::string(), tu->imports);
+		for (const auto &kv : tu->module_import_views)
+			if (!kv.first.empty()) fill_view(kv.first, kv.second);
+		// catalog_.qualified 保留为主源视图（残留读取逐字维持现状）。
+		for (const auto &kv : qualified_view_[std::string()]) catalog_.qualified[kv.first] = kv.second;
 		// 路 B 阶段2-c：跨模块同名（host vs import、import vs import）共存 → 给「导入项」挂 dunder 合成符号名
 		//   `__<stem>__<name>`；host 自身项保留裸名（ambient 胜出、host 定义全局唯一）。
 		//   同模块内 prototype+definition（distinct key 唯一）不触发。消解 LLVM 链接期重复 external 符号误并（h4b b=2 根因）。
@@ -768,6 +821,18 @@ private:
 		default:
 			return a->is_unsigned == b->is_unsigned;
 		}
+	}
+
+	// 整函数类型（返回 + 形参 + 变参 + 原型位）的声明相容性：文件作用域重声明判定用。
+	//   与 same_type 的差别：形参顶层限定符不参与，统一交 type_resolver.h 的 decl_compatible
+	//   （与块作用域 note_local_name 共用同一判据；C23 口径下 `()` 即零参原型）。
+	static bool decl_func_compatible(const FuncDecl &a, const FuncDecl &b)
+	{
+		std::vector<CTypePtr> pa, pb;
+		for (const auto &p : a.params) pa.push_back(p.type);
+		for (const auto &p : b.params) pb.push_back(p.type);
+		return decl_compatible(make_func_type(a.return_type, std::move(pa), a.is_variadic, a.is_prototype),
+			make_func_type(b.return_type, std::move(pb), b.is_variadic, b.is_prototype));
 	}
 
 	// 严格同一性：限定符（const/volatile/restrict/_Atomic）与数组维度全同才算同一（`_Generic` 重复关联用）。
@@ -1625,6 +1690,29 @@ private:
 		return false;
 	}
 
+	// 路 B 闭包（⑥）：按当前代码归属模块视角解析限定名 alias → 目标模块 key。
+	//   优先 cur_source_module_key_ 视角（子模块自身 imports），回落主源视角（""＝修前口径）；
+	//   主源代码 cur 视角即 ""，行为逐字不变。回空 = 该 alias 在册各视角均无。
+	const std::string resolve_alias_in_view(const std::string &alias) const
+	{
+		auto vit = qualified_view_.find(cur_source_module_key_);
+		if (vit != qualified_view_.end())
+		{
+			auto a = vit->second.find(alias);
+			if (a != vit->second.end()) return a->second;
+		}
+		if (!cur_source_module_key_.empty())
+		{
+			auto hit = qualified_view_.find(std::string());
+			if (hit != qualified_view_.end())
+			{
+				auto a = hit->second.find(alias);
+				if (a != hit->second.end()) return a->second;
+			}
+		}
+		return std::string();
+	}
+
 	// P217：按 tag 查 struct/union 的「完整定义项」（is_definition=true）。
 	//   不取 structs_（可能被主源的前置引用空壳覆盖），而直接扫 main_tu_->structs。
 	const StructDef *find_struct_def_by_tag(const std::string &tag) const
@@ -1639,11 +1727,11 @@ private:
 		{
 			const std::string alias = tag.substr(0, dot);
 			const std::string nm = tag.substr(dot + 1);
-			auto qit = catalog_.qualified.find(alias);
-			if (qit != catalog_.qualified.end())
+			const std::string key = resolve_alias_in_view(alias); // 路 B 闭包（⑥）：按视角解前缀
+			if (!key.empty())
 			{
 				for (const auto &s : main_tu_->structs)
-					if (s.tag == nm && s.is_definition && s.source_module_key == qit->second) return &s;
+					if (s.tag == nm && s.is_definition && s.source_module_key == key) return &s;
 				return nullptr;
 			}
 		}
@@ -1750,13 +1838,32 @@ private:
 	}
 
 	// P212：封装——在主源上下文下检查名字引用；非主源代码直接放行。
+	// P355 订正：「非主源直接放行」只对**类型/变量面**保留，函数面已同口径下沉（见下方模块分支）。
 	void enforce_import_visibility(const std::string &name, const SourceLoc &loc)
 	{
-		// 只在主源代码（cur_source_module_key_ 空）中才需跨模块可见性检查。
-		if (!cur_source_module_key_.empty()) return;
+		const std::string src = symbol_source_module(name);
+		if (!cur_source_module_key_.empty())
+		{
+			// P355：把根单元那条拒收诊断按同口径下沉到**模块桶的调用点绑定**。
+			//   修前：本函数在非主源上下文无条件返回，于是「模块 B 调模块 A 的非 public 函数」
+			//   编译期零诊断，拖到链接期才报 `undefined symbol: Private1`（**裸名**、不带 `__A__`
+			//   模块前缀——定义方按模块 mangle、调用方按外部链接发出，两边永不相逢）。
+			//   只收「他模块**有 body 的定义**」：纯原型（body 空）常是外部/C 库声明（承 P213
+			//   「纯原型不参与 strip」的同一条理由），按裸名发出去能链上，一并拒收会成误报。
+			//   同模块内部互引恒放行（imported 代码引用自有私有助手是合法路径）。
+			//   本批**不查**「是否已显式 import」——跨模块调 public 而未 import 仍按既有宽容放行，
+			//   以免把诊断面扩到现今可通过的路径。
+			if (src.empty() || src == cur_source_module_key_) return;
+			auto mit = funcs_.find(name);
+			if (mit == funcs_.end() || !mit->second) return;
+			const FuncDecl *def = mit->second;
+			if (!def->body || def->is_public) return;
+			report(loc, "cannot import non-public symbol '" + name + "'");
+			return;
+		}
+		// 只在主源代码（cur_source_module_key_ 空）中才需完整跨模块可见性检查。
 		// 路 B 阶段1 ambient 切断：宿主自身（含其 #include）声明的名字优先，不作跨模块可见性检查。
 		if (host_own_names_.count(name)) return;
-		const std::string src = symbol_source_module(name);
 		if (src.empty()) return; // 主源自身符号、不跨模块
 		// 取目标 is_public 标记（funcs_/globals_ 两路）
 		bool target_pub = false;
@@ -1804,8 +1911,8 @@ private:
 		if (dot == std::string::npos) return false;
 		const std::string alias = t->tag.substr(0, dot);
 		const std::string nm = t->tag.substr(dot + 1);
-		auto qit = catalog_.qualified.find(alias);
-		if (qit == catalog_.qualified.end())
+		const std::string qkey = resolve_alias_in_view(alias); // 路 B 闭包（⑥）
+		if (qkey.empty())
 		{
 			// 非导入别名：点号只是 parser 的块内改名（`X.__blkN`）——不当限定名处理，
 			//   交回常规 tag 路径；仅当第二段确实是已登记标签/typedef 时（如写错模块名 `zz.Leaf`）
@@ -1817,7 +1924,7 @@ private:
 			}
 			return false;
 		}
-		auto vit = catalog_.by_module.find(qit->second);
+		auto vit = catalog_.by_module.find(qkey);
 		if (vit == catalog_.by_module.end()) return true;
 		const ModuleCatalog::View &v = vit->second;
 		auto sit = v.structs.find(nm);
@@ -1985,7 +2092,7 @@ private:
 	//   落到 Struct/Union 且 tag 非空、find_struct_def_by_tag 为空 ⇒ 不完整、报错。Enum 不纳入（越界）。
 	//   P301：主源与子模块同口径。此前仅主源触发（cur_source_module_key_ 空），子模块里按值用到
 	//   不完整类型时会一路漏给 codegen，opaque %struct. 作 alloca 使 LLVM 直接崩溃（决策记录见项目内部设计文档）。
-	enum IncompleteCtx { IctxVar, IctxField, IctxGlobal };
+	enum IncompleteCtx { IctxVar, IctxField, IctxGlobal, IctxParam }; // (I)：值形参按值 alloca 的完备性兜底
 
 	void enforce_complete_type(const CTypePtr &t, const SourceLoc &loc, IncompleteCtx ctx)
 	{
@@ -2161,7 +2268,8 @@ private:
 			if (it == self->funcs_.end() || !it->second) return nullptr;
 			std::vector<CTypePtr> ps;
 			for (const auto &p : it->second->params) ps.push_back(p.type);
-			return make_func_type(it->second->return_type, std::move(ps), it->second->is_variadic);
+			return make_func_type(it->second->return_type, std::move(ps), it->second->is_variadic,
+				it->second->is_prototype);
 		}
 		// 目标数据模型的 long 位宽（供共享解析器整型提升取正确宽度）。
 		unsigned long_bits() const { return static_cast<unsigned>(self->opts_.target.sizeof_long) * 8u; }
@@ -2498,9 +2606,9 @@ private:
 		const std::string &alias = base->name;
 		if (alias.empty()) return false;
 		if (is_declared(alias)) return false;          // 本地同名变量胜出（遮蔽），走常规成员
-		auto qit = catalog_.qualified.find(alias);
-		if (qit == catalog_.qualified.end()) return false; // 非模块限定名
-		auto vit = catalog_.by_module.find(qit->second);
+		const std::string qkey = resolve_alias_in_view(alias); // 路 B 闭包（⑥）
+		if (qkey.empty()) return false; // 非模块限定名
+		auto vit = catalog_.by_module.find(qkey);
 		if (vit == catalog_.by_module.end())
 		{
 			report(e->loc, "reference to module '" + alias + "' before import");
@@ -2547,10 +2655,10 @@ private:
 			auto sit = structs_.find(mname);
 			auto eit = enums_.find(mname);
 			auto cit = classes_.find(mname);
-			const bool same_mod = (sit != structs_.end() && sit->second && sit->second->source_module_key == qit->second) ||
-			                      (eit != enums_.end() && eit->second && eit->second->source_module_key == qit->second) ||
-			                      (cit != classes_.end() && cit->second && cit->second->source_module_key == qit->second) ||
-			                      typedef_owned_by(mname, qit->second);
+			const bool same_mod = (sit != structs_.end() && sit->second && sit->second->source_module_key == qkey) ||
+			                      (eit != enums_.end() && eit->second && eit->second->source_module_key == qkey) ||
+			                      (cit != classes_.end() && cit->second && cit->second->source_module_key == qkey) ||
+			                      typedef_owned_by(mname, qkey);
 			if (same_mod)
 			{
 				report(e->loc, "no public type '" + mname + "' in module '" + alias + "'");
@@ -2597,10 +2705,10 @@ private:
 		if (dot == std::string::npos) return false;
 		const std::string alias = ref->name.substr(0, dot);
 		const std::string nm = ref->name.substr(dot + 1);
-		auto qit = catalog_.qualified.find(alias);
-		if (qit == catalog_.qualified.end()) return false;
+		const std::string qkey = resolve_alias_in_view(alias); // 路 B 闭包（⑥）
+		if (qkey.empty()) return false;
 		ref->module_qualifier = true;
-		auto vit = catalog_.by_module.find(qit->second);
+		auto vit = catalog_.by_module.find(qkey);
 		if (vit == catalog_.by_module.end()) return true;
 		const ModuleCatalog::View &v = vit->second;
 		if (v.classes.count(nm)) return true; // 已导出为类（解析失败属上层问题，静默）
@@ -3040,14 +3148,27 @@ private:
 				else if (e->op == "->" && !is_ptr_or_array(base))
 					report(e->loc, std::string("member reference type ") + describe_type(base) + " is not a pointer" + (is_struct_like(base) ? "; did you mean to use '.'?" : ""));
 				else if (e->op == ".")
-					check_member_exists(base, e->name, e->loc); // P305：成员名存在性
+					{
+											// (I) 记录基 incomplete（含跨模块 typedef 别名完备性断链、前向声明无定义）
+											//   → 报 clang 同款 incomplete，绝不放行 codegen 造空 llvm::StructType 崩。
+											if (const CTypePtr inc = incomplete_record_type(base))
+												report(e->loc, "incomplete definition of type " + spell_record(inc));
+											else
+												check_member_exists(base, e->name, e->loc); // P305：成员名存在性
+										}
 				else
 				{
 					// P305：`->` 先解一层再校核——解引用基不是记录时 clang 走「基类型非结构体」同文
 					//   （`void *v; v->x` / `int *p; p->x` 修前静默过）。
 					const CTypePtr rec = base->base;
 					if (!rec) { /* 未知 pointee：不报，交其他检查 */ }
-					else if (is_struct_like(rec)) check_member_exists(rec, e->name, e->loc);
+					else if (is_struct_like(rec))
+										{
+											if (const CTypePtr inc = incomplete_record_type(rec))
+												report(e->loc, "incomplete definition of type " + spell_record(inc));
+											else
+												check_member_exists(rec, e->name, e->loc);
+										}
 					else report(e->loc, "member reference base type " + describe_type(rec) + " is not a structure or union");
 				}
 			}
@@ -3094,10 +3215,10 @@ private:
 					auto dep = dep_funcs_.find(e->name);
 					if (dep != dep_funcs_.end())
 						note_deprecated_use(e->name, dep->second, e->loc);
-					// 仅查本 TU 内有定义（有 body）的函数：extern 头声明的签名可能带
-					// codegen 注入的隐藏参数（如 setjmp.h 的 _setjmp 帧地址第二参），
-					// arity 不可靠，一律跳过以免误伤。
-					if (f->body && (!f->params.empty() || f->is_variadic))
+					// 参数个数检查覆盖两轴（修复②）：① 无 body 的 extern 原型同样查（P9.35 曾为 _setjmp
+					//   整段跳过纯原型，现改为按名豁免该唯一由 codegen 注入隐藏参的函数——setjmp.h 声明
+					//   _setjmp 2 参、setjmp 宏只传 env，第二参在 codegen 补齐，按名口径与其一致）；② 零形参 ()/(void) 按 C23 视作 0 参，传实参即 too many。
+					if (e->name != "_setjmp")
 					{
 						const std::size_t np = f->params.size();
 						const std::size_t na = e->args.size();
@@ -3669,6 +3790,12 @@ private:
 		param_list_.clear();
 		for (const auto &p : f.params)
 			if (!p.name.empty()) { scopes_.back()[p.name] = {p.type, p.loc}; param_list_.emplace_back(p.name, p.loc); }
+		// (I) 值形参完备性兜底：有 body 定义的按值形参在 codegen 会 alloca，incomplete record
+		//   （跨模块 typedef 别名完备性断链、前向声明无定义）会漏给后端造空 llvm::StructType 崩
+		//   （0xC0000005）。判据与局部/字段同源（find_struct_def_by_tag 落空即不完整）。纯原型
+		//   无 body、run 里 if (f.body) 才进 check_func，天然不查。
+		for (const auto &p : f.params)
+			if (p.type) enforce_complete_type(p.type, p.loc, IctxParam);
 		used_var_names_.clear();
 		declared_locals_.clear();
 		read_var_names_.clear();
@@ -3767,6 +3894,9 @@ private:
 	bool per_module_ = false;
 	// 路 B 阶段1b：逐模块 public 视图目录（per_module_ 为 true 时填充）。
 	ModuleCatalog catalog_;
+	// 路 B 闭包（⑥）：视角 module_key → (限定名 alias → 目标模块 key)。主源视角存 key=""。
+	//   子模块 typedef referent 折的 owner 前缀来自其自身 imports，须按对应视角解析。
+	std::unordered_map<std::string, std::unordered_map<std::string, std::string>> qualified_view_;
 	using View = ModuleCatalog::View;
 	// 路 B 阶段1b：裸名 → 导出该名的不同模块 key 集（host 裸名歧义裁定③：size>1 且非 host 自有→歧义）。
 	std::unordered_map<std::string, std::unordered_set<std::string>> xmod_public_owners;

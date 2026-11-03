@@ -326,7 +326,14 @@ struct Parser
 	unsigned tag_rename_seq_ = 0;
 	// 块作用域的普通标识符（局部变量/形参）名字栈：parser 把 enum 常量折叠成字面量，
 	//   需先判断该名是否被内层变量声明隐藏（C 同名空间，内层声明隐藏外层 enumerator）。
-	std::vector<std::unordered_set<std::string>> var_scope_;
+	//   值＝该层此名的「可重复声明」类型：C 6.2.7 允许同作用域重复声明函数原型与
+	//   无初值 extern 对象（类型须相容），此类记声明类型；其余（自动变量/带初值 extern
+	//   等）记 nullptr，同作用域再现即重定义。
+	std::vector<std::unordered_map<std::string, CTypePtr>> var_scope_;
+	// 当前是否在解析块作用域对象声明（parse_local_decl / parse_local_decl_no_semi）。
+	//   旧式存储类 auto 允许与类型说明符任意交错（`volatile MyInt auto av = 1;`），仅在
+	//   此上下文按 no-op 跳过；文件作用域/形参/成员里的 auto 仍按原路径（非法位置）。
+	bool local_decl_ctx_ = false;
 	// P256：局部 const int 值作用域栈（与 var_scope_ 并列压弹）：每层 名→已折常量。
 	//   仅登记「初值解析期可折叠」的 const 限定整数局部；内层遮蔽外层/import const（C 标准同名空间）。
 	std::vector<std::unordered_map<std::string, std::int64_t>> const_local_vals_;
@@ -358,14 +365,32 @@ struct Parser
 		return tag;
 	}
 
-	// 登记局部声明的名字（供 enum 常量遮蔽判定 + P353 重定义诊断）
-	void note_local_name(const std::string &n, const SourceLoc &loc = {})
+	// 登记局部声明的名字（供 enum 常量遮蔽判定 + P353 重定义诊断）。
+	//   repeatable/type：该声明是否属「同作用域可重复声明」（函数原型或、无初值 extern 对象）。
+	//   C 6.2.7 允许这类声明在同一作用域重复出现且类型相容；修前一律按重定义拒收，
+	//   误杀 `extern int a; extern int a;`、`void f(int); void f(int);` 等合法 C。
+	//   两条可重复声明但类型冲突时按 clang 口径报 conflicting types；其余同名声明保持重定义。
+	void note_local_name(const std::string &n, const CTypePtr &type, bool repeatable,
+		const SourceLoc &loc = {})
 	{
-		if (!var_scope_.empty())
+		if (var_scope_.empty()) return;
+		auto &sc = var_scope_.back();
+		auto it = sc.find(n);
+		if (it == sc.end())
 		{
-			if (!var_scope_.back().insert(n).second && loc.line)
-				error(loc, "redefinition of '" + n + "'");
+			sc[n] = repeatable ? type : nullptr;
+			return;
 		}
+		// 声明相容性走 decl_compatible（与文件作用域重声明同一判据）：形参顶层限定符
+		//   不影响相容；空形参表按 C23 口径即零参原型（`f(); f(int);` 判冲突）。
+		//   不改 types_compatible，故 _Generic 关联匹配不受影响。
+		if (repeatable && it->second && type && decl_compatible(it->second, type))
+			return;
+		if (!loc.line) return;
+		if (repeatable && it->second && type)
+			error(loc, "conflicting types for '" + n + "'");
+		else
+			error(loc, "redefinition of '" + n + "'");
 	}
 
 	// 该名是否被内层局部声明（变量或形参）占用
@@ -1555,7 +1580,7 @@ struct Parser
 			if (!pick) return nullptr;
 			std::vector<CTypePtr> ps;
 			for (const auto &p : pick->params) ps.push_back(p.type);
-			return make_func_type(pick->return_type, std::move(ps), pick->is_variadic);
+			return make_func_type(pick->return_type, std::move(ps), pick->is_variadic, pick->is_prototype);
 		}
 		// 目标数据模型的 long 位宽（供共享解析器整型提升取正确宽度）。
 		unsigned long_bits() const { return static_cast<unsigned>(self->target.sizeof_long) * 8u; }
@@ -2519,7 +2544,7 @@ struct Parser
 			fn.lib_name = attrs.lib_name;
 			fn.subsystem_windows = attrs.subsystem_windows;
 			expect_punct("(");
-			parse_param_list(fn.params, fn.is_variadic);
+			parse_param_list(fn.params, fn.is_variadic, fn.is_prototype);
 			expect_punct(")");
 			// 0.4.1 a2-follow：函数声明符参数表之后的 [[...]] ＝附着于函数类型 → clang 报 cannot be applied to types
 			//   （F1/F3/F4 探针，声明与定义同文；后续函数体/分号照常解析）。
@@ -2689,6 +2714,10 @@ struct Parser
 			if (match_keyword("restrict")) { if (r) r->is_restrict = true; continue; }
 			if (match_keyword("static")) { last_static_ = true; continue; }
 			if (match_keyword("extern")) { last_extern_ = true; continue; }
+			// 旧式存储类 auto 跟在类型说明符之后（`volatile MyInt auto av = 1;`）：按 no-op
+			//   消费。修前该 token 留给声明符，名字与位置丢失（空名 `:1:1`，同作用域第二条
+			//   报 `redefinition of ''`）。C23 auto 类型推断仍走 core 的 `auto` 分支。
+			if (local_decl_ctx_ && match_keyword("auto")) continue;
 			if (match_keyword("typedef")) { last_typedef_ = true; continue; }
 			// 位点4：GNU __attribute__ 后置（类型说明符与声明符之间，如
 			//   `void __attribute__((stdcall)) f(void)`；非 ISO C，GCC/Clang 兼容）。
@@ -2721,6 +2750,10 @@ struct Parser
 			const std::string &s = t.text;
 			if (s == "const" || s == "volatile" || s == "restrict" || s == "_Atomic" ||
 				s == "register" || s == "inline")
+				continue;
+			// 块作用域对象声明里的旧式存储类 auto 不打断类型关键字组合计数
+			//   （`volatile MyInt auto short const x`）；其余上下文仍按原路径。
+			if (s == "auto" && local_decl_ctx_)
 				continue;
 			if (s == "void" || s == "_Bool" || s == "bool" || s == "char" || s == "short" ||
 				s == "int" || s == "long" || s == "float" || s == "double" ||
@@ -2857,6 +2890,9 @@ struct Parser
 			else if (match_keyword("_Atomic")) ato = true;
 			else if (match_keyword("restrict") ||
 				match_keyword("register") || match_keyword("inline"))
+				;
+			// 旧式存储类 auto 夹在类型关键字之间（C 允许说明符任意顺序，块作用域对象声明）
+			else if (local_decl_ctx_ && match_keyword("auto"))
 				;
 			else break;
 		}
@@ -3137,7 +3173,12 @@ struct Parser
 						parse_static_assert_decl();
 						continue;
 					}
+					// 成员声明不许存储类（`struct S { int auto x; };` 按 clang 拒收）：
+					//   临时关闭旧式 auto 的 no-op 消费，出块后恢复。
+					const bool saved_member_ctx = local_decl_ctx_;
+					local_decl_ctx_ = false;
 					CTypePtr mtype = parse_decl_specifiers();
+					local_decl_ctx_ = saved_member_ctx;
 					const SourceLoc mem_decl_loc = peek().loc; // 成员声明类型起始（备用）
 					unsigned mal = last_alignas_; // 本成员的 _Alignas（后续声明符解析前捕获）
 					const bool mal_has = last_has_alignas_;    // P250
@@ -3644,8 +3685,11 @@ struct Parser
 		return false;
 	}
 
-	void parse_param_list(std::vector<Param> &params, bool &variadic)
+	void parse_param_list(std::vector<Param> &params, bool &variadic, bool &prototype)
 	{
+		// 原型位按 C23 口径记录（2026-11-03 拍板）：`(void)`、非空参数表与空 `()` 均为原型；
+		//   空 `()` 的具体口径由 type_resolver.h 的 decl_empty_paren_is_prototype 单点决定。
+		prototype = true;
 		// (void)
 		if (check_keyword("void") && peek(1).kind == TokKind::Punct && peek(1).text == ")")
 		{
@@ -3654,6 +3698,7 @@ struct Parser
 		}
 		if (check_punct(")"))
 		{
+			prototype = decl_empty_paren_is_prototype;
 			return; // empty
 		}
 		variadic = false;
@@ -3683,11 +3728,12 @@ struct Parser
 				advance(); // '('
 				std::vector<Param> inner;
 				bool ivariadic = false;
-				parse_param_list(inner, ivariadic);
+				bool iproto = true;
+				parse_param_list(inner, ivariadic, iproto);
 				expect_punct(")");
 				std::vector<CTypePtr> innerTypes;
 				for (auto &ip : inner) innerTypes.push_back(ip.type);
-				t = make_pointer(make_func_type(base, innerTypes, ivariadic)); // 函数指示符形参 → 函数指针
+				t = make_pointer(make_func_type(base, innerTypes, ivariadic, iproto)); // 函数指示符形参 → 函数指针
 			}
 			else
 			{
@@ -3732,7 +3778,7 @@ struct Parser
 		const_local_vals_.emplace_back(); // P256：与 var_scope_ 并列压弹，两层保持同步
 		// 函数体：形参在本块可见（须先于 enumerator 判定）
 		for (const auto &pn : pending_param_names_)
-			if (!pn.empty()) var_scope_.back().insert(pn);
+			if (!pn.empty()) var_scope_.back().emplace(pn, nullptr);
 		pending_param_names_.clear();
 		while (!check_punct("}") && !at_end())
 		{
@@ -4042,7 +4088,10 @@ struct Parser
 			attr_fatal_ = false;
 			return nullptr;
 		}
+		const bool saved_local_ctx = local_decl_ctx_;
+		local_decl_ctx_ = true; // 旧式存储类 auto 可夹在类型说明符之间
 		CTypePtr base_type = parse_decl_specifiers();
+		local_decl_ctx_ = saved_local_ctx;
 		is_static = is_static || last_static_;
 		is_extern = is_extern || last_extern_;
 		is_td = is_td || last_typedef_;
@@ -4076,7 +4125,7 @@ struct Parser
 			// 推断类型
 			s->var_type = auto_lvalue_convert(infer_auto_type(s->var_init));
 			local_var_types_[s->var_name] = s->var_type;
-			note_local_name(s->var_name, s->var_ident_loc);
+			note_local_name(s->var_name, s->var_type, false, s->var_ident_loc);
 			note_local_const(s->var_name, s->var_type, s->var_init); // P256
 			match_punct(";");
 			return s;
@@ -4176,7 +4225,10 @@ struct Parser
 			}
 			deduce_array_size(s->var_type, s->var_init);
 			local_var_types_[s->var_name] = s->var_type;
-			note_local_name(s->var_name, s->var_ident_loc);
+			// 同作用域可重复声明：函数原型与无初值 extern 对象（C 6.2.7）。
+			const bool redecl_ok = (s->var_type && s->var_type->kind == TypeKind::Function) ||
+				(is_extern && !s->var_init);
+			note_local_name(s->var_name, s->var_type, redecl_ok, s->var_ident_loc);
 			note_local_const(s->var_name, s->var_type, s->var_init); // P256
 			compound->body.push_back(std::move(s));
 		} while (match_punct(","));
@@ -4190,7 +4242,10 @@ struct Parser
 	StmtPtr parse_local_decl_no_semi()
 	{
 		skip_attributes();
+		const bool saved_local_ctx = local_decl_ctx_;
+		local_decl_ctx_ = true; // 旧式存储类 auto 可夹在类型说明符之间
 		CTypePtr base_type = parse_decl_specifiers();
+		local_decl_ctx_ = saved_local_ctx;
 		if (!base_type && !last_auto_) return nullptr;
 		if (last_auto_)
 		{
@@ -4204,7 +4259,7 @@ struct Parser
 			s->var_init = parse_assign();
 			s->var_type = auto_lvalue_convert(infer_auto_type(s->var_init));
 			local_var_types_[s->var_name] = s->var_type;
-			note_local_name(s->var_name, s->var_ident_loc);
+			note_local_name(s->var_name, s->var_type, false, s->var_ident_loc);
 			return s;
 		}
 		// 简单声明: type name = expr
@@ -4222,7 +4277,7 @@ struct Parser
 			s->var_init = check_punct("{") ? parse_init_list() : parse_assign();
 		deduce_array_size(s->var_type, s->var_init);
 		local_var_types_[s->var_name] = s->var_type;
-		note_local_name(s->var_name, s->var_ident_loc);
+		note_local_name(s->var_name, s->var_type, false, s->var_ident_loc);
 		return s;
 	}
 	
@@ -4317,11 +4372,12 @@ struct Parser
 			advance(); // (
 			std::vector<Param> ps;
 			bool variadic = false;
-			parse_param_list(ps, variadic);
+			bool proto = true;
+			parse_param_list(ps, variadic, proto);
 			expect_punct(")");
 			std::vector<CTypePtr> ptypes;
 			for (auto &p : ps) ptypes.push_back(p.type);
-			auto fn_ty = make_func_type(ret_type, std::move(ptypes), variadic);
+			auto fn_ty = make_func_type(ret_type, std::move(ptypes), variadic, proto);
 			return {name, make_pointer(fn_ty)};
 		}
 		if (check_punct("["))
@@ -4520,7 +4576,8 @@ struct Parser
 				advance(); // '('
 				std::vector<Param> ps;
 				bool variadic = false;
-				parse_param_list(ps, variadic);
+				bool proto = true;
+				parse_param_list(ps, variadic, proto);
 				expect_punct(")");
 				decl_tail_ = 2; // a2-follow：本帧尾=参数表（类型语境；晚于 parse_param_list 内的嵌套清零，故置于此）
 				// 紧邻标识符的参数表 = 被定义函数自身参数（带名），回填供函数定义绑定体作用域。
@@ -4529,9 +4586,9 @@ struct Parser
 				std::vector<CTypePtr> ptypes;
 				for (auto &p : ps) ptypes.push_back(p.type);
 				DeclaratorFn prev = cur;
-				cur = [prev, ptypes, variadic](CTypePtr X) -> CTypePtr
+				cur = [prev, ptypes, variadic, proto](CTypePtr X) -> CTypePtr
 				{
-					return prev(make_func_type(X, ptypes, variadic));
+					return prev(make_func_type(X, ptypes, variadic, proto));
 				};
 			}
 			else break;
@@ -4609,6 +4666,7 @@ struct Parser
 					fn.params.push_back(std::move(p));
 				}
 			fn.is_variadic = type->is_variadic;
+			fn.is_prototype = type->is_prototype;
 			fn.is_static = is_static;
 			fn.is_public = is_public;
 			fn.is_deprecated = attrs.deprecated;

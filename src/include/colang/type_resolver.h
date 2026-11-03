@@ -64,6 +64,20 @@ inline IntPromo int_uac(const IntPromo &a, const IntPromo &b)
 	return { a.bits, a.is_unsigned || b.is_unsigned };
 }
 
+// 整型类别判定（含 _Bool/枚举/位精确整型）；Float/Double 不在此列。
+inline bool is_integer_kind(TypeKind k)
+{
+	switch (k)
+	{
+	case TypeKind::Bool: case TypeKind::Char: case TypeKind::WChar: case TypeKind::Char8:
+	case TypeKind::Char16: case TypeKind::Char32: case TypeKind::Short: case TypeKind::Int:
+	case TypeKind::Long: case TypeKind::LongLong: case TypeKind::Enum: case TypeKind::BitInt:
+		return true;
+	default:
+		return false;
+	}
+}
+
 // 由提升后位宽+符号回构 CType（供报告复合表达式结果类型）
 // >32 一律归 long long（宁可偏宽也不下截断；无 40 位普通整型）
 inline CTypePtr int_ctype_of(unsigned bits, bool uns)
@@ -107,6 +121,72 @@ inline bool types_compatible(const CTypePtr &a, const CTypePtr &b)
 	default:
 		return a->is_unsigned == b->is_unsigned; // 基本整/浮：符号一致
 	}
+}
+
+// ============================================================
+// 口径拍板（2026-11-03）：空形参表按 C23 语义解释——`()` 等价 `(void)`（零参原型）。
+//   依据：clang -std=c23 实测 `void f(); void f(int);` 判 conflicting types；
+//     K&R 标识符表定义在 c23 下已不可解析（`int f(a) int a;` 报 unknown type name 'a'）。
+//   因此旧式非原型相容（默认实参提升豁免）整套取消，声明相容统一按原型比较。
+//   单一开关点：此常量 + parser 侧 ast.h CType::is_prototype / FuncDecl::is_prototype 记录。
+//   若未来改回 C17 口径，只需把此常量置 false 并恢复非原型相容分支（K&R 定义仍不支持）。
+// ============================================================
+inline constexpr bool decl_empty_paren_is_prototype = true;
+
+// 声明相容性判定（C 6.2.7 / 6.7.6.3，文件作用域与块作用域重声明共用）。
+//   与 types_compatible（_Generic 关联匹配）分开，二者语义不同：
+//     * 形参**顶层**限定符不影响相容（`void f(int)` ≡ `void f(const int)`）；
+//       指针目标/数组元素等嵌套层的限定符仍须一致（`int *` ≠ `const int *`）。
+//     * 空形参表按 C23 原型处理（`()` ≡ `(void)`，零参）：`f()` 与 `f(void)` 相容，
+//       与 `f(int)`/`f(char)`/`f(...)` 不相容。旧式默认实参提升豁免已取消。
+//     * 数组维度：一侧未知（0/柔性/VLA）相容，两侧已知须相等。
+//     * 返回类型保留限定符（clang：`const int f(void); int f(void);` 冲突）。
+//   ignore_qualifiers 仅供形参顶层调用点使用，其余递归一律 false。
+inline bool decl_compatible_impl(const CTypePtr &a, const CTypePtr &b, bool ignore_qualifiers)
+{
+	if (!a || !b) return false;
+	if (a->kind != b->kind) return false;
+	if (!ignore_qualifiers &&
+		(a->is_const != b->is_const || a->is_volatile != b->is_volatile ||
+		 a->is_restrict != b->is_restrict || a->is_atomic != b->is_atomic))
+		return false;
+	switch (a->kind)
+	{
+	case TypeKind::Pointer:
+		return decl_compatible_impl(a->base, b->base, false);
+	case TypeKind::Array:
+		if (a->array_size != 0 && b->array_size != 0 && a->array_size != b->array_size)
+			return false;
+		return decl_compatible_impl(a->base, b->base, false);
+	case TypeKind::Function:
+	{
+		if (!decl_compatible_impl(a->base, b->base, false)) return false; // 返回类型
+		// 原型位：C23 口径下 parser 产出的函数类型恒为 true（`()` 也记作原型）。
+		//   若某侧仍为非原型（仅在将来重新引入旧式声明时出现），按本次拍板一律判不相容，
+		//   不再提供默认实参提升豁免——这是声明相容的单一判据，不保留第二套语义。
+		if (a->is_prototype != b->is_prototype) return false;
+		if (a->is_variadic != b->is_variadic) return false;
+		if (a->params.size() != b->params.size()) return false;
+		for (std::size_t i = 0; i < a->params.size(); ++i)
+			if (!decl_compatible_impl(a->params[i], b->params[i], true)) return false;
+		return true;
+	}
+	case TypeKind::Struct:
+	case TypeKind::Union:
+	case TypeKind::Enum:
+	case TypeKind::Class:
+		return a->tag == b->tag;
+	case TypeKind::BitInt:
+		return a->bit_width == b->bit_width && a->is_unsigned == b->is_unsigned;
+	default:
+		return a->is_unsigned == b->is_unsigned;
+	}
+}
+
+// 文件作用域/块作用域重声明入口（对象或函数类型整体相容性）。
+inline bool decl_compatible(const CTypePtr &a, const CTypePtr &b)
+{
+	return decl_compatible_impl(a, b, false);
 }
 
 // 位域存储单元位宽（根据基本类型确定）
@@ -353,7 +433,8 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		return resolve_expr_type(e->args.back(), env);
 	}
 	// 三元表达式（C 标准）：任一臂为 void → 结果 void（C 标准）；两臂同 tag 的 struct/union → 该类型；
-	//   同型指针 → 该指针；其余仅在两臂类型兼容时采纳首臂，否则维持旧 nullptr 行为（最小 blast radius）。
+	//   同型指针 → 该指针；两臂均为算术类型 → 常用算术转换（usual arithmetic conversions）；
+	//   其余仅在两臂类型兼容时采纳首臂，否则维持旧 nullptr 行为。
 	if (e->kind == ExprKind::Ternary)
 	{
 		CTypePtr a = e->args.size() > 0 ? resolve_expr_type(e->args[0], env) : nullptr;
@@ -365,6 +446,25 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 			return make_type(TypeKind::Void);
 		if (a->kind == TypeKind::Struct || a->kind == TypeKind::Union)
 			return (a->kind == b->kind && !a->tag.empty() && a->tag == b->tag) ? a : nullptr;
+		// P4xx：两臂均为算术类型时按 C 常用算术转换合并结果类型：浮点秩高于整型
+		//   （float vs int → float，double 压过 float），整型对整型走 int_uac（rank/符号性：
+		//   int vs unsigned int → unsigned int、unsigned int vs long long → long long）。
+		//   旧行为「仅 types_compatible 时采纳首臂」使 `1 ? u : 0` 定型失败返回 nullptr，
+		//   转浮点时因缺 CType 回退 SIToFP，把 4294967295 折成 -1.0；其它缺型组合
+		//   （如 ULL vs int）还会让 codegen 把宽臂截成 i32。指针/空指针常量路径保持原状。
+		const bool a_arith = is_integer_kind(a->kind) || a->kind == TypeKind::Float ||
+			a->kind == TypeKind::Double;
+		const bool b_arith = is_integer_kind(b->kind) || b->kind == TypeKind::Float ||
+			b->kind == TypeKind::Double;
+		if (a_arith && b_arith)
+		{
+			if (a->kind == TypeKind::Double || b->kind == TypeKind::Double)
+				return make_type(TypeKind::Double);
+			if (a->kind == TypeKind::Float || b->kind == TypeKind::Float)
+				return make_type(TypeKind::Float);
+			IntPromo res = int_uac(int_promo_of(a, env.long_bits()), int_promo_of(b, env.long_bits()));
+			return int_ctype_of(res.bits, res.is_unsigned);
+		}
 		if (types_compatible(a, b)) return a;
 		return nullptr;
 	}

@@ -89,6 +89,10 @@ struct CType
 	// Function：返回类型用 base；参数列表 + 是否变参
 	std::vector<CTypePtr> params;
 	bool is_variadic = false;
+	// Function：本声明符是否带原型（参数类型列表）。2026-11-03 口径拍板为 C23 语义：
+	//   `()` 等价 `(void)`——空形参表即零参原型，故解析产出的函数类型恒为 true；
+	//   该位保留在 AST 上，声明相容判定统一按原型比较（旧式非原型相容已整套取消）。
+	bool is_prototype = true;
 
 	// Struct/Union/Enum（P3+）：名称
 	std::string tag;
@@ -142,13 +146,14 @@ inline CTypePtr ctype_of_string_literal(const std::string &raw)
 	}
 }
 
-inline CTypePtr make_func_type(CTypePtr ret, std::vector<CTypePtr> ps, bool variadic)
+inline CTypePtr make_func_type(CTypePtr ret, std::vector<CTypePtr> ps, bool variadic, bool prototype = true)
 {
 	auto t = std::make_shared<CType>();
 	t->kind = TypeKind::Function;
 	t->base = std::move(ret);
 	t->params = std::move(ps);
 	t->is_variadic = variadic;
+	t->is_prototype = prototype;
 	return t;
 }
 
@@ -351,6 +356,8 @@ struct FuncDecl
 	CTypePtr return_type;
 	std::vector<Param> params;
 	bool is_variadic = false;
+	// 是否带原型（C23 口径下 `()` 与 `(void)` 均为原型，恒为 true；供声明相容与诊断使用）。
+	bool is_prototype = true;
 	bool is_static = false;  // static 函数 (InternalLinkage)
 	bool is_public = false;  // P211 Co 层：public 标记 → DLL 导出（不改 linkage）
 	// P214 C23 属性：[[deprecated]] / [[lib("X")]]
@@ -564,6 +571,11 @@ struct TranslationUnit
 	// P212 Co 层：顶层 import 声明。driver 在 parse 后递归加载被导入模块、
 	//   DFS 后序拓序合并 AST 到主源 TU（本字段保留原始 import 声明供 sema 可见集构造）。
 	std::vector<ImportDecl> imports;
+	// 路 B 闭包（⑥）：module_key → 该模块自身 imports 的视图。主源存于 key=""。
+	//   merge_bundle 不把子模块 imports 并入上面的 imports（维持「不搬」不变量），
+	//   本字段是各模块 imports 视图留存到 sema/codegen 的唯一通路：子模块 typedef
+	//   referent 折的 alias.Tag 前缀，须按「当前代码归属模块」的这份视图解析。
+	std::vector<std::pair<std::string, std::vector<ImportDecl>>> module_import_views;
 	// P212 loader 诊断展示路径（环检测报路径、module not found 拼串用）。
 	//   主源 = opts.source_path 文件名；子模块 = 已解析的绝对路径文件名。不依默认行为。仅 loader 写。
 	std::string diagnostics_display_path;

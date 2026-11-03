@@ -3,6 +3,13 @@
 本记录按发布版本列出 Co（colang）语言/编译器的主要变化。
 版本策略：0.* 为开发测试版，1.* 为正式版，2.* 为自举版。
 
+## 0.5.3
+- **`winapi.co` 顶层类型别名改为可跨模块使用**：`DWORD` / `WORD` / `BYTE` / `BOOL` / `HANDLE` / `HWND` / `LPARAM` / `WNDPROC` 等 36 个别名此前未标 `public`，`import * from winapi;` 之后仍报 `use of undeclared identifier`（连用这些别名声明的变量名都会被级联报未声明）。本版全部改为 `public typedef`，导入后可直接按名声明、取用。**注意变化**：这些名字现在参与跨模块同名判定——被导入的模块与导入方各自若另写同名 `typedef` 或同名标签，会与之冲突。
+- **跨模块调用非 `public` 函数改为编译期报错**：在非根模块里调用另一模块未标 `public` 的函数（有函数体）此前编译通过、链接才报裸名 `undefined symbol: X`（无源码位置）；现在编译期即报 `cannot import non-public symbol 'X'`，并带出错行的源码上下文。判据只覆盖**带函数体且未标 `public`** 的函数；`[[lib]]` / 外部 C 库一类非 `public` 纯声明继续放行。
+- **调用参数个数检查收紧（含外部 API 声明）**：此前只有「形参数 ≥ 1 且有函数体」的函数才检查参数个数。本版起，手工声明的外部 API 原型（无函数体）与零形参函数 `int f()` / `int f(void)` 被传参同样报 `too many arguments` / `too few arguments`——此前是静默放行、按错误实参发出调用（寄存器/栈错位，`[[lib]]` 命中真实导出时连链接都能过）。`setjmp(env)` 按名豁免（其 `setjmp.h` 原型为 2 参、第二参由编译器注入）。
+- **函数原型语义取 C23 口径（`()` 等价 `(void)`）**：空形参表即零参原型，旧式「非原型声明」与非原型相容规则整套取消。`void f(void); void f(int);` 现在判声明冲突；`void f(); void f(int a) { … }`（先前兼容）现在拒收；`f()` 声明后按带参调用报 `too many arguments`。K&R 花式定义仍不支持。**注意变化**：依赖旧式非原型声明的代码会转为编译错误——这与 clang `-std=c23` 判决一致。
+- **`public typedef struct X Y;` 在非根模块内补齐类型完备性**：导入模块后对该别名的 `sizeof(Y)` / 局部 `Y y;` 此前伪报 incomplete；`p->a` 成员访问与 `f(Y h)` 值形参更会让编译器**崩溃（`0xC0000005`、零诊断）**；`Y inner;` 作 struct 值成员则在 LLVM 校验才失败。本版起别名五种形态与 `struct X` 标签形完全等价；真正的不完整类型仍在前端按 clang 同款诊断拒收。
+
 ## 0.5.2
 - **`math.h` 补齐 `long double` 版数学函数声明（C 标准全族 56 个）**：`asinhl` / `acoshl` / `atanhl` / `sqrtl` 等 `l` 后缀函数此前在 `math.h` 中**零声明**。colang 按 C 的隐式函数声明规则把未声明函数**按返回 `int` 处理**，调用点遂从整数寄存器取浮点结果——**编译、链接全部通过且零诊断，运行得到的是垃圾整数**（同一程序每次运行还可能不同）。本版补齐 56 个 `l` 后缀声明，原型逐条对照 Windows UCRT 头取真值（含 `nexttowardl` 第二参为 `long double`、`ilogbl` 返 `int`、`lrintl`/`lroundl` 返 `long`、`llrintl`/`llroundl` 返 `long long`、`scalblnl` 第二参为 `long` 等宿主特异处）。**输出正确性修复**：原先调用这些函数而取到错值的代码，现在取到正确值。
 - **新增自制最小 `complex.h`**：`#include <complex.h>` 此前因标准库无此头而直接报错。本版交付 `complex.h`，按 C 标准发出 `__STDC_NO_COMPLEX__`（如实告知实现不支持复数）。colang **仍不实现 `_Complex` / `_Imaginary` 复数类型**，本头有意**不定义 `I`**——把 `I` 定义成实数会让 `1.0 + 2.0 * I` 静默算成 `3.0`（错值且零诊断）；真写复数构造的源仍会得到显式诊断，不会退化成实数运算。只包含该头、不使用复数构造的程序现可正常编译运行。

@@ -1169,6 +1169,21 @@ struct CodeGenImpl
 		}
 	}
 
+	// 路 B 闭包（⑥）：当前桶登记 `alias.Tag` 布局键所据的 imports 视图。
+	//   主桶（空 key）＝ tu.imports（逐字维持现状、零回归）；子桶＝主 imports ∪ 本桶自有
+	//   imports（module_import_views 里 key==cur_bucket_key_ 那份）。子模块 typedef referent
+	//   折的 owner 前缀来自本桶视角，必须并入，否则 get_struct_type 落空造空 llvm::StructType。
+	std::vector<const ImportDecl *> bucket_import_view(const TranslationUnit &tu) const
+	{
+		std::vector<const ImportDecl *> v;
+		for (const auto &d : tu.imports) v.push_back(&d);
+		if (!cur_bucket_key_.empty())
+			for (const auto &kv : tu.module_import_views)
+				if (kv.first == cur_bucket_key_)
+					for (const auto &d : kv.second) v.push_back(&d);
+		return v;
+	}
+
 	// —— 翻译单元 ——
 	// --per-module：逐桶发射管线主体（全局第零遍/函数声明第一遍/drectve/定义第二遍）。
 	//   非分桶模式 in_cur_bucket 恒真，本函数与旧 gen_tu 主体逐字等价（零回归）；
@@ -1199,8 +1214,9 @@ struct CodeGenImpl
 			// P302：模块限定类型名 `mod.Tag` 的别名键——宿主写 `a.Leaf` 时按此键取该模块的
 			//   那份布局，消灭「成员未命中→GEP 0 号槽」的静默错编译（h4 族另一半）。
 			//   别名口径与 sema 同：`as ModAlias` 优先，否则文件 stem 原文。
-			for (const auto &d : tu.imports)
+			for (const ImportDecl *dp : bucket_import_view(tu))
 			{
+				const ImportDecl &d = *dp;
 				if (d.resolved_module_key.empty()) continue;
 				const std::string alias = import_alias_of(d);
 				for (const auto &sd : tu.structs)
@@ -1378,7 +1394,8 @@ struct CodeGenImpl
 			{
 				std::vector<CTypePtr> ptypes;
 				for (const auto &p : fn.params) ptypes.push_back(p.type);
-				func_cftypes_[fn.name] = make_func_type(fn.return_type, std::move(ptypes), fn.is_variadic);
+				func_cftypes_[fn.name] = make_func_type(fn.return_type, std::move(ptypes), fn.is_variadic,
+					fn.is_prototype);
 			}
 			if (!in_cur_bucket(fn.source_module_key)) continue; // 分桶：仅本桶实体建 LLVM 值
 			llvm::FunctionType *ft = to_func_type(fn);
@@ -1743,8 +1760,9 @@ struct CodeGenImpl
 			std::vector<llvm::Type *> pts;
 			for (const auto &pt : fn->params)
 				pts.push_back(sig_val_type(pt));
-			// 无原型 () 函数指针（params 空且非变参）却带实参调用：C 允许并作默认提升，
-			//   LLVM 以 ret(...) 建模，避免按 i32() 零参发射触发 verifier「参数数不符」（00209 fptr1）。
+			// 零形参函数类型（C23 口径 `()` ≡ `(void)`）却带实参调用：语义上属非法（sema 已对具名
+			//   调用报 too many arguments），此处仅保留 LLVM 形状兜底——按 ret(...) 建模，避免按零参
+			//   i32() 发射触发 verifier「参数数不符」；不构成旧式非原型相容的第二套语义。
 			bool va = fn->is_variadic;
 			if (fn->params.empty() && !va && !e->args.empty()) va = true;
 			return llvm::FunctionType::get(ret, pts, va);
@@ -2384,6 +2402,12 @@ struct CodeGenImpl
 		}
 		case ExprKind::Ternary:
 		{
+			// 浮点结果的三元不是整型常量表达式（C17 6.6p6）；直接取被选臂的整数值会跳过
+			//   结果类型 UAC 的 int→float 精度截断（`0 ? 1.5f : 16777217` 应得 16777216），
+			//   故一律回 false，由 fold_global_init 按结果类型逐臂折叠再转目标类型。
+			CTypePtr ct = get_expr_ctype(e);
+			if (ct && (ct->kind == TypeKind::Float || ct->kind == TypeKind::Double))
+				return false;
 			intmax_t c; if (!fold_int_const(e->lhs, c)) return false;
 			return c ? fold_int_const(e->args.size() > 0 ? e->args[0] : nullptr, out)
 				: fold_int_const(e->args.size() > 1 ? e->args[1] : nullptr, out);
@@ -3408,6 +3432,51 @@ struct CodeGenImpl
 		}
 	}
 
+	// 已折叠标量常量按 C 转换规则转到目标整型/浮点类型：
+	//   整型源用 src_unsigned 决定符号口径（同 uitofp/sitofp 与 zext/sext；_Bool 源恒零扩展）；
+	//   浮点→整型按标准向零截断（越界/NaN 在 C 中未定义，此处取机器截断值）。
+	//   非标量（指针/聚合）返回 nullptr，调用方保持原有 fallback 路径不变。
+	llvm::Constant *const_convert(llvm::Constant *c, llvm::Type *ty, bool src_unsigned)
+	{
+		if (!c || !ty) return nullptr;
+		llvm::Type *from = c->getType();
+		if (from == ty) return c;
+		if (auto *ci = llvm::dyn_cast<llvm::ConstantInt>(c))
+		{
+			if (ty->isFloatTy() || ty->isDoubleTy())
+			{
+				const double d = src_unsigned ? static_cast<double>(ci->getZExtValue())
+				                              : static_cast<double>(ci->getSExtValue());
+				return llvm::ConstantFP::get(ty, d);
+			}
+			if (auto *it = llvm::dyn_cast<llvm::IntegerType>(ty))
+			{
+				const unsigned w = it->getBitWidth();
+				if (w == 1) return llvm::ConstantInt::get(ty, ci->isZero() ? 0 : 1); // _Bool：非零即真
+				const llvm::APInt src = ci->getValue();
+				const llvm::APInt v = (src_unsigned || from->getIntegerBitWidth() == 1)
+					? src.zextOrTrunc(w) : src.sextOrTrunc(w);
+				return llvm::ConstantInt::get(ty, v);
+			}
+			return nullptr;
+		}
+		if (auto *cf = llvm::dyn_cast<llvm::ConstantFP>(c))
+		{
+			const double d = cf->getValueAPF().convertToDouble();
+			if (ty->isFloatTy() || ty->isDoubleTy())
+				return llvm::ConstantFP::get(ty, d); // 自带目标精度舍入（double→float 的 fptrunc）
+			if (auto *it = llvm::dyn_cast<llvm::IntegerType>(ty))
+			{
+				if (it->getBitWidth() == 1) return llvm::ConstantInt::get(ty, d != 0.0);
+				const uint64_t bits = d >= 0.0 ? static_cast<uint64_t>(d)
+					: static_cast<uint64_t>(static_cast<int64_t>(d));
+				return llvm::ConstantInt::get(ty, bits);
+			}
+			return nullptr;
+		}
+		return nullptr;
+	}
+
 	// 将初始化表达式折叠为 LLVM 常量（全局变量初始化器用）
 	llvm::Constant *fold_global_init(const ExprPtr &e, llvm::Type *ty, bool *out_folded = nullptr)
 	{
@@ -3479,6 +3548,51 @@ struct CodeGenImpl
 			}
 			// 全不中（读运行期变量等）不落 return → 交回下方通用路径与末尾 fallback（out_folded=false 不变）。
 		}
+		// 浮点操作数的显式转换（`(double)(0 ? 1.5f : 16777217)`、`(int)(...)` 一类）：
+		//   须先按操作数自身类型折叠（保住 float 臂的中间截断），再常量转换到目标类型；
+		//   整型操作数（如 `(double)0xFFFFFFFFFFFFFFFFULL`）不走此分支，下方既有路径逐字不变。
+		if (e->kind == ExprKind::Cast && e->lhs &&
+			(ty->isIntegerTy() || ty->isFloatTy() || ty->isDoubleTy()))
+		{
+			CTypePtr st = get_expr_ctype(e->lhs);
+			if (st && (st->kind == TypeKind::Float || st->kind == TypeKind::Double))
+			{
+				llvm::Type *sty = to_llvm_type(st);
+				if (sty->isFloatTy() || sty->isDoubleTy())
+				{
+					bool ok = true;
+					llvm::Constant *v = fold_global_init(e->lhs, sty, &ok);
+					if (ok)
+					{
+						if (llvm::Constant *r = const_convert(v, ty, is_unsigned_int_type(st)))
+							return r;
+					}
+				}
+			}
+		}
+		// 浮点结果的三元：两臂按 C 常用算术转换定型。整型结果仍走下方既有整型路径；
+		//   浮点结果须先折被选臂到结果类型（int 臂先转 float，`16777217`→`16777216`），
+		//   再常量转换到目标类型——旧路径直接取臂的整数值会跳过这一步。
+		if (e->kind == ExprKind::Ternary &&
+			(ty->isIntegerTy() || ty->isFloatTy() || ty->isDoubleTy()))
+		{
+			CTypePtr ct = get_expr_ctype(e);
+			intmax_t c = 0;
+			if (ct && (ct->kind == TypeKind::Float || ct->kind == TypeKind::Double) &&
+				fold_int_const(e->lhs, c))
+			{
+				const ExprPtr &arm = c ? (e->args.size() > 0 ? e->args[0] : nullptr)
+				                       : (e->args.size() > 1 ? e->args[1] : nullptr);
+				llvm::Type *rt = to_llvm_type(ct);
+				bool ok = true;
+				llvm::Constant *v = fold_global_init(arm, rt, &ok);
+				if (ok)
+				{
+					if (llvm::Constant *r = const_convert(v, ty, is_unsigned_int_type(ct)))
+						return r;
+				}
+			}
+		}
 		// 标量整型/浮点：接受整型常量表达式（含 Binary/Unary/Cast/Ternary，如 `1+1`）
 		if (ty->isIntegerTy() || ty->isFloatTy() || ty->isDoubleTy())
 		{
@@ -3489,8 +3603,11 @@ struct CodeGenImpl
 					return llvm::ConstantInt::get(ty, static_cast<uint64_t>(v));
 				// C 标准：无符号常量表达式须按值转浮点。fold_int_const 以 intmax_t 回绕，
 				// `18446744073709551615ULL` 得 -1，不重解释就会折成 -1.0（局部路径经 uitofp 正确）。
-				CTypePtr vt = get_expr_ctype(e);
-				if (!vt) vt = e->type;
+				// 显式转换到浮点时 e 自身类型已是 float/double（恒有符号），符号性须取自被转换的
+				// 源表达式：`(double)0xFFFFFFFFFFFFFFFFULL` 否则折成 -1.0（全局/静态初值）。
+				ExprPtr src = (e->kind == ExprKind::Cast && e->lhs) ? e->lhs : e;
+				CTypePtr vt = get_expr_ctype(src);
+				if (!vt && src) vt = src->type;
 				if (vt && is_unsigned_int_type(vt))
 					return llvm::ConstantFP::get(ty, static_cast<double>(static_cast<uint64_t>(v)));
 				return llvm::ConstantFP::get(ty, static_cast<double>(v));
@@ -4536,8 +4653,9 @@ struct CodeGenImpl
 					class_defs_[cd.tag] = &cd;
 			// P302：限定类名 `alias.Tag` 的别名键（与 sema 同口径）——宿主 `a.Counter` 在声明/
 			//   转换/new 处命中该模块的那份 class 定义；实体与符号名仍按 owner 定义（cd.tag）发射。
-			for (const auto &d : tu.imports)
+			for (const ImportDecl *dp : bucket_import_view(tu))
 			{
+				const ImportDecl &d = *dp;
 				if (d.resolved_module_key.empty()) continue;
 				const std::string alias = import_alias_of(d);
 				for (const auto &cd : tu.classes)
@@ -8399,17 +8517,26 @@ vla_restore_emit(0);       // P348：同上
 
 		const bool tvoid = tv->getType()->isVoidTy();
 		const bool evoid = ev->getType()->isVoidTy();
-		// 结果类型：任一臂为 void → 整体 void；否则按 C 标准统一：
-		//   同型即用；任一臂为浮点 → 取 double（整型臂 SIToFP 提升）；其余异型回退 i32（沿用旧策略）
+		// 结果类型：任一臂为 void → 整体 void；否则优先采用共享定型的常用算术转换结果
+		//   （两臂宽度/符号性与浮点秩，见 type_resolver.h 的 Ternary 分支）。缺 CType 的
+		//   旧形态仍沿用原策略（同型即用、任一浮点→double、异型回退 i32），但整型对整型
+		//   取更宽者，避免 `1 ? 0xFFFFFFFFFFFFFFFFULL : 0` 被截成 i32。
 		llvm::Type *rt = nullptr;
 		if (!tvoid && !evoid)
 		{
 			llvm::Type *tt = tv->getType();
 			llvm::Type *et = ev->getType();
-			if (tt == et)
+			CTypePtr crt = get_expr_ctype(e);
+			const bool crt_arith = crt && (is_integer_kind(crt->kind) ||
+				crt->kind == TypeKind::Float || crt->kind == TypeKind::Double);
+			if (crt_arith)
+				rt = to_llvm_type(crt);
+			else if (tt == et)
 				rt = tt;
 			else if (tt->isFloatingPointTy() || et->isFloatingPointTy())
 				rt = llvm::Type::getDoubleTy(ctx);
+			else if (tt->isIntegerTy() && et->isIntegerTy())
+				rt = tt->getIntegerBitWidth() >= et->getIntegerBitWidth() ? tt : et;
 			else
 				rt = llvm::Type::getInt32Ty(ctx);
 		}
