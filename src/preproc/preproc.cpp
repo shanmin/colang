@@ -170,7 +170,11 @@ std::string gather_msg(const std::vector<Token> &line, std::size_t from)
 // —— pp-number → 整数（供 #if 求值）——
 // 支持 0x/0X、0b/0B、八进制（前导 0）、十进制，尾部 u/U/l/L 后缀；
 // 含 '.' 或指数（e/p）等非整数形式者返回 false。
-bool parse_pp_integer(const std::string &s, std::intmax_t &out)
+// uns_out（P374）：该常数在 #if 里按 uintmax_t 还是 intmax_t 参与运算。判据照
+// clang PPExpressions.cpp 的常数分支：带 u/U 者恒无符号；无 u/U 而位模式最高
+// 位为 1（即超出 intmax_t 可表示范围、clang 的 isNegative() 检）者升为无符号。
+// l/L 后缀在 #if 语境按标准忽略，不影响符号性。
+bool parse_pp_integer(const std::string &s, std::intmax_t &out, bool *uns_out = nullptr)
 {
 	const std::size_t n = s.size();
 	if (n == 0)
@@ -225,8 +229,13 @@ bool parse_pp_integer(const std::string &s, std::intmax_t &out)
 		return false; // 前缀后无有效数字
 	}
 	const std::string digits = s.substr(start, k - start);
+	bool has_u = false;
 	while (k < n && (s[k] == 'u' || s[k] == 'U' || s[k] == 'l' || s[k] == 'L'))
 	{
+		if (s[k] == 'u' || s[k] == 'U')
+		{
+			has_u = true;
+		}
 		++k; // 整型后缀
 	}
 	if (k != n)
@@ -236,7 +245,37 @@ bool parse_pp_integer(const std::string &s, std::intmax_t &out)
 	errno = 0;
 	const unsigned long long v = std::strtoull(digits.c_str(), nullptr, base);
 	out = static_cast<std::intmax_t>(v);
+	if (uns_out != nullptr)
+	{
+		*uns_out = has_u || ((v >> 63) != 0);
+	}
 	return true;
+}
+
+// —— #if 子表达式的值（P374）——
+// 照 clang PPExpressions.cpp 的 PPValue/llvm::APSInt 模型：表达式一律按
+// intmax_t/uintmax_t 定宽（clang 取 TargetInfo::getIntMaxTWidth()＝64）承载，
+// 「值」本身只是位模式，另带一个符号位表示它按 uintmax_t 还是 intmax_t 参与
+// 运算。此前 colang 只用一个 std::intmax_t 承载，符号位在源头即丢失，故
+// 「无符号常量与负数比较」「-1u 这类回绕值参与关系运算」全部按有符号误判。
+struct PPVal
+{
+	std::uintmax_t u = 0;
+	bool uns = false; // true ⇒ uintmax_t；false ⇒ intmax_t
+	static PPVal sint(std::intmax_t v) { return PPVal{static_cast<std::uintmax_t>(v), false}; }
+	std::intmax_t sint_of() const { return static_cast<std::intmax_t>(u); }
+	bool nonzero() const { return u != 0; }
+};
+
+// 内置伪宏名清单：expand_seq 的特殊处理、#if 的 defined() 判定、#ifdef/#ifndef/
+// #elifdef/#elifndef 三条路径必须同判（clang 侧统一走 getMacroDefinition()，
+// 不存在口径分叉）。P374 前 ifdef/elifdef 只查 macros_，于是
+// #ifdef __STDC_VERSION__ 为假而 #if defined(__STDC_VERSION__) 为真。
+bool is_builtin_pseudo_macro(const std::string &name)
+{
+	return name == "__FILE__" || name == "__LINE__" || name == "__DATE__" ||
+		name == "__TIME__" || name == "__STDC__" || name == "__STDC_VERSION__" ||
+		name == "__STDC_HOSTED__";
 }
 
 // —— #if 常量表达式递归下降求值器（C 标准）——
@@ -255,8 +294,8 @@ public:
 
 	std::intmax_t eval()
 	{
-		const std::intmax_t v = parse_conditional();
-		return ok_ ? v : 0;
+		const PPVal v = parse_conditional();
+		return ok_ ? v.sint_of() : 0;
 	}
 	bool ok() const { return ok_; }
 	bool consumed() const { return i_ == end_; }
@@ -284,19 +323,19 @@ private:
 		return !at_end() && (cur().kind == TokKind::Identifier || cur().kind == TokKind::Keyword);
 	}
 
-	std::intmax_t fail(const std::string &msg)
+	PPVal fail(const std::string &msg)
 	{
 		if (ok_)
 		{
 			ok_ = false;
 			err_ = msg;
 		}
-		return 0;
+		return PPVal{};
 	}
 
-	std::intmax_t parse_conditional()
+	PPVal parse_conditional()
 	{
-		const std::intmax_t cond = parse_or();
+		const PPVal cond = parse_or();
 		if (!ok_ || !is_punct("?"))
 		{
 			return cond;
@@ -304,34 +343,39 @@ private:
 		++i_;
 		// ?: 短路（C 标准）：仅“被选中分支”正常求值，“未选中分支”仍解析以校验
 		// 语法但抑制其求值期错误（如 0/0）。c-testsuite 00145：`-1 ? 3 : (0/0)`。
-		const bool take_mid = (cond != 0);
+		const bool take_mid = cond.nonzero();
 		const bool saved = suppress_value_error_;
 		suppress_value_error_ = (saved || !take_mid);
-		const std::intmax_t mid = parse_conditional();
+		const PPVal mid = parse_conditional();
 		suppress_value_error_ = saved;
 		if (!ok_)
 		{
-			return 0;
+			return PPVal{};
 		}
 		if (!eat_punct(":"))
 		{
 			return fail("expected ':' in conditional expression");
 		}
 		suppress_value_error_ = (saved || take_mid);
-		const std::intmax_t rhs = parse_conditional();
+		const PPVal rhs = parse_conditional();
 		suppress_value_error_ = saved;
 		if (!ok_)
 		{
-			return 0;
+			return PPVal{};
 		}
-		return take_mid ? mid : rhs;
+		// ?: 的两个分支不做取值上的典型转换（选哪支就取哪支的位模式），但结果的
+		// 符号性由两支共同决定——照 clang PPExpressions.cpp：「result is unsigned
+		// if either operand is unsigned」。
+		PPVal r = take_mid ? mid : rhs;
+		r.uns = mid.uns || rhs.uns;
+		return r;
 	}
 
 	// 二元档：调用下一档并在匹配运算符处左结合折叠
-	std::intmax_t parse_binary(std::intmax_t (CondExpr::*next_level)(), const char *const *ops,
-		std::intmax_t (*combine)(std::intmax_t, std::intmax_t))
+	PPVal parse_binary(PPVal (CondExpr::*next_level)(), const char *const *ops,
+		PPVal (*combine)(PPVal, PPVal))
 	{
-		std::intmax_t lhs = (this->*next_level)();
+		PPVal lhs = (this->*next_level)();
 		while (ok_)
 		{
 			int op = -1;
@@ -348,227 +392,247 @@ private:
 			{
 				break;
 			}
-			const std::intmax_t rhs = (this->*next_level)();
+			const PPVal rhs = (this->*next_level)();
 			if (!ok_)
 			{
-				return 0;
+				return PPVal{};
 			}
 			lhs = combine(lhs, rhs);
 		}
 		return lhs;
 	}
 
-	std::intmax_t parse_or()
+	PPVal parse_or()
 	{
 		// || 短路（C 标准）：左侧非 0 时结果必为 1，右侧仅作 token 消费并
 		// 抑制其求值期错误（如 0/0），与 GCC/Clang 预处理器一致。
-		std::intmax_t lhs = parse_and();
+		PPVal lhs = parse_and();
 		while (ok_ && is_punct("||"))
 		{
 			++i_;
-			const bool dead = (lhs != 0);
+			const bool dead = lhs.nonzero();
 			const bool saved = suppress_value_error_;
 			if (dead) suppress_value_error_ = true;
-			const std::intmax_t rhs = parse_and();
+			const PPVal rhs = parse_and();
 			suppress_value_error_ = saved;
-			if (!ok_) return 0;
-			lhs = (lhs || rhs) ? 1 : 0;
+			if (!ok_) return PPVal{};
+			// 逻辑运算结果恒为 int（signed），且不参与通常算术转换
+			lhs = PPVal{(lhs.nonzero() || rhs.nonzero()) ? 1u : 0u, false};
 		}
 		return lhs;
 	}
-	std::intmax_t parse_and()
+	PPVal parse_and()
 	{
 		// && 短路（C 标准）：左侧为 0 时结果必为 0，右侧仅作 token 消费并
 		// 抑制其求值期错误。c-testsuite 00145：`0 && (0/0)` 不得报除零。
-		std::intmax_t lhs = parse_bitor();
+		PPVal lhs = parse_bitor();
 		while (ok_ && is_punct("&&"))
 		{
 			++i_;
-			const bool dead = (lhs == 0);
+			const bool dead = !lhs.nonzero();
 			const bool saved = suppress_value_error_;
 			if (dead) suppress_value_error_ = true;
-			const std::intmax_t rhs = parse_bitor();
+			const PPVal rhs = parse_bitor();
 			suppress_value_error_ = saved;
-			if (!ok_) return 0;
-			lhs = (lhs && rhs) ? 1 : 0;
+			if (!ok_) return PPVal{};
+			lhs = PPVal{(lhs.nonzero() && rhs.nonzero()) ? 1u : 0u, false};
 		}
 		return lhs;
 	}
-	std::intmax_t parse_bitor()
+	// 按位三档：位模式与符号性无关，但结果的符号性按通常算术转换取“任一侧无
+	// 符号则无符号”（照 clang PPExpressions.cpp 的 default 分支）。
+	PPVal parse_bitor()
 	{
 		static const char *const ops[] = {"|", nullptr};
 		return parse_binary(&CondExpr::parse_bitxor, ops,
-			[](std::intmax_t a, std::intmax_t b) { return a | b; });
+			[](PPVal a, PPVal b) { return PPVal{a.u | b.u, a.uns || b.uns}; });
 	}
-	std::intmax_t parse_bitxor()
+	PPVal parse_bitxor()
 	{
 		static const char *const ops[] = {"^", nullptr};
 		return parse_binary(&CondExpr::parse_bitand, ops,
-			[](std::intmax_t a, std::intmax_t b) { return a ^ b; });
+			[](PPVal a, PPVal b) { return PPVal{a.u ^ b.u, a.uns || b.uns}; });
 	}
-	std::intmax_t parse_bitand()
+	PPVal parse_bitand()
 	{
 		static const char *const ops[] = {"&", nullptr};
 		return parse_binary(&CondExpr::parse_equality, ops,
-			[](std::intmax_t a, std::intmax_t b) { return a & b; });
+			[](PPVal a, PPVal b) { return PPVal{a.u & b.u, a.uns || b.uns}; });
 	}
 	// 相等档同理需区分 == / !=，泛型 combine 拿不到具体运算符，故单独实现。
-	std::intmax_t parse_equality()
+	PPVal parse_equality()
 	{
-		std::intmax_t lhs = parse_relational();
+		PPVal lhs = parse_relational();
 		while (ok_ && (is_punct("==") || is_punct("!=")))
 		{
 			const bool eq = is_punct("==");
 			++i_;
-			const std::intmax_t rhs = parse_relational();
+			const PPVal rhs = parse_relational();
 			if (!ok_)
 			{
-				return 0;
+				return PPVal{};
 			}
-			lhs = (eq ? (lhs == rhs) : (lhs != rhs)) ? 1 : 0;
+			// 定宽二补下 ==/!= 只看位模式，与两侧符号性无关（故无需先做转换）；
+			// 结果恒为 int（signed）。
+			lhs = PPVal{(eq ? (lhs.u == rhs.u) : (lhs.u != rhs.u)) ? 1u : 0u, false};
 		}
 		return lhs;
 	}
 	// 关系档需区分 4 种子比较，泛型 parse_binary 的 combine 拿不到具体运算符，
 	// 故单独实现左结合折叠（与 parse_shift 同构）。
-	std::intmax_t parse_relational()
+	PPVal parse_relational()
 	{
-		std::intmax_t lhs = parse_shift();
+		PPVal lhs = parse_shift();
 		while (ok_ && (is_punct("<") || is_punct("<=") || is_punct(">") || is_punct(">=")))
 		{
 			const std::string op = cur().text;
 			++i_;
-			const std::intmax_t rhs = parse_shift();
+			const PPVal rhs = parse_shift();
 			if (!ok_)
 			{
-				return 0;
+				return PPVal{};
 			}
-			if (op == "<")
+			// 通常算术转换（P374 根因）：任一侧按 uintmax_t 时，两侧都按无符号比较，
+			// 于是负数位模式回绕成极大值——这是标准规定的行为，不是陷阱。
+			const bool uns = lhs.uns || rhs.uns;
+			bool res = false;
+			if (uns)
 			{
-				lhs = (lhs < rhs) ? 1 : 0;
-			}
-			else if (op == "<=")
-			{
-				lhs = (lhs <= rhs) ? 1 : 0;
-			}
-			else if (op == ">")
-			{
-				lhs = (lhs > rhs) ? 1 : 0;
+				const std::uintmax_t a = lhs.u;
+				const std::uintmax_t b = rhs.u;
+				res = (op == "<") ? (a < b) : (op == "<=") ? (a <= b) : (op == ">") ? (a > b) : (a >= b);
 			}
 			else
 			{
-				lhs = (lhs >= rhs) ? 1 : 0; // ">="
+				const std::intmax_t a = lhs.sint_of();
+				const std::intmax_t b = rhs.sint_of();
+				res = (op == "<") ? (a < b) : (op == "<=") ? (a <= b) : (op == ">") ? (a > b) : (a >= b);
 			}
+			lhs = PPVal{res ? 1u : 0u, false}; // 关系结果恒 int（signed）
 		}
 		return lhs;
 	}
 
-	std::intmax_t parse_shift()
+	PPVal parse_shift()
 	{
-		std::intmax_t lhs = parse_additive();
+		PPVal lhs = parse_additive();
 		while (ok_ && (is_punct("<<") || is_punct(">>")))
 		{
 			const bool left = is_punct("<<");
 			++i_;
-			const std::intmax_t rhs = parse_additive();
+			const PPVal rhs = parse_additive();
 			if (!ok_)
 			{
-				return 0;
+				return PPVal{};
 			}
-			if (rhs < 0 || rhs >= 64)
+			// 移位两侧不做通常算术转换（clang 同款），移位量按它自己的符号性取值。
+			const bool bad = rhs.uns ? (rhs.u >= 64) : (rhs.sint_of() < 0 || rhs.sint_of() >= 64);
+			if (bad)
 			{
 				// 短路死分支：移位越界属求值期错误，抑制后保留 lhs 继续（值被丢弃）
 				if (suppress_value_error_) { continue; }
 				return fail("shift count out of range in #if expression");
 			}
+			const unsigned sh = static_cast<unsigned>(rhs.uns ? rhs.u : static_cast<std::uintmax_t>(rhs.sint_of()));
 			if (left)
 			{
-				lhs = static_cast<std::intmax_t>(static_cast<std::uintmax_t>(lhs)
-					<< static_cast<unsigned>(rhs));
+				lhs = PPVal{lhs.u << sh, lhs.uns};
 			}
 			else
 			{
-				lhs = static_cast<std::intmax_t>(static_cast<std::uintmax_t>(lhs)
-					>> static_cast<unsigned>(rhs));
+				// 右移的符号性跟左侧：无符号⇒逻辑移位，有符号⇒算术移位（照 clang
+				// APSInt operator>>）；此前 colang 一律按逻辑移位，负数右移得错值。
+				lhs = PPVal{lhs.uns ? (lhs.u >> sh)
+						: static_cast<std::uintmax_t>(lhs.sint_of() >> sh), lhs.uns};
 			}
 		}
 		return lhs;
 	}
 
-	std::intmax_t parse_additive()
+	PPVal parse_additive()
 	{
-		std::intmax_t lhs = parse_mul();
+		PPVal lhs = parse_mul();
 		while (ok_ && (is_punct("+") || is_punct("-")))
 		{
 			const bool plus = is_punct("+");
 			++i_;
-			const std::intmax_t rhs = parse_mul();
+			const PPVal rhs = parse_mul();
 			if (!ok_)
 			{
-				return 0;
+				return PPVal{};
 			}
-			auto ua = static_cast<std::uintmax_t>(lhs);
-			auto ub = static_cast<std::uintmax_t>(rhs);
-			lhs = static_cast<std::intmax_t>(plus ? (ua + ub) : (ua - ub));
+			const bool uns = lhs.uns || rhs.uns;
+			lhs = PPVal{plus ? (lhs.u + rhs.u) : (lhs.u - rhs.u), uns};
 		}
 		return lhs;
 	}
 
-	std::intmax_t parse_mul()
+	PPVal parse_mul()
 	{
-		std::intmax_t lhs = parse_unary();
+		PPVal lhs = parse_unary();
 		while (ok_ && (is_punct("*") || is_punct("/") || is_punct("%")))
 		{
 			const char op = is_punct("*") ? '*' : (is_punct("/") ? '/' : '%');
 			++i_;
-			const std::intmax_t rhs = parse_unary();
+			const PPVal rhs = parse_unary();
 			if (!ok_)
 			{
-				return 0;
+				return PPVal{};
 			}
+			const bool uns = lhs.uns || rhs.uns; // 通常算术转换
 			if (op == '*')
 			{
-				lhs = static_cast<std::intmax_t>(static_cast<std::uintmax_t>(lhs)
-					* static_cast<std::uintmax_t>(rhs));
+				lhs = PPVal{lhs.u * rhs.u, uns};
 			}
 			else
 			{
-				if (rhs == 0)
+				if (rhs.u == 0)
 				{
 					// 短路死分支：除/模零属求值期错误，抑制后得 0 继续（值被丢弃）
-					if (suppress_value_error_) { lhs = 0; continue; }
+					if (suppress_value_error_) { lhs = PPVal{}; continue; }
 					return fail("division by zero in #if expression");
 				}
-				// INTMAX_MIN / -1 与 INTMAX_MIN % -1 在 x86 上会触发 idiv 除法溢出陷阱(SIGFPE)，
-				// 且是有符号 UB。按二补数回绕语义特判 rhs == -1：除法得 -lhs（无符号取负回绕），
-				// 取模恒为 0（任意整数除以 -1 余数为 0）；与 GCC/Clang 预处理器 -fwrapv 行为一致。
-				if (rhs == -1)
+				if (uns)
 				{
-					lhs = (op == '/')
-						? static_cast<std::intmax_t>(0ULL - static_cast<std::uintmax_t>(lhs))
-						: 0;
+					// 无符号路径：按 uintmax_t 除/模，不需下面的有符号特判
+					lhs = PPVal{(op == '/') ? (lhs.u / rhs.u) : (lhs.u % rhs.u), true};
 				}
 				else
 				{
-					lhs = (op == '/') ? (lhs / rhs) : (lhs % rhs);
+					// INTMAX_MIN / -1 与 INTMAX_MIN % -1 在 x86 上会触发 idiv 除法溢出陷阱(SIGFPE)，
+					// 且是有符号 UB。按二补数回绕语义特判 rhs == -1：除法得 -lhs（无符号取负回绕），
+					// 取模恒为 0（任意整数除以 -1 余数为 0）；与 GCC/Clang 预处理器 -fwrapv 行为一致。
+					if (rhs.sint_of() == -1)
+					{
+						lhs = PPVal{(op == '/')
+							? (0ULL - lhs.u)
+							: 0ULL, false};
+					}
+					else
+					{
+						const std::intmax_t a = lhs.sint_of();
+						const std::intmax_t b = rhs.sint_of();
+						lhs = PPVal::sint((op == '/') ? (a / b) : (a % b));
+					}
 				}
 			}
 		}
 		return lhs;
 	}
 
-	std::intmax_t parse_unary()
+	PPVal parse_unary()
 	{
 		if (is_punct("!"))
 		{
 			++i_;
-			const std::intmax_t v = parse_unary();
-			return v ? 0 : 1;
+			const PPVal v = parse_unary();
+			return PPVal{v.nonzero() ? 0u : 1u, false}; // ! 的结果恒 int（signed）
 		}
 		if (is_punct("~"))
 		{
 			++i_;
-			return ~parse_unary();
+			PPVal v = parse_unary();
+			return PPVal{~v.u, v.uns}; // 符号性随操作数
 		}
 		if (is_punct("+"))
 		{
@@ -578,14 +642,15 @@ private:
 		if (is_punct("-"))
 		{
 			++i_;
-			const std::intmax_t v = parse_unary();
-			auto u = static_cast<std::uintmax_t>(v);
-			return static_cast<std::intmax_t>(0 - u);
+			PPVal v = parse_unary();
+			// 取负不改变符号性（无符号操作数得回绕值）：-1u 仍是 uintmax 的 2^64-1。
+			// 这是 01-11（`1l > (-1u)`）此前误判真的直接原因。
+			return PPVal{0ULL - v.u, v.uns};
 		}
 		return parse_primary();
 	}
 
-	std::intmax_t parse_primary()
+	PPVal parse_primary()
 	{
 		if (at_end())
 		{
@@ -595,26 +660,27 @@ private:
 		if (t.kind == TokKind::Number)
 		{
 			std::intmax_t v = 0;
-			if (!parse_pp_integer(t.text, v))
+			bool uns = false;
+			if (!parse_pp_integer(t.text, v, &uns))
 			{
 				return fail("floating constant may not be used in #if");
 			}
 			++i_;
-			return v;
+			return PPVal{static_cast<std::uintmax_t>(v), uns};
 		}
 		if (t.kind == TokKind::Char)
 		{
 			// 字符常量在 #if/#elif 中合法（C 标准）；与 parser/codegen 同源 co_decode_char 解码，
-			//   UCN（\u/\U）同样先展开（与 parser 处同口径）。
+			//   UCN（\u/\U）同样先展开（与 parser 处同口径）。按 intmax_t 参与运算。
 			++i_;
-			return static_cast<std::intmax_t>(co_decode_char(co_expand_ucn(t.text)));
+			return PPVal::sint(static_cast<std::intmax_t>(co_decode_char(co_expand_ucn(t.text))));
 		}
 		if (eat_punct("("))
 		{
-			const std::intmax_t v = parse_conditional();
+			const PPVal v = parse_conditional();
 			if (!ok_)
 			{
-				return 0;
+				return PPVal{};
 			}
 			if (!eat_punct(")"))
 			{
@@ -650,17 +716,17 @@ private:
 					name = cur().text;
 					++i_;
 				}
-				return is_defined_(name) ? 1 : 0;
+				return PPVal{is_defined_(name) ? 1u : 0u, false}; // defined() 结果恒 int
 			}
 			if (t.text == "true")
 			{
 				++i_;
-				return 1;
+				return PPVal::sint(1);
 			}
 			if (t.text == "false")
 			{
 				++i_;
-				return 0;
+				return PPVal::sint(0);
 			}
 			// __has_include(header)
 			if (t.text == "__has_include" && has_include_)
@@ -697,7 +763,7 @@ private:
 				}
 				if (!eat_punct(")"))
 					return fail("expected ')' after __has_include header");
-				return has_include_(header) ? 1 : 0;
+				return PPVal{has_include_(header) ? 1u : 0u, false};
 			}
 			// __has_c_attribute(attr-name)：C23 标准。参数为属性名序列（如 nodiscard），
 			// 拼接所有 token 文本后交由回调判定（作用域名 :: 与未知名均不匹配 → 0）。
@@ -733,11 +799,11 @@ private:
 				}
 				if (!closed)
 					return fail("expected ')' after __has_c_attribute attribute name");
-				return has_c_attribute_(name) ? 1 : 0;
+				return PPVal{has_c_attribute_(name) ? 1u : 0u, false};
 			}
 			// 其余标识符：宏尚未展开，按未定义记 0（P1.4/P1.5 落地展开）
 			++i_;
-			return 0;
+			return PPVal::sint(0);
 		}
 		return fail("invalid token in #if expression");
 	}
@@ -1425,10 +1491,9 @@ bool Preprocessor::eval_expr(const std::vector<Token> &line, std::size_t from,
 
 	auto is_defined = [this](const std::string &name) {
 		if (macros_.count(name) > 0) return true;
-		// 内置伪宏始终视为已定义
-		return name == "__FILE__" || name == "__LINE__" || name == "__DATE__" ||
-			name == "__TIME__" || name == "__STDC__" || name == "__STDC_VERSION__" ||
-			name == "__STDC_HOSTED__";
+		// 内置伪宏始终视为已定义（名单与 #ifdef/#ifndef/#elifdef/#elifndef 共用，
+		// P374 前两侧分叉：defined() 认伪宏、ifdef 不认）
+		return is_builtin_pseudo_macro(name);
 	};
 	auto has_include = [this](const std::string &hdr) -> bool {
 		// 解析头文件名并搜索 include_dirs
@@ -1512,7 +1577,9 @@ bool Preprocessor::handle_ifdef(const std::vector<Token> &line, bool negate)
 				negate ? "#ifndef requires an identifier" : "#ifdef requires an identifier"});
 			return false;
 		}
-		const bool defined = macros_.count(line[2].text) > 0;
+		// P374：与 #if 的 defined() 同口径——内置伪宏不得只查 macros_。
+		const bool defined = macros_.count(line[2].text) > 0 ||
+			is_builtin_pseudo_macro(line[2].text);
 		active = negate ? !defined : defined;
 	}
 	cond_stack_.push_back(CondState{parent, parent && active, parent ? active : true});
@@ -1579,7 +1646,9 @@ bool Preprocessor::handle_elifdef(const std::vector<Token> &line, bool negate)
 			negate ? "#elifndef requires an identifier" : "#elifdef requires an identifier"});
 		return false;
 	}
-	const bool defined = macros_.count(line[2].text) > 0;
+	// P374：与 #if 的 defined() 同口径——内置伪宏不得只查 macros_。
+	const bool defined = macros_.count(line[2].text) > 0 ||
+		is_builtin_pseudo_macro(line[2].text);
 	const bool active = negate ? !defined : defined;
 	cs.branch_active = active;
 	cs.any_taken = active;

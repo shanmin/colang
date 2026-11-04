@@ -439,6 +439,9 @@ void harvest_tag_seeds(const std::unordered_map<std::string, TUPtr> &cache,
                        const std::vector<std::string> *only_keys = nullptr)
 {
 	std::unordered_set<std::string> seen;
+	// P371：二阶段采集的暂存——public 记录（连同所属 TU）先全量入册，布局闭包种子随后统一补，
+	//   以免采集顺序颠倒「同名 public 种子优先」：A 的内部 Ctx 不得吞掉 B 的 public Ctx。
+	std::vector<std::pair<const TranslationUnit *, const StructDef *>> closure_src;
 	auto visit = [&](const TUPtr &tu) {
 		if (!tu) return; // 主源哨兵
 		for (const auto &s : tu->structs)
@@ -455,6 +458,8 @@ void harvest_tag_seeds(const std::unordered_map<std::string, TUPtr> &cache,
 				seed.layout_size = s.layout_size;
 				seed.layout_align = s.layout_align;
 				seed.layout_member_off = s.layout_member_off;
+				// P371：记下「导出面锚点」，供下方闭包补带它按值嵌着的内部记录布局。
+				closure_src.emplace_back(tu.get(), &s);
 			}
 			out.push_back(std::move(seed));
 		}
@@ -480,14 +485,62 @@ void harvest_tag_seeds(const std::unordered_map<std::string, TUPtr> &cache,
 	};
 	if (only_keys)
 	{
+		// P371：本子模块只用直接依赖那一层，但闭包补带必须在两条派发路径上都要跑（旧写法在此
+		//   直接 return，会让子模块的 import 拿不到布局种子，同一个崩溃在子模块侧依旧）。
 		for (const auto &k : *only_keys)
 		{
 			auto it = cache.find(k);
 			if (it != cache.end()) visit(it->second);
 		}
-		return;
 	}
-	for (const auto &kv : cache) visit(kv.second);
+	else
+	{
+		for (const auto &kv : cache) visit(kv.second);
+	}
+
+	// P371：沿 public 记录的成员表把「按值嵌着、且尚未入册」的内部记录以 layout_only 补带出去
+	//   （只带 size/align、不带成员表），并顺着它自己的成员递归——这一块是导出面自洽性的补齐：
+	//   缺了它，导入方无法把该成员建成 sized 类型，外层记录整张 unsized，按值落点不是撞
+	//   LLVM verifier 就是前端 0xC0000005。布局来源优先取本 TU 的真定义；本 TU 只有 inert 种子时
+	//   （多层导入：定义在更深的模块里）退取种子自带的快照，快照逐层传 ⇒ 链不断。
+	for (const auto &cs : closure_src)
+	{
+		const TranslationUnit *tu = cs.first;
+		std::vector<std::string> q;
+		auto add_from = [&](const StructDef *d) {
+			if (!d) return;
+			for (const auto &m : d->members)
+			{
+				CTypePtr t = m.type;
+				while (t && t->kind == TypeKind::Array) t = t->base; // 数组元素同样需要 size
+				if (!t || (t->kind != TypeKind::Struct && t->kind != TypeKind::Union)) continue;
+				if (!t->tag.empty()) q.push_back(t->tag);
+			}
+		};
+		add_from(cs.second);
+		for (std::size_t i = 0; i < q.size(); ++i)
+		{
+			if (!seen.insert(q[i]).second) continue; // 环/重入守卫，兼让 public 名胜出
+			const StructDef *sd = nullptr;
+			const StructDef *inert = nullptr;
+			for (const auto &cand : tu->structs)
+			{
+				if (cand.tag != q[i]) continue;
+				if (cand.is_definition) { sd = &cand; break; }
+				if (!inert && cand.layout_size > 0) inert = &cand;
+			}
+			if (!sd) sd = inert;
+			if (!sd || sd->layout_size <= 0) continue; // 无布局可带：消费方照旧按不完整处理
+			ImportTagSeed seed;
+			seed.name = sd->tag;
+			seed.is_union = sd->is_union;
+			seed.layout_only = true;
+			seed.layout_size = sd->layout_size;
+			seed.layout_align = sd->layout_align;
+			out.push_back(std::move(seed));
+			add_from(sd); // 再嵌一层（inert 项成员表为空 ⇒ 自然止步）
+		}
+	}
 }
 
 // P256：采集各已加载子模块的 public const int 全局值（parser 已在模块 parse 期折好入

@@ -430,6 +430,13 @@ struct StructDef
 	int64_t layout_size = 0;            // 上取整到 align 后的字节数
 	int64_t layout_align = 0;           // 记录有效对齐
 	std::vector<int64_t> layout_member_off; // 与 members 等长：成员起始偏移（位域＝存储单元起点）
+	// P371：跨模块「布局闭包」标记。public 记录按值嵌着导出方自己的非 public 记录时，那份内部
+	//   记录只有布局事实（size/align）出得来、名字与字段名出不去；导入方据此把它建成 sized 的
+	//   字节记录，宿主记录才不再因成员 unsized 塌成空壳（否则 alloca/GEP/按值传参轻则撞 LLVM
+	//   verifier「must be sized」/「GEP into unsized type!」、重则前端 0xC0000005）。
+	//   本标记一律与 is_definition=false 伴行 ⇒ sema 的完整性判据（find_struct_def_by_tag）与字段核
+	//   （record_def_of）逐字按「不完整」处理：命名、字段访问照旧拒收，public 语义不外扩。
+	bool layout_only = false;
 	unsigned align = 0;   // GNU __attribute__((aligned(N))) 施加于 struct/union 类型本身（字节；0=未指定）
 	// P337：GNU __attribute__((packed)) 施于类型——其内无显式对齐成员一律按 1 对齐（不递归改写
 	//   已定义嵌套类型的内部布局；显式 _Alignas/类型级 aligned 压不住，见 clang 实测 Ha/T1/S10）。

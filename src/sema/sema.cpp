@@ -374,14 +374,21 @@ public:
 		// 路 B 阶段2-c：跨模块同名（host vs import、import vs import）共存 → 给「导入项」挂 dunder 合成符号名
 		//   `__<stem>__<name>`；host 自身项保留裸名（ambient 胜出、host 定义全局唯一）。
 		//   同模块内 prototype+definition（distinct key 唯一）不触发。消解 LLVM 链接期重复 external 符号误并（h4b b=2 根因）。
-		std::unordered_map<std::string, std::unordered_set<std::string>> fn_keys, g_keys;
-		for (const auto &f : tu->funcs) fn_keys[f.name].insert(f.source_module_key);
-		for (const auto &g : tu->globals) g_keys[g.name].insert(g.source_module_key);
+		// 判据按「定义」计、不按「声明」计（外部 C-05）：只有各模块都给出定义体才是需要
+		//   共存的两个实体；无定义体的是外部符号（CRT / [[lib]] / 隐式声明），纯声明也不构成
+		//   独立实体——它们指向同一个符号，按声明改名会把它拆成两个（`__<stem>__printf`
+		//   链接期 undefined）。模块各自预处理，任何被多个模块 include 的公共头都会产生 N 份
+		//   同名声明，故声明数不能当实体数用（同族的单一定义 + 他处 extern 声明同理）。
+		std::unordered_map<std::string, std::unordered_set<std::string>> fn_def_keys, g_def_keys;
+		for (const auto &f : tu->funcs)
+			if (f.body) fn_def_keys[f.name].insert(f.source_module_key);
+		for (const auto &g : tu->globals)
+			if (!g.is_extern) g_def_keys[g.name].insert(g.source_module_key);
 		for (auto &f : tu->funcs)
-			if (!f.source_module_key.empty() && fn_keys[f.name].size() > 1)
+			if (!f.source_module_key.empty() && fn_def_keys[f.name].size() > 1)
 				f.symbol_name = "__" + sanitize_ident(stem_of_key(f.source_module_key)) + "__" + f.name;
 		for (auto &g : tu->globals)
-			if (!g.source_module_key.empty() && g_keys[g.name].size() > 1)
+			if (!g.source_module_key.empty() && g_def_keys[g.name].size() > 1)
 				g.symbol_name = "__" + sanitize_ident(stem_of_key(g.source_module_key)) + "__" + g.name;
 	}
 
@@ -1713,6 +1720,21 @@ private:
 		return std::string();
 	}
 
+	// P371：记录定义对「当前代码所属模块」是否可见——自己的（含主源自身）或已 public 导出的。
+	//   此前主源侧由 enforce_type_visible 守、子模块侧一整块空白（那个函数开头就
+	//   `if (!cur_source_module_key_.empty()) return;`）：merge 把导出方的**非 public** 记录也摊进
+	//   同一 vector，于是 record_def_of 命中它、成员名核通过，而 codegen 的分桶登记只认
+	//   is_public——两判据分岔的后果不是报错而是静默错值（实测 `o.tag*100+o.in.a*10+o.in.b`
+	//   得 722 而非 712：`.a`/`.b` 双双落 P305 里那个「成员未命中→0 号槽」的默认分支）。
+	//   只在非主源道上加闸：主源逐字维持口径由 enforce_type_visible 守（零漂移）。
+	bool def_visible_here(const StructDef *s) const
+	{
+		if (!s) return false;
+		if (cur_source_module_key_.empty()) return true;
+		if (s->is_public) return true;
+		return s->source_module_key.empty() || s->source_module_key == cur_source_module_key_;
+	}
+
 	// P217：按 tag 查 struct/union 的「完整定义项」（is_definition=true）。
 	//   不取 structs_（可能被主源的前置引用空壳覆盖），而直接扫 main_tu_->structs。
 	const StructDef *find_struct_def_by_tag(const std::string &tag) const
@@ -1736,7 +1758,7 @@ private:
 			}
 		}
 		for (const auto &s : main_tu_->structs)
-			if (s.tag == tag && s.is_definition) return &s;
+			if (s.tag == tag && s.is_definition && def_visible_here(&s)) return &s; // P371
 		return nullptr;
 	}
 
@@ -1761,22 +1783,35 @@ private:
 			auto git = struct_defs_by_tag_.find(tag);
 			if (git != struct_defs_by_tag_.end())
 			{
+				// P371：四档候选均加可见性闸——非 public 且非本模块的定义不得参与成员名校核
+				//   与完整性判定（否则 sema 认为完整、codegen 分桶给不出字段 ⇒ 静默错值）。
 				for (const StructDef *s : git->second)
 					if (s && s->is_definition && !s->source_module_key.empty() &&
-					    s->source_module_key == cur_source_module_key_)
+					    s->source_module_key == cur_source_module_key_ && def_visible_here(s))
 						return s;
 				for (auto rit = git->second.rbegin(); rit != git->second.rend(); ++rit)
 					if (*rit && (*rit)->is_definition && (*rit)->source_module_key.empty())
 						return *rit;
 				for (auto rit = git->second.rbegin(); rit != git->second.rend(); ++rit)
-					if (*rit && (*rit)->is_definition) return *rit;
-				return git->second.back(); // 只有前置声明的空壳
+					if (*rit && (*rit)->is_definition && def_visible_here(*rit)) return *rit; // P371
+				// P371：兜底档同样过闸——「拿得到别模块的非 public 真定义」比拿不到更坏
+				//   （前者让成员名核通过、而 codegen 分桶给不出字段 ⇒ 静默错值），宁可回 nullptr
+				//   交给调用方按不完整报。主源道上 def_visible_here 恒真 ⇒ 本分支逐字维持原行为。
+				for (auto rit = git->second.rbegin(); rit != git->second.rend(); ++rit)
+					if (*rit && def_visible_here(*rit)) return *rit;
+				return nullptr;
 			}
 		}
 		auto it = structs_.find(tag);
-		if (it != structs_.end() && it->second && it->second->is_definition) return it->second;
+		// P371：下面的可见性闸只管**裸 tag**。限定名 `alias.Tag` 的可见性已由 P302/P217 的
+		//   ensure_visible_from_main 那一道守（非 public 的限定访问自有其诊断）；在此再筛会把
+		//   「跨模块 public typedef 的底层类型」一并误杀（regress p356 实测误报）。
+		const bool qualified = tag.find('.') != std::string::npos;
+		auto vis_ok = [&](const StructDef *s) { return qualified || def_visible_here(s); };
+		if (it != structs_.end() && it->second && it->second->is_definition && vis_ok(it->second))
+			return it->second; // P371
 		auto rd = real_struct_defs_.find(tag);
-		if (rd != real_struct_defs_.end()) return rd->second;
+		if (rd != real_struct_defs_.end() && vis_ok(rd->second)) return rd->second; // P371
 		if (it != structs_.end()) return it->second; // 只有前置声明的空壳
 		return nullptr;
 	}
@@ -1831,6 +1866,14 @@ private:
 			// 只有前置声明、无 {} 定义：clang 同文诊断 + 前置声明 note。
 			const std::string sp = spell_record(rec);
 			if (sd) report_with_note(loc, "incomplete definition of type " + sp, sd->loc, "forward declaration of " + sp);
+			// P371：本模块根本拿不到该记录的定义（定义在别的模块里且未 public 导出，或被上面
+			//   的可见性闸筛掉）——旧写法在这里静默 return，于是成员展开一路落到 codegen 的 0 号槽
+			//   默认分支（实测 `o.tag*100+o.in.a*10+o.in.b` 得 722 而非 712）。clang 无此形
+			//   （C 里定义可见即可展开、不可见即报下面那句同文），按同文补齐。
+			//   限定名 `alias.Tag` 不在本条之内：那条精确键由 P302 的别名登记供，查不到时仍走
+			//   原静默口径（否则跨模块 public typedef 的底层类型被误杀：regress p356）。
+			else if (rec->tag.find('.') == std::string::npos)
+				report(loc, "incomplete definition of type " + sp);
 			return;
 		}
 		if (struct_has_member(sd, field, 0)) return;

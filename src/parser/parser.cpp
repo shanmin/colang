@@ -515,6 +515,25 @@ struct Parser
 		if (!co_mode_ || !seeds_ || !cur_tu_) return;
 		for (const auto &s : *seeds_)
 		{
+			// P371：布局闭包种子（口径见 loader.h）——只把 size/align 落一条 inert 记录。
+			//   不登 seed_type_names_（那是 public 名的口径，本名对用户仍不可写），也不带
+			//   members/layout_member_off：两者同时留空才能让 layout_of 的「快照与成员等长」
+			//   判据成立（0==0）而直取快照——否则是拿空成员表去惰性推导（那会算出 4）。
+			if (s.layout_only)
+			{
+				if (s.name.empty() || struct_tags_.count(s.name) || s.layout_size <= 0) continue;
+				StructDef sd;
+				sd.tag = s.name;
+				sd.is_union = s.is_union;
+				sd.is_definition = false; // 仍是不完整类型：命名/字段访问逐字维持现口径
+				sd.is_public = false;
+				sd.layout_only = true;
+				sd.layout_size = s.layout_size;
+				sd.layout_align = s.layout_align;
+				cur_tu_->structs.push_back(std::move(sd));
+				struct_tags_[s.name] = cur_tu_->structs.size() - 1;
+				continue;
+			}
 			// P304：记下「来自其它模块」的类型名，供 public typedef 的底层引用拒收
 			if (!s.name.empty()) seed_type_names_.insert(s.name);
 			if (s.is_enum)
@@ -729,6 +748,9 @@ struct Parser
 			error(peek().loc, "expected declaration or statement");
 			skip_to_semi();
 		}
+		// P371：导出面的布局闭包——必须在整份 TU 成形后算（定义顺序不限），结果供
+		//   harvest_tag_seeds 随 public 面一并带出（函数注释里写清了为何只算布局）。
+		fill_layout_export_closure(*tu);
 		return tu;
 	}
 
@@ -1811,6 +1833,48 @@ struct Parser
 		RecordLayout lay;
 		record_layout(s, lay);
 		return lay;
+	}
+
+	// P371：导出面的「布局闭包」。public 记录按值嵌着的成员记录（含数组元素）若是本模块内部
+	//   非 public 类型，它的布局事实必须一起出得去——否则导入方把该成员建成 opaque，使宿主记录
+	//   整张 unsized，按值落点轻则撞 LLVM verifier（must be sized / GEP into unsized type!）、
+	//   重则前端 0xC0000005（PROJECT §3.2 在册那条）。此处只算布局（size/align/偏移），不改
+	//   is_public、不导出成员表：类型名与被嵌记录的字段名仍留在导出方。
+	//   与 P343 的定义点填法共存：public 那侧已填过 ⇒ layout_size>0 幂等跳过；本函数新填的都是
+	//   非 public 记录，它们原本每次走惰性推导 ⇒ 算法同源（record_layout）、结果逐字相等。
+	void fill_layout_export_closure(TranslationUnit &tu)
+	{
+		std::unordered_set<std::string> queued;
+		std::vector<std::string> queue;
+		auto push_tag = [&](const std::string &tag) {
+			if (tag.empty() || !queued.insert(tag).second) return; // 兼作环/重入守卫
+			queue.push_back(tag);
+		};
+		for (const auto &s : tu.structs)
+			if (s.is_public && s.is_definition) push_tag(s.tag);
+		for (std::size_t i = 0; i < queue.size(); ++i)
+		{
+			StructDef *sd = nullptr;
+			for (auto &cand : tu.structs)
+				if (cand.tag == queue[i] && cand.is_definition) { sd = &cand; break; }
+			if (!sd) continue; // 只有前置引用/他模块来的 inert 项：本 TU 无定义可算
+			if (sd->layout_size <= 0)
+			{
+				RecordLayout lay;
+				record_layout(*sd, lay);
+				sd->layout_size = lay.size;
+				sd->layout_align = lay.align;
+				sd->layout_member_off = std::move(lay.member_off);
+			}
+			// 按值嵌着的下一层拉进闭包（指针/函数层止步：不完整类型经指针合法）
+			for (const auto &m : sd->members)
+			{
+				CTypePtr t = m.type;
+				while (t && t->kind == TypeKind::Array) t = t->base;
+				if (!t || (t->kind != TypeKind::Struct && t->kind != TypeKind::Union)) continue;
+				push_tag(t->tag);
+			}
+		}
 	}
 
 	int64_t const_sizeof_type(const CTypePtr &t)

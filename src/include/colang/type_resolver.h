@@ -383,7 +383,15 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		//   仅用于「双侧都衰减」这一个判定，不改下面 ptr ± int 的既有行为。
 		const bool l_dec = l_ptr || (lt && lt->kind == TypeKind::Function);
 		const bool r_dec = r_ptr || (rt && rt->kind == TypeKind::Function);
-		if ((bop == "+" || bop == "-") && l_dec && r_dec) return nullptr; // ptr−ptr → ptrdiff
+		// P370（用户 2026-11-04 拍板「参照 clang」）：ptr−ptr 定型为 ptrdiff_t（LP64 = `long long`、有符号 64）。
+		//   旧此路返回 nullptr，令 codegen 的 sizeof 折叠落 `getInt32Ty` 得 **4**（clang 实测 **8**），而同
+		//   一表达式在数组维度语境走 parser `infer_auto_type` 那份又给 LongLong=8——两引擎分叉（探针
+		//   p_pp02 的 K/L 两行实证：同一份源码里 sizeof(p−q) 得 4、sizeof(char dim[sizeof(p−q)][2]) 得 16）。
+		//   与 parser `infer_auto_type` 的 ptr−ptr 分支（同给 LongLong）及 codegen `generic_controlling_type` 收敛。
+		//   整型↔整型在 sema 不判 int-conversion（只判指针↔整型），故 `int a = p - q;` 仍静默放行，不新增误报。
+		//   只改 `-`：`ptr + ptr` 非法、其诊断在 sema，维持 nullptr 不外扩。
+		if (bop == "-" && l_dec && r_dec) return int_ctype_of(64, false); // ptr−ptr → ptrdiff_t
+		if (bop == "+" && l_dec && r_dec) return nullptr;
 		if (l_ptr || r_ptr) {
 			if ((bop == "+" || bop == "-") && l_ptr != r_ptr) {
 				const CTypePtr &pt = l_ptr ? lt : rt;         // 指针操作数

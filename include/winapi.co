@@ -7,7 +7,11 @@
 //
 // 覆盖范围（起步）：函数封装 + 少量 Win32 结构布局（public struct，供 import 方按系统 ABI 构造/传参）。
 //   DLL 导出的数据符号（只有 __imp_X、无 thunk）与 per-symbol 精确绑定属未建模/后置项，
-//   故此处不纳入任何全局数据变量。全量 API 覆盖长期走 win32metadata + windows-rs 式自动生成、非手写。
+//   故此处不纳入任何全局数据变量。全量 API 覆盖长期靠自动生成、非手写。**校验链路已于 P376 改定**：
+//   不再等 win32metadata，改由本机三件套直接对账——SDK 10.0.26100.0 头经 clang AST 出原型目录、
+//   经 `-fdump-record-layouts` 出结构布局、System32 导出表出函数→库归属；入口 `_run_winapi_verify.ps1`，
+//   产物 `_tmp\p376\diff_{prototype,struct,lib,const}.csv` 与 `verify_report.txt`。该回路只登记缺陷、
+//   不改本文件；已登记者见 `HISTORY.md` P376 块。
 //
 // W 系原型参数用 const wchar_t*，依赖「右值宽字符串字面量降 UTF-16」地基
 //   （调用方以 L"…" 传参，据此报 wchar_t* 并落 UTF-16 码元）。
@@ -291,7 +295,7 @@ public const int GMEM_MOVEABLE = 0x0002;
 public const int GMEM_NOCOMPACT = 0x0010;
 public const int GMEM_ZEROINIT = 0x0040;
 public const int GPTR = 0x0040;
-public const int GHND = 0x0002;
+public const int GHND = 0x0042;   // WinBase.h:637 (GMEM_MOVEABLE|GMEM_ZEROINIT)；原误为 0x0002（只取了 MOVEABLE 一半）
 // Wait 返回值（WaitForSingleObject 的返回）
 public const int WAIT_OBJECT_0 = 0;
 public const int WAIT_ABANDONED = 0x80;
@@ -305,8 +309,8 @@ public const int TH32CS_SNAPPROCESS = 0x00000002;
 public const int TH32CS_SNAPTHREAD = 0x00000004;
 public const int TH32CS_SNAPMODULE = 0x00000008;
 public const int TH32CS_SNAPMODULE32 = 0x00000010;
-public const int TH32CS_SNAPALL = 0x00000011;
-public const int INVALID_SNAPSHOT_HANDLE = -1;
+public const int TH32CS_SNAPALL = 0x0000000F;   // TlHelp32.h:58 (HEAPLIST|PROCESS|THREAD|MODULE)；原误为 0x11（误并 SNAPMODULE32、漏 THREAD）
+// INVALID_SNAPSHOT_HANDLE 已删：SDK 全树零定义，失败哨兵真名是 INVALID_HANDLE_VALUE（本文件 L249）
 // 进程访问权限（OpenProcess 的 dwDesiredAccess）
 public const int PROCESS_QUERY_INFORMATION = 0x0400;
 public const int PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
@@ -319,7 +323,7 @@ public const int PROCESS_ALL_ACCESS = 0x1FFFFF;
 public const int FILE_MAP_COPY = 0x0001;
 public const int FILE_MAP_WRITE = 0x0002;
 public const int FILE_MAP_READ = 0x0004;
-public const int FILE_MAP_ALL_ACCESS = 0x000F;
+public const int FILE_MAP_ALL_ACCESS = 0x000F001F;   // memoryapi.h:35 → winnt.h:14957 SECTION_ALL_ACCESS；原误为 0xF（只落了低 4 位）
 // 命名管道模式（CreateNamedPipeW 的 dwOpenMode/dwPipeMode）
 public const int PIPE_ACCESS_INBOUND = 0x00000001;
 public const int PIPE_ACCESS_OUTBOUND = 0x00000002;
@@ -328,9 +332,8 @@ public const int PIPE_TYPE_BYTE = 0x00000000;
 public const int PIPE_TYPE_MESSAGE = 0x00000004;
 public const int PIPE_WAIT = 0x00000000;
 public const int NMPWAIT_WAIT_FOREVER = -1;
-// 事件复位/触发（CreateEventW 的 bManualReset）
-public const int NPIPE_SERVER_TO_CLIENT = 2;
-public const int PNP_TERMINATE = 1;
+// 管道读模式（SetNamedPipeHandleState 的 dwReadMode）
+// NPIPE_SERVER_TO_CLIENT / PNP_TERMINATE 已删：SDK 全树零定义的凭空名
 public const int PIPE_READMODE_BYTE = 0;
 public const int PIPE_REJECT_REMOTE_CLIENTS = 8;
 public const int PIPE_ACCEPT_REMOTE_CLIENTS = 0;
@@ -593,9 +596,9 @@ public unsigned int GetPrivateProfileIntW(const wchar_t *lpAppName, const wchar_
 public unsigned int GetPrivateProfileStringW(const wchar_t *lpAppName, const wchar_t *lpKeyName, const wchar_t *lpDefault, wchar_t *lpReturnedString, unsigned int nSize, const wchar_t *lpFileName);
 public void* GetStdHandle(unsigned int nStdHandle);
 // 标准句柄索引（GetStdHandle 的 nStdHandle）
-public const unsigned int STD_INPUT_HANDLE = 0xFFFFFFF5;
-public const unsigned int STD_OUTPUT_HANDLE = 0xFFFFFFF6;
-public const unsigned int STD_ERROR_HANDLE = 0xFFFFFFF7;
+public const unsigned int STD_INPUT_HANDLE = 0xFFFFFFF6;    // WinBase.h:819 ((DWORD)-10)；原误为 0xFFFFFFF5（= -11，与 OUTPUT 互换）
+public const unsigned int STD_OUTPUT_HANDLE = 0xFFFFFFF5;   // WinBase.h:820 ((DWORD)-11)；原误为 0xFFFFFFF6（= -10，取到的是输入句柄）
+public const unsigned int STD_ERROR_HANDLE = 0xFFFFFFF4;    // WinBase.h:821 ((DWORD)-12)；原误为 0xFFFFFFF7（= -9）
 public unsigned int GetSystemDirectoryA(char *lpBuffer, unsigned int uBufSize);
 public unsigned int GetSystemDirectoryW(wchar_t *lpBuffer, unsigned int uBufSize);
 public void GetSystemInfo(struct SYSTEM_INFO *lpSystemInfo);
@@ -755,7 +758,7 @@ public unsigned int SetErrorMode(unsigned int uMode);
 // 堆操作标志（HeapCreate 的 flOptions / HeapAlloc 的 dwFlags）
 public const unsigned int HEAP_GENERATE_EXCEPTIONS = 0x00000004;
 public const unsigned int HEAP_ZERO_MEMORY = 0x00000008;
-public const unsigned int HEAP_REALLOC_MEM_KEEP_INDICES = 0x00000001;
+// HEAP_REALLOC_MEM_KEEP_INDICES 已删：本 SDK（10.0.26100.0）全树零定义
 
 // 错误模式（SetErrorMode 的 uMode）
 public const unsigned int SEM_FAILCRITICALERRORS = 0x0001;
@@ -834,7 +837,7 @@ public const unsigned int BELOW_NORMAL_PRIORITY_CLASS = 0x00004000;
 public const unsigned int SYMBOLIC_LINK_FLAG_DIRECTORY = 0x1;
 
 // 线程优先级常量（GetThreadPriority/SetThreadPriority 返回值/参数）
-public const int THREAD_PRIORITY_REALTIME = 15;
+public const int THREAD_PRIORITY_TIME_CRITICAL = 15;   // WinBase.h:733 → THREAD_BASE_PRIORITY_LOWRT（winnt.h:12834）；原名 THREAD_PRIORITY_REALTIME 系凭空名，SDK 零定义
 public const int THREAD_PRIORITY_HIGHEST = 2;
 public const int THREAD_PRIORITY_ABOVE_NORMAL = 1;
 public const int THREAD_PRIORITY_NORMAL = 0;
@@ -2373,13 +2376,12 @@ public struct timeval
 [[lib("ws2_32")]] public int getsockname(unsigned long long s, struct sockaddr *name, int *namelen);
 [[lib("ws2_32")]] public int ioctlsocket(unsigned long long s, unsigned int cmd, unsigned int *argp);
 
-// —— crypt32 专用常量（CryptoAPI 字符串编解码标志；值按 crypt32.h 文档，CRYPT_STRING_* 作 int）——
+// —— crypt32 专用常量（CryptoAPI 字符串编解码标志；真值源 wincrypt.h L20922–20945，CRYPT_STRING_* 作 int）——
 public const int CRYPT_STRING_BASE64 = 0x00000001;
 public const int CRYPT_STRING_BINARY = 0x00000002;
 public const int CRYPT_STRING_HEX = 0x00000004;
 public const int CRYPT_STRING_HEXRAW = 0x0000000C;
-public const int CRYPT_STRING_NOSPACE = 0x10000000;
-public const int CRYPT_STRING_NOCRLF = 0x40000000;
+public const int CRYPT_STRING_NOCRLF = 0x40000000;   // CRYPT_STRING_NOSPACE 已删：SDK 零定义，且 0x10000000 实为 CRYPT_STRING_HASHDATA
 
 // —— crypt32：[[lib("crypt32")]] CryptoAPI 起步族（Base64/十六进制编解码，纯缓冲进出、本地可硬验证；BOOL 按 int、BYTE* 按 char*、DWORD 按 int）——
 [[lib("crypt32")]] public int CryptBinaryToStringA(const char *pbBinary, int cbBinary, int dwFlags, char *pszString, int *pcchString);

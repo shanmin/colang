@@ -642,6 +642,19 @@ struct CodeGenImpl
 		// 先创建 opaque（支持自引用）
 		auto *st = llvm::StructType::create(ctx, tname);
 		struct_types_[tag] = st;
+		// P371：布局闭包种子——本模块看不见那份记录的定义，只拿到了导出方定义点算好的布局事实。
+		//   按 [layout_size x i8] 建体（sized、可整块分配/拷贝），有效对齐另登 struct_align_，
+		//   使外层记录的手工布局把成员放到真偏移上（type_effective_align 读的就是这张表；
+		//   字节体的自然对齐为 1，靠上方 needs_manual 那条「struct_align_ > 自然对齐」的判据抬成手工布局）。
+		//   字段名不可得 ⇒ 任何 `.in.xxx` 展开在 sema 侧已被 `incomplete definition of type` 挡住，
+		//   不会走到这里取成员型。
+		if (sd->layout_only)
+		{
+			const uint64_t n = sd->layout_size > 0 ? static_cast<uint64_t>(sd->layout_size) : 1;
+			st->setBody(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), n), false);
+			struct_align_[tag] = sd->layout_align > 0 ? static_cast<unsigned>(sd->layout_align) : 1;
+			return st;
+		}
 		const auto &DL = module->getDataLayout();
 		// P337：本记录是否按 packed 布局。置位后：① 必走手工逐字节布局（LLVM 自动布局会按
 		//   自然对齐插垫）；② LLVM StructType 以 isPacked 建型——packed struct 的 ABI 对齐恒 1、
@@ -1205,8 +1218,20 @@ struct CodeGenImpl
 			struct_pos_map_.clear();
 			bitfield_access_.clear();
 			field_index_map_.clear();
+			// P371：布局闭包种子登记。放在**最先**，下方两条真定义登记按同名覆盖它（他桶 public
+			//   定义、再本桶自有定义——「本模块自引用恒绑自身布局」的既有不变量不动），故本条只兜
+			//   「本桶拿不到那份定义、而成员表里按值嵌着它」这一个形态：不登记就得不到 sized 类型。
 			for (const auto &sd : tu.structs)
-				if (!sd.tag.empty() && sd.is_definition && sd.is_public && !in_cur_bucket(sd.source_module_key))
+				if (!sd.tag.empty() && sd.layout_only && sd.layout_size > 0)
+					struct_defs_[sd.tag] = &sd;
+			// P371 补：主桶（cur_bucket_key_ 为空）就是主源视角，与 sema 侧 def_visible_here
+			//   对主源的早退同口径 —— 合并 vector 里的定义**全部**登记（含他模块的非 public）。
+			//   旧口径只认 is_public，于是主源写 `o.in.a` 时拿不到 Inner 成员表、落 P305 的
+			//   「成员未命中→GEP 0 号槽」，实测静默错值 722（真值 712）；非分桶路径本就全量
+			//   登记，故本条是把主桶拉回与单桶模式一致的旧行为（同名仍 last-wins）。
+			const bool main_bucket = cur_bucket_key_.empty();
+			for (const auto &sd : tu.structs)
+				if (!sd.tag.empty() && sd.is_definition && (main_bucket || sd.is_public) && !in_cur_bucket(sd.source_module_key))
 					struct_defs_[sd.tag] = &sd;
 			for (const auto &sd : tu.structs)
 				if (!sd.tag.empty() && sd.is_definition && in_cur_bucket(sd.source_module_key))
@@ -1227,6 +1252,10 @@ struct CodeGenImpl
 		}
 		else
 		{
+			// P371：非分桶路径同口径——闭包种子先登记、真定义随后同名覆盖（旧行为逐字不变）。
+			for (const auto &sd : tu.structs)
+				if (!sd.tag.empty() && sd.layout_only && sd.layout_size > 0)
+					struct_defs_[sd.tag] = &sd;
 			for (const auto &sd : tu.structs)
 				if (!sd.tag.empty() && sd.is_definition)
 					struct_defs_[sd.tag] = &sd;
@@ -5959,7 +5988,8 @@ vla_restore_emit(0);       // P348：同上
 	{
 		// C23 init-statement
 		if (s->init_stmt) gen_stmt(s->init_stmt, F);
-		llvm::Value *disc = to_i32(gen_expr(s->expr));
+		// C-01：控制表达式须按源符号性做整型提升，否则 `switch (u8val)` 落进负数 case 分支。
+		llvm::Value *disc = to_i32(gen_expr(s->expr), get_expr_ctype(s->expr));
 		llvm::BasicBlock *switch_end = llvm::BasicBlock::Create(ctx, "switch.end", F);
 
 		// 递归收集全部 case/default 标签（含嵌套在循环/分支体内者），各建一个 BB 并登记 case_label_bb_。
@@ -7267,6 +7297,7 @@ vla_restore_emit(0);       // P348：同上
 			llvm::Value *idx = nullptr;
 			CTypePtr lhs_t = get_expr_ctype(e->lhs);
 			CTypePtr rhs_t = get_expr_ctype(e->rhs);
+			CTypePtr idx_t;   // 下标侧 CType：加宽方向由它定（外部 C-01）
 			bool lhs_ptr = lhs_t && (lhs_t->kind == TypeKind::Array || lhs_t->kind == TypeKind::Pointer);
 			bool rhs_ptr = rhs_t && (rhs_t->kind == TypeKind::Array || rhs_t->kind == TypeKind::Pointer);
 			if (!lhs_ptr && rhs_ptr)
@@ -7276,14 +7307,16 @@ vla_restore_emit(0);       // P348：同上
 				// （CTS 0048/0053/0151 族 "SExt only operates on integer"）。
 				ptr = gen_expr(e->rhs);
 				idx = gen_expr(e->lhs);
+				idx_t = lhs_t;   // 镜像形：整数在 lhs，须赶在 lhs_t 被覆写之前取
 				lhs_t = rhs_t;
 			}
 			else
 			{
 				ptr = gen_expr(e->lhs);
 				idx = gen_expr(e->rhs);
+				idx_t = rhs_t;
 			}
-			idx = to_index(idx);
+			idx = to_index(idx, idx_t);
 			// 多维 VLA / VLA 形参（P209）：行元素含运行期维→叶类型+运行期跨距线性寻址。
 			bool rt_row = subscript_row_is_runtime(lhs_t);
 			llvm::Value *addr = gen_subscript_addr(lhs_t, ptr, idx);
@@ -7368,20 +7401,29 @@ vla_restore_emit(0);       // P348：同上
 				}
 				if (elem_sz > 1)
 					diff = builder.CreateSDiv(diff, llvm::ConstantInt::get(i64ty, elem_sz));
-				return builder.CreateTrunc(diff, llvm::Type::getInt32Ty(ctx));
+				// P370（用户 2026-11-04 拍板「参照 clang」）：ptrdiff_t 在 LP64 是有符号 64，此处**不得**收窄。
+				//   旧路在此 `trunc i64 → i32`：>2^31 的差直接符号翻转（实测 colang −2147483648 / clang 2147483648），
+				//   且消费点从此拿不到真宽（`sizeof(p-q)` 连带得 4）。clang -O0 全程不发 `trunc i64 to i32`
+				//   （探针 p_pp02 计数：colang 11 次 / clang 3 次，那 3 次是源码里本就存在的 int 窄化）。
+				//   收窄只发生在消费点，由 widen_int 的 `w > tgt_bits → CreateTrunc` 按目标类型承担。
+				return diff;
 			}
 			llvm::Value *ptr_val = nullptr;
 			llvm::Value *idx_val = nullptr;
 			CTypePtr elem_ct;
+			CTypePtr idx_ct;      // 偏移侧 CType：加宽方向由它定（外部 C-01）
+			bool idx_negated = false;
 			if (l_raw->getType()->isPointerTy())
 			{
-				ptr_val = l_raw; idx_val = to_i32(r_raw);
+				idx_ct = get_expr_ctype(e->rhs);
+				ptr_val = l_raw; idx_val = to_i32(r_raw, idx_ct);
 				CTypePtr lt = get_expr_ctype(e->lhs);
 				if (lt && (lt->kind == TypeKind::Pointer || lt->kind == TypeKind::Array)) elem_ct = lt->base;
 			}
 			else
 			{
-				ptr_val = r_raw; idx_val = to_i32(l_raw);
+				idx_ct = get_expr_ctype(e->lhs);
+				ptr_val = r_raw; idx_val = to_i32(l_raw, idx_ct);
 				CTypePtr rt = get_expr_ctype(e->rhs);
 				if (rt && (rt->kind == TypeKind::Pointer || rt->kind == TypeKind::Array)) elem_ct = rt->base;
 			}
@@ -7389,11 +7431,14 @@ vla_restore_emit(0);       // P348：同上
 			{
 				llvm::Value *neg = builder.CreateSub(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0), idx_val);
 				idx_val = neg;
+				idx_negated = true;   // 取负后值已是有符号 i32，再加宽必须 sext（与 clang 同）
 			}
 			// P330：`void *vp; vp + 1` 按 GNU 步长 1 字节（与 P314 的 `(void *)arr + 1`、P318 的
 			//   `void * - void *` 同一口径）；旧路把 unsized `void` 喂 GEP → 误拒合法 C。
 			llvm::Type *ety = pointee_llvm_type(elem_ct);
-			return builder.CreateGEP(ety, ptr_val, to_index(idx_val));
+			// 未取负时按偏移侧符号性加宽（clang 对 `unsigned int` 下标发 zext i32→i64）。
+			return builder.CreateGEP(ety, ptr_val,
+				to_index(idx_val, idx_negated ? CTypePtr{} : idx_ct));
 		}
 		// 指针参与（比较等）：沿用旧宽度基路径，保持既有 IR
 		if (l_raw->getType()->isPointerTy() || r_raw->getType()->isPointerTy())
@@ -7633,7 +7678,8 @@ vla_restore_emit(0);       // P348：同上
 			llvm::Value *iv = widen_int(raw, tgt, is_unsigned_int_type(ot));
 			return builder.CreateXor(iv, llvm::ConstantInt::get(iv->getType(), static_cast<uint64_t>(-1), true));
 		}
-		llvm::Value *v = to_i32(gen_expr(e->lhs));
+		// C-01 同族：`~u8val` 的整型提升方向亦须按源符号性（上方 _BitInt 一路已由 widen_int 接住）。
+		llvm::Value *v = to_i32(gen_expr(e->lhs), get_expr_ctype(e->lhs));
 		return v;
 	}
 
@@ -7778,11 +7824,17 @@ vla_restore_emit(0);       // P348：同上
 			{
 				llvm::Type *ptr_ty = llvm::PointerType::getUnqual(ctx);
 				llvm::Value *lhs_val = builder.CreateLoad(ptr_ty, addr);
-				llvm::Value *idx = to_i32(rhs);
+				CTypePtr idx_ct = get_expr_ctype(e->rhs);   // C-01：`p += u8val` 同须按符号性加宽
+				llvm::Value *idx = to_i32(rhs, idx_ct);
+				bool idx_negated = false;
 				if (base_op == "-")
+				{
 					idx = builder.CreateSub(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0), idx);
+					idx_negated = true;   // 取负后是有符号 i32，加宽须 sext
+				}
 				llvm::Type *ety = pointee_llvm_type(lhs_ct->base);   // P330：`vp += 1` 步长 1
-				rhs = builder.CreateGEP(ety, lhs_val, to_index(idx));
+				rhs = builder.CreateGEP(ety, lhs_val,
+					to_index(idx, idx_negated ? CTypePtr{} : idx_ct));
 			}
 			else
 			{
@@ -7924,13 +7976,13 @@ vla_restore_emit(0);       // P348：同上
 			if (!lhs_ptr && rhs_ptr)
 			{
 				ptr = gen_expr(e->rhs);
-				idx = to_index(gen_expr(e->lhs));
+				idx = to_index(gen_expr(e->lhs), lhs_t);   // 镜像形：整数在 lhs，须赶在 lhs_t 被覆写前取
 				lhs_t = rhs_t;
 			}
 			else
 			{
 				ptr = gen_expr(e->lhs);
-				idx = to_index(gen_expr(e->rhs));
+				idx = to_index(gen_expr(e->rhs), rhs_t);
 			}
 			// 下标取址：元素类型 / 运行期行跨距（多维 VLA，P209）由 gen_subscript_addr 统一处理；
 			// 本路径始终返回地址（不 load），load 与否由调用方（gen_expr）决定。
@@ -8455,42 +8507,31 @@ vla_restore_emit(0);       // P348：同上
 	}
 
 	// —— 短路求值 && / || ——
+	// 结果在 merge 块用 phi 合流（与 gen_ternary 同构、与 clang 的 land.end 形态一致）。
+	// 不走 alloca：槽若建在使用点，在循环体内就是每轮推进 rsp、永不回收（外部「§4 栈泄漏」半条）。
+	// 短路分支不需要独立块：判定块直接作为 phi 的一个前驱供常量（同 clang，共三块）。
 	llvm::Value *gen_short_circuit(const ExprPtr &e, bool is_and)
 	{
 		llvm::Function *F = builder.GetInsertBlock()->getParent();
 		llvm::Value *lhs_val = gen_cond(e->lhs);
-		// 分配结果变量
-		llvm::AllocaInst *result = builder.CreateAlloca(
-			llvm::Type::getInt1Ty(ctx), nullptr, "sc.result");
-		llvm::BasicBlock *rhs_bb = llvm::BasicBlock::Create(ctx, is_and ? "sc.rhs" : "sc.rhs", F);
-		llvm::BasicBlock *short_bb = llvm::BasicBlock::Create(ctx, is_and ? "sc.false" : "sc.true", F);
+		llvm::BasicBlock *lhs_end = builder.GetInsertBlock();   // 判定块：短路时由它直接供常量给 phi
+		llvm::BasicBlock *rhs_bb = llvm::BasicBlock::Create(ctx, "sc.rhs", F);
 		llvm::BasicBlock *merge_bb = llvm::BasicBlock::Create(ctx, "sc.merge", F);
+		llvm::ConstantInt *short_val = llvm::ConstantInt::get(
+			llvm::Type::getInt1Ty(ctx), is_and ? 0 : 1);
 		if (is_and)
-		{
-			// a && b: a false → short(false), a true → rhs(b)
-			builder.CreateCondBr(lhs_val, rhs_bb, short_bb);
-			builder.SetInsertPoint(short_bb);
-			builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx), 0), result);
-			builder.CreateBr(merge_bb);
-			builder.SetInsertPoint(rhs_bb);
-			llvm::Value *rhs_val = gen_cond(e->rhs);
-			builder.CreateStore(rhs_val, result);
-			builder.CreateBr(merge_bb);
-		}
+			builder.CreateCondBr(lhs_val, rhs_bb, merge_bb);   // a && b: a false → merge(false)
 		else
-		{
-			// a || b: a true → short(true), a false → rhs(b)
-			builder.CreateCondBr(lhs_val, short_bb, rhs_bb);
-			builder.SetInsertPoint(short_bb);
-			builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx), 1), result);
-			builder.CreateBr(merge_bb);
-			builder.SetInsertPoint(rhs_bb);
-			llvm::Value *rhs_val = gen_cond(e->rhs);
-			builder.CreateStore(rhs_val, result);
-			builder.CreateBr(merge_bb);
-		}
+			builder.CreateCondBr(lhs_val, merge_bb, rhs_bb);   // a || b: a true → merge(true)
+		builder.SetInsertPoint(rhs_bb);
+		llvm::Value *rhs_val = gen_cond(e->rhs);
+		llvm::BasicBlock *rhs_end = builder.GetInsertBlock();  // rhs 自身也可能是短路：插入点已被换块
+		builder.CreateBr(merge_bb);
 		builder.SetInsertPoint(merge_bb);
-		return builder.CreateLoad(llvm::Type::getInt1Ty(ctx), result);
+		llvm::PHINode *phi = builder.CreatePHI(llvm::Type::getInt1Ty(ctx), 2, "sc.val");
+		phi->addIncoming(short_val, lhs_end);
+		phi->addIncoming(rhs_val, rhs_end);
+		return phi;
 	}
 
 	// —— 三元 cond ? then : else ——（C 标准：仅求值被选中的一支；结果可为 void）
@@ -8546,14 +8587,14 @@ vla_restore_emit(0);       // P348：同上
 		if (rt && rt != llvm::Type::getInt32Ty(ctx))
 			tv = convert_value(tv, rt, get_expr_ctype(e->args[0]));
 		else if (rt)
-			tv = to_i32(tv);
+			tv = to_i32(tv, get_expr_ctype(e->args[0]));   // C-01 同族：与上一支 convert_value 同口径带符号性
 		builder.CreateBr(merge_bb);
 
 		builder.SetInsertPoint(else_end);
 		if (rt && rt != llvm::Type::getInt32Ty(ctx))
 			ev = convert_value(ev, rt, get_expr_ctype(e->args[1]));
 		else if (rt)
-			ev = to_i32(ev);
+			ev = to_i32(ev, get_expr_ctype(e->args[1]));
 		builder.CreateBr(merge_bb);
 
 		builder.SetInsertPoint(merge_bb);
@@ -8653,27 +8694,20 @@ vla_restore_emit(0);       // P348：同上
 		return v;
 	}
 
-	llvm::Value *to_i32(llvm::Value *v)
+	// 提升到 i32（C 整型提升等场合）。ct 为源表达式 CType，决定加宽方向；
+	//   空则落回有符号口径（sext），与旧实现逐条等价——未接 ctype 的调用点行为零变化。
+	llvm::Value *to_i32(llvm::Value *v, const CTypePtr &ct = nullptr)
 	{
-		llvm::Type *t = v->getType();
-		if (t == llvm::Type::getInt32Ty(ctx)) return v;
-		if (t->isPointerTy()) return builder.CreatePtrToInt(v, llvm::Type::getInt32Ty(ctx));
-		if (t == llvm::Type::getInt1Ty(ctx)) return builder.CreateZExt(v, llvm::Type::getInt32Ty(ctx));
-		if (t == llvm::Type::getInt8Ty(ctx)) return builder.CreateSExt(v, llvm::Type::getInt32Ty(ctx));
-		if (t->isIntegerTy() && t->getIntegerBitWidth() < 32) return builder.CreateSExt(v, llvm::Type::getInt32Ty(ctx));
-		if (t->isIntegerTy() && t->getIntegerBitWidth() > 32) return builder.CreateTrunc(v, llvm::Type::getInt32Ty(ctx));
-		return v;
+		return widen_int(v, 32, ct && is_unsigned_int_type(ct));
 	}
 
-	// 提升为 i64（用于 GEP 索引）
-	llvm::Value *to_index(llvm::Value *v)
+	// 提升为 i64（用于 GEP 索引）。外部 C-01 的根因就在这一层：旧实现除 i1/i64 外一律 sext、
+	//   不看源符号性，于是 `TAB_G[BUF_G[0]]` 的 0x80 被当成 -128，读/写均落到表前内存且零告警；
+	//   `unsigned int` 0x80000000 同族（clang 此处发 zext i32→i64）。
+	//   加宽方向交由 widen_int 单一真值源（内含 i1→zext 特判，即 CTS 0150 下标族）。
+	llvm::Value *to_index(llvm::Value *v, const CTypePtr &ct = nullptr)
 	{
-		if (v->getType() == llvm::Type::getInt64Ty(ctx)) return v;
-		// i1（&&/||/! 等逻辑/关系运算结果，C 里是 int 0/1）须零扩展：
-		// sext(i1 true)= -1 会令 arr[1&&1] 变 arr[-1] 越界（CTS 0150 下标族）。
-		if (v->getType() == llvm::Type::getInt1Ty(ctx))
-			return builder.CreateZExt(v, llvm::Type::getInt64Ty(ctx));
-		return builder.CreateSExt(v, llvm::Type::getInt64Ty(ctx));
+		return widen_int(v, 64, ct && is_unsigned_int_type(ct));
 	}
 
 	// —— VLA 多维支持（P209）——

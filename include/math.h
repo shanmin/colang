@@ -149,6 +149,18 @@ extern float fmaf(float x, float y, float z);
 extern long lroundf(float x);
 extern long long llroundf(float x);
 
+/* 漏声明补录（P372：copysign/copysignf/nan/nanf/nextafterf 五名）
+ * 修 CTS 0000_0172/0173/0174、0104_0879–0882、0112_0105、0104_0674/0675 共 10 例（copysign 面，
+ * 实测 colang OUT_MISMATCH 而 clang PASS）；本头此前只有 copysignl/nextafter/nanl，
+ * 双档与 f 档漏声明 ⇒ 走隐式声明按 int 返回、调用点读 EAX 而非 XMM0，静默错值且零诊断
+ * （探针实测 copysign(1.0,-2.0) 得 0；补原型后与 clang 逐字同值 bff0000000000000）。
+ * 原型逐条取自宿主 corecrt_math.h:532/560/584/604/606，不凭标准记忆；符号由宿主 CRT 提供（_ACRTIMP）。 */
+extern double copysign(double number, double sign);
+extern float copysignf(float number, float sign);
+extern double nan(const char *tag);
+extern float nanf(const char *tag);
+extern float nextafterf(float x, float y);
+
 /* long double 档（C 标准全族 56 名）
  * 修 CTS 0112_0112（差异恰 3 行，全在 long_asinhl/long_acoshl/long_atanh 段，余 17 行逐字正确）
  * 与 0055_0003/0055_0004/0055_0005（sqrtl 被当 int 返回、打出 NG_<每次不同的垃圾整数>）。

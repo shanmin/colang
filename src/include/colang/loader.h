@@ -42,6 +42,11 @@ struct ImportTagSeed
 	int64_t layout_size = 0;
 	int64_t layout_align = 0;
 	std::vector<int64_t> layout_member_off;
+	// P371：布局闭包种子。public 记录按值嵌着导出方的非 public 记录时，那份内部记录以本形态
+	//   补带——**只带 size/align、不带 members**（字段名属于导出方内部，带出去等于放宽 public
+	//   语义）。消费方把它建成 sized 的字节记录，使宿主记录可分配；而命名与字段访问仍按
+	//   「不完整类型」拒收（见 ast.h 的 StructDef::layout_only）。
+	bool layout_only = false;
 };
 
 // P256：加载阶段采集的 public const int 值种子。供 parser 在「parse 主源时」把
