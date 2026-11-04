@@ -4,13 +4,12 @@
 版本策略：0.* 为开发测试版，1.* 为正式版，2.* 为自举版。
 
 ## 0.5.4
-- **`ptr - ptr` 指针差修复为 64 位**：此前两个指针相减的结果被截为 32 位有符号整数（`int`），超过 2^31 的差值取到负数；同时 `sizeof(p - q)` 折成 **4**（正确为 **8**）。本版改为与 clang 一致返回 64 位有符号（`ptrdiff_t` = `long long`），`sizeof` 同步修正。**注意**：在超大数组（>2 GiB）内计算偏移差的代码，原先得到负数或错误值，现在得到正确结果。
-- **跨模块 `public struct` 含非 `public` 成员类型不再崩溃**：此前若 `public struct` 的值成员是一个未标 `public` 的 `struct`/`union`，导入侧编译器会**崩溃**（`0xC0000005`、零诊断）或发 LLVM 校验层无定位文案。本版改为：尺寸/对齐正常传递（`sizeof` 正确），但**在导入模块中展开该成员字段**按 clang 同文拒收（`incomplete definition of type '...'`），零崩溃。规避方式不变：被 `public struct` 引用的成员 struct 需一并 `public`。
-- **`math.h` 补 `copysign`/`nan`/`nextafterf` 声明（5 名）**：`copysign`、`copysignf`、`nan`、`nanf`、`nextafterf` 此前在 `include\math.h` 中**无声明**——调用点按 C 隐式声明规则当返回 `int`、实际浮点结果从整数寄存器取出，**静默错值零诊断**。本版补齐原型（逐条取自 UCRT `corecrt_math.h`），原先调用这些函数得到错值的代码现在正确。
-- **`float.h` 补 C23 浮点特性宏（9 条）**：新增 `FLT_DECIMAL_DIG`、`DBL_DECIMAL_DIG`、`LDBL_DECIMAL_DIG`、`FLT_EVAL_METHOD`（更新）、`FLT_HAS_SUBNORM`/`DBL_HAS_SUBNORM`/`LDBL_HAS_SUBNORM`、`DECIMAL_DIG`（更新）等 9 条宏定义，真值取本机 clang 23 资源头（`__float_float.h`），原先这些宏未定义导致特性探测失败。
-- **`#if` 预处理求值器支持无符号语义**：修复 `#if` 表达式中 `u`/`U` 后缀常量、超 32 位无符号值的比较/运算按有符号处理的缺陷——如 `#if 2147483648u > -1` 原先判假、现判真（与 clang 一致）。同时修复 `#ifdef`/`#elifdef` 与 `#if defined()` 对内置伪宏（`__STDC_VERSION__` 等）判定不一致的分叉。
-- **`winapi.co` 常量段修正 6 条错值 + 清 6 条凭空名**：`STD_INPUT_HANDLE`/`STD_OUTPUT_HANDLE`/`STD_ERROR_HANDLE` 三值此前**互换且偏移**（导致 `GetStdHandle(STD_OUTPUT_HANDLE)` 实际拿到输入句柄）；`GHND`、`TH32CS_SNAPALL`、`FILE_MAP_ALL_ACCESS` 值修正；6 条 SDK 中不存在的凭空名删除（其中 `THREAD_PRIORITY_REALTIME` 改名为真名 `THREAD_PRIORITY_TIME_CRITICAL`）。**使用这些常量的代码行为会改变**（原先传入了错值）。
-- **新增 Win32 校验回路（基础设施，不影响用户 API）**：五件版本化脚本（`_winapi_extract_proto.ps1` / `_winapi_extract_layout.ps1` / `_winapi_extract_libmap.ps1` / `_winapi_audit_const.ps1` / `_run_winapi_verify.ps1`）建立 SDK 原型/布局/导出表/常量四张差表自动对账，登记 20 条新缺陷，为后续 winapi.co 修正提供闸门。
+- **`ptr - ptr` 指针差修复为 64 位**：两个指针相减此前被截成 32 位整数，跨度超过 2 GiB 会得到负数或错值；现与 clang 一致返回 64 位，`sizeof(p - q)` 也从 4 修正为 8。
+- **引用 `public struct` 不再崩溃**：当 `public struct` 含未标 `public` 的成员类型时，导入方编译器此前会直接崩溃；现在能正确获得其大小，仅在展开未导出的成员字段时给出明确报错。被 `public struct` 引用的成员类型仍建议一并标 `public`。
+- **`math.h` 补齐 `copysign`、`nan`、`nextafterf` 等 5 个函数声明**：这些函数此前缺少声明，调用会被当作返回整数而静默算出错误值；现已补齐，原先得到错值的代码计算正确。
+- **`float.h` 补齐 C23 浮点特性宏**：新增 `FLT_DECIMAL_DIG`、`DBL_DECIMAL_DIG`、`FLT_EVAL_METHOD`、`FLT_HAS_SUBNORM` 等 9 条宏，供浮点特性探测使用。
+- **`#if` 支持无符号比较**：`#if` 中带 `u` 后缀或超过 32 位的无符号常量此前按有符号数处理、判断出错（如 `#if 2147483648u > -1` 判为假）；现与 clang 一致判为真。
+- **`winapi.co` 常量修正**：修正 6 条错误值（其中 `STD_INPUT_HANDLE` / `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE` 三个此前互相错位，导致 `GetStdHandle(STD_OUTPUT_HANDLE)` 取到错误的句柄），并删除 6 个 SDK 中并不存在的名称。使用这些常量的代码行为会随之改变。
 
 ## 0.5.3
 - **`winapi.co` 顶层类型别名改为可跨模块使用**：`DWORD` / `WORD` / `BYTE` / `BOOL` / `HANDLE` / `HWND` / `LPARAM` / `WNDPROC` 等 36 个别名此前未标 `public`，`import * from winapi;` 之后仍报 `use of undeclared identifier`（连用这些别名声明的变量名都会被级联报未声明）。本版全部改为 `public typedef`，导入后可直接按名声明、取用。**注意变化**：这些名字现在参与跨模块同名判定——被导入的模块与导入方各自若另写同名 `typedef` 或同名标签，会与之冲突。
