@@ -1793,6 +1793,19 @@ struct Parser
 					if (rP && !lP) return r;            // int + ptr → ptr
 					if (lP && rP) return make_type(TypeKind::LongLong); // ptr - ptr → ptrdiff_t
 				}
+				// 复数算术转换：任一侧 Complex → 结果 Complex（与实数混算升复数），
+				//   元素型取宽者：任一侧 Double 或 Complex(double) → double，否则 float。
+				bool lC = l && l->kind == TypeKind::Complex;
+				bool rC = r && r->kind == TypeKind::Complex;
+				if (lC || rC)
+				{
+					bool wide =
+						(l && l->kind == TypeKind::Double) ||
+						(r && r->kind == TypeKind::Double) ||
+						(lC && l->base && l->base->kind == TypeKind::Double) ||
+						(rC && r->base && r->base->kind == TypeKind::Double);
+					return make_complex(make_type(wide ? TypeKind::Double : TypeKind::Float));
+				}
 				bool anyD = (l && l->kind == TypeKind::Double) || (r && r->kind == TypeKind::Double);
 				bool anyF = (l && l->kind == TypeKind::Float) || (r && r->kind == TypeKind::Float);
 				if (anyD) return make_type(TypeKind::Double);
@@ -1888,6 +1901,7 @@ struct Parser
 		case TypeKind::Int: case TypeKind::Float: case TypeKind::Enum: case TypeKind::Char32: return 4;
 		case TypeKind::Long: return target.sizeof_long;
 		case TypeKind::LongLong: case TypeKind::Double: return 8;
+		case TypeKind::Complex: return 2 * const_sizeof_type(t->base); // {elem,elem}
 		case TypeKind::Pointer: return target.sizeof_pointer; // LLP64/LP64
 		// P321：函数型的 sizeof 是 GNU 扩展，clang 实测不报错且值为 **1**。
 		//   不得并入 Pointer 支：共享解析器现在能给出函数名真型，并进去即把原先静默的 4
@@ -2143,6 +2157,7 @@ struct Parser
 		case TypeKind::LongLong: case TypeKind::Double: natural = 8; break;
 		case TypeKind::Pointer: case TypeKind::Function: natural = target.sizeof_pointer; break;
 		case TypeKind::Array: natural = const_alignof_type(t->base); break;
+		case TypeKind::Complex: natural = const_alignof_type(t->base); break; // {elem,elem} 对齐同元素
 		case TypeKind::BitInt: natural = 1; break; // _BitInt 对齐 = 1
 		case TypeKind::Struct: case TypeKind::Union:
 		{
@@ -2822,7 +2837,7 @@ struct Parser
 			if (s == "void" || s == "_Bool" || s == "bool" || s == "char" || s == "short" ||
 				s == "int" || s == "long" || s == "float" || s == "double" ||
 				s == "signed" || s == "unsigned" || s == "char8_t" || s == "char16_t" ||
-				s == "char32_t" || s == "wchar_t")
+				s == "char32_t" || s == "wchar_t" || s == "_Complex")
 			{
 				++n;
 				continue;
@@ -2866,6 +2881,7 @@ struct Parser
 		bool saw_int = false, saw_float = false, saw_double = false;
 		bool saw_signed = false, saw_unsigned = false;
 		bool saw_char8 = false, saw_char16 = false, saw_char32 = false, saw_wchar = false;
+		bool saw_complex = false; // _Complex（C99 Annex G）：仅可与 float/double/long double 并现或独占（→double）
 		int long_count = 0;
 		// ADR-106：`long_count == 1` 的定型要看**首个 long token 自身的来源文件**（见 long_kind）。
 		std::string long_file;
@@ -2874,6 +2890,7 @@ struct Parser
 		//   判据与拼写对齐本机 clang 23.1.0 真值（逐条取证 _tmp/sc_probe.log：clang 容忍
 		//   `short short` / `signed signed` / `unsigned unsigned` 重复，此处一并容忍以免误杀）。
 		int n_void = 0, n_bool = 0, n_char = 0, n_short = 0, n_int = 0, n_float = 0, n_double = 0;
+		int n_complex = 0;    // _Complex 计数（至多 1）
 		int n_fixed = 0; // char8_t/char16_t/char32_t/wchar_t：恒独占，不与任何其它类型说明符共存
 		std::string prev_name; // 已见简单说明符的规范化名（clang 报 'previous "X"' 用）
 		bool has_sign = false;
@@ -2884,6 +2901,11 @@ struct Parser
 				return false;
 			if (n_void > 1 || n_bool > 1 || n_char > 1 || n_int > 1 || n_float > 1 || n_double > 1 || n_fixed > 1)
 				return false;
+			// _Complex 仅可与 float/double（含 long double）并现，或独占（combo_len>=2 时必带 float/double）；
+			//   与整型/void/_Bool/charN_t 不可组合；`long _Complex`（无 double）非法（只有 long double _Complex）。
+			if (n_complex > 1) return false;
+			if (n_complex && (n_int || n_char || n_bool || n_void || n_short || n_fixed)) return false;
+			if (n_complex && long_count && !n_double) return false;
 			if (long_count > 2 || n_short > 2) return false; // long 至两个，short 至一个（容忍 clang 式重复）
 			if (n_short && long_count) return false;         // short 与 long 不共存
 			if (n_float && (long_count || n_double || n_short || n_char || n_int || n_bool || n_void))
@@ -2927,6 +2949,7 @@ struct Parser
 			}
 			else if (match_keyword("float")) { saw_float = true; add_simple(kloc, "float", n_float); }
 			else if (match_keyword("double")) { saw_double = true; add_simple(kloc, "double", n_double); }
+			else if (match_keyword("_Complex")) { saw_complex = true; add_simple(kloc, "_Complex", n_complex); }
 			// 四名处于声明符名位（其前已有别的简单说明符）：整体退出说明符收集，
 			//   把该 token 留给声明符（clang 同形，取证 _tmp/p4_wchar_probe.log）。
 			else if ((check_keyword("char8_t") || check_keyword("char16_t") ||
@@ -2967,6 +2990,7 @@ struct Parser
 		{
 			const std::string bad = saw_double ? std::string("double")
 				: saw_float ? std::string("float")
+				: saw_complex ? std::string("_Complex")
 				: saw_bool ? std::string("bool")
 				: saw_void ? std::string("void")
 				: saw_char8 ? std::string("char8_t")
@@ -2990,6 +3014,16 @@ struct Parser
 		else if (saw_float) k = TypeKind::Float;
 		else if (saw_short) k = TypeKind::Short;
 		else if (saw_int) k = TypeKind::Int;
+		// _Complex：float 元素→float _Complex，double/long double/无其它浮点说明符→double _Complex。
+		//   （独占 `_Complex` 不带浮点说明符的情形 combo_len==1、走线性分支，不在此处。）
+		if (saw_complex)
+		{
+			auto ct = make_complex(make_type(saw_float ? TypeKind::Float : TypeKind::Double));
+			ct->is_const = cnst;
+			ct->is_volatile = vol;
+			ct->is_atomic = ato;
+			return ct;
+		}
 		auto t = make_type(k, cnst);
 		t->is_volatile = vol;
 		t->is_atomic = ato;
@@ -3167,6 +3201,25 @@ struct Parser
 			return make_type(TypeKind::Float, cnst);
 		if (match_keyword("double"))
 			return make_type(TypeKind::Double, cnst);
+		// 独立 `_Complex`（不带 float/double；否则 combo_len>=2 走 combo 分支）：
+		//   clang 发 warning "plain '_Complex' requires a type specifier; assuming '_Complex double'"、类型按 double。
+		if (check_keyword("_Complex"))
+		{
+			const SourceLoc kl = peek().loc;
+			advance();
+			warn(kl, "plain '_Complex' requires a type specifier; assuming '_Complex double'", "");
+			auto ct = make_complex(make_type(TypeKind::Double));
+			ct->is_const = cnst; ct->is_volatile = vol; ct->is_atomic = ato;
+			return ct;
+		}
+		// `_Imaginary`：承现状与 clang 同拒（"imaginary types are not supported"）；本批不做独立虚数类型。
+		if (check_keyword("_Imaginary"))
+		{
+			const SourceLoc kl = peek().loc;
+			advance();
+			error(kl, "imaginary types are not supported");
+			return make_type(TypeKind::Double, cnst); // 恢复：吐个标量型以免级联报错
+		}
 		// struct / union
 		if (check_keyword("struct") || check_keyword("union"))
 		{
@@ -4988,6 +5041,7 @@ struct Parser
 			t.text == "_Static_assert" || t.text == "_Atomic" ||
 			t.text == "auto" || t.text == "bool" || t.text == "constexpr" ||
 			t.text == "typeof" || t.text == "typeof_unqual" || t.text == "_BitInt" ||
+			t.text == "_Complex" || t.text == "_Imaginary" ||
 			t.text == "thread_local" || t.text == "public" || t.text == "class")
 			return true;
 		// typedef 名
@@ -5016,6 +5070,7 @@ struct Parser
 			s == "const" || s == "volatile" || s == "struct" || s == "union" ||
 			s == "enum" || s == "_Bool" || s == "bool" ||
 			s == "_BitInt" || s == "typeof" || s == "typeof_unqual" ||
+			s == "_Complex" || s == "_Imaginary" ||
 			s == "constexpr" || s == "_Atomic")
 			return true;
 		if (typedefs_.count(s)) return true;
@@ -5897,6 +5952,19 @@ struct Parser
 				auto e = std::make_shared<Expr>();
 				e->kind = ExprKind::ThisRef;
 				e->loc = t.loc;
+				return e;
+			}
+			// C99 虚数单位 `_Complex_I`（clang 内置常量，值 {0,1}、类型 double _Complex）：
+			//   作 Call 到魔法内建 `__colang_complex_i`（sema 跳过可见性/元数、codegen 折成 {0.0,1.0}）。
+			//   `I` 经 <complex.h> 宏 `#define I _Complex_I` 展开到此。
+			if (t.text == "_Complex_I")
+			{
+				advance();
+				auto e = std::make_shared<Expr>();
+				e->kind = ExprKind::Call;
+				e->loc = t.loc;
+				e->name = "__colang_complex_i";
+				e->type = make_complex(make_type(TypeKind::Double));
 				return e;
 			}
 		}

@@ -54,6 +54,7 @@
 #include <llvm/Target/CGPassBuilderOption.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
+#include <llvm/Support/CodeGen.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 
 #include "colang/codegen.h"
@@ -212,6 +213,9 @@ struct CodeGenImpl
 	// 路 B 阶段3：产出形态——`-o *.dll` 判定（driver→codegen 透传）。为真时入口合成
 	//   从 main 改合成 DllMain（顶层初始化载体）；exe 恒 false、与旧逐字等价。
 	bool output_is_dll_ = false;                     // generate() 从 opts 注入
+	// 路 B / P381：ELF 共享对象产出——`-o *.so` 判定（driver→codegen 透传）。为真时 emit 走
+	//   PIC 下降、入口合成改走 .init_array 载体（synthesize_init_ctor）；exe/.dll/纯 C 恒 false。
+	bool output_is_so_ = false;                      // generate() 从 opts 注入
 	// 路 B 阶段3：`.co` 新面标志（仅 .co 的 WinMain/DllMain 载体参与顶层初始化捕获，
 	//   纯 C 档恒 false、逐字不变）。
 	bool is_co_ = false;                             // generate() 从 opts 注入
@@ -222,6 +226,9 @@ struct CodeGenImpl
 	const TranslationUnit *cur_tu_ = nullptr;
 	// P306：合并后主 TU 视图（限定访问 `m.K` 按 import 限定名回查目标全局；见 const_global_ref_init）。
 	const TranslationUnit *tu_view_ = nullptr;
+	// P380 链接期诊断旁路表：外部符号引用点（键＝最终发射符号名、含 dunder）。
+	//   generate() 末尾 std::move 进 state.sym_refs，供链接层失败时反查回填源码坐标。
+	std::unordered_map<std::string, std::vector<SymRef>> sym_refs_;
 	std::unordered_map<std::string, std::string> gdef_bucket_; // 全局变量名 → 定义桶 key（仅分桶模式填）
 	std::vector<std::string> imported_init_names_; // 拓序排列的各导入桶 __init__ 函数名（仅分桶模式填）
 	// 顶层非恒定运行的 pending store 条目（P219；自 gen_tu 局部升格供分桶复用）
@@ -277,11 +284,15 @@ struct CodeGenImpl
 	// 统一函数引用决议：本桶已有→直用；非分桶→旧 getFunction 语义逐字等价；
 	//   分桶且他桶有定义/原型→当前桶造 External 声明（链接器归并定义）。
 	// 路 B 阶段2-c：入参为裸名，内部解析为应使用的 LLVM 符号（symbol_name 命中时用之）。
-	llvm::Function *func_ref(const std::string &nm)
+	// P380：`loc` 非空时（调用点提供源码位置）over-record 该符号引用，供链接诊断反查。
+	llvm::Function *func_ref(const std::string &nm, const SourceLoc *loc = nullptr)
 	{
 		const std::string sym = resolve_func_symbol(nm);
 		if (llvm::Function *F = module->getFunction(sym))
+		{
+			record_sym_ref(sym, loc);
 			return F;
+		}
 		if (!per_module_)
 			return nullptr;
 		auto it = canon_.find(nm);
@@ -291,13 +302,22 @@ struct CodeGenImpl
 		llvm::FunctionCallee FC = module->getOrInsertFunction(sym, ft);
 		if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee()))
 			F->addFnAttr("uwtable");
-		return llvm::dyn_cast<llvm::Function>(FC.getCallee());
+		auto *RF = llvm::dyn_cast<llvm::Function>(FC.getCallee());
+		record_sym_ref(sym, loc);
+		return RF;
 	}
 
-	// 路 B 阶段2-c：定义/引用统一符号名（symbol_name 空→裸名；默认路径恒空、逐字等价）。
-	static std::string func_symbol(const FuncDecl &fn)
+	// 路 B 阶段2-c：定义/引用统一符号名——查合并 TU 上的单元级单真值表 symbol_table[(mod,name)]，
+	//   命中即 dunder 合成名、未命中回退裸名；默认路径（非分桶/表空）恒回退裸名，与旧
+	//   「symbol_name 空→name」逐字等价（谓词只依赖 (mod,name)，取值点返回串不变）。
+	std::string func_symbol(const FuncDecl &fn) const
 	{
-		return fn.symbol_name.empty() ? fn.name : fn.symbol_name;
+		if (cur_tu_)
+		{
+			auto it = cur_tu_->symbol_table.find(symbol_table_key(fn.source_module_key, fn.name));
+			if (it != cur_tu_->symbol_table.end()) return it->second;
+		}
+		return fn.name;
 	}
 	// 路 B 阶段2-c：分桶下把裸名解析为应使用的 LLVM 符号——本桶自有 decl 优先，其次 canon_ 目标；
 	//   非分桶恒返回裸名（默认路径零改动）。
@@ -336,24 +356,36 @@ struct CodeGenImpl
 		return gvar;
 	}
 
-	// 路 B 阶段1b-iii：全局变量统一符号名（symbol_name 空→裸名；与函数 func_symbol 同口径）。
-	//   仅作 LLVM GlobalVariable 的**发射名**，内部 globals_/global_types_ 仍按裸名键控（零回归）。
-	static std::string global_symbol(const GlobalVar &gv)
+	// 路 B 阶段1b-iii：全局变量统一符号名——查 symbol_table[(mod,name)]，命中即 dunder、未命中回退裸名
+	//   （与函数 func_symbol 同口径）。仅作 LLVM GlobalVariable 的**发射名**，内部 globals_/global_types_
+	//   仍按裸名键控（零回归）。
+	std::string global_symbol(const GlobalVar &gv) const
 	{
-		return gv.symbol_name.empty() ? gv.name : gv.symbol_name;
+		if (cur_tu_)
+		{
+			auto it = cur_tu_->symbol_table.find(symbol_table_key(gv.source_module_key, gv.name));
+			if (it != cur_tu_->symbol_table.end()) return it->second;
+		}
+		return gv.name;
 	}
 
 	// 路 B 阶段1b-iii：限定访问目标函数引用（按 symbol 解析，他桶定义经 linkInModule 归并）。
-	llvm::Function *qualified_func_ref(const FuncDecl *f)
+	// P380：`loc` 非空时 over-record 引用点（供链接诊断反查）。
+	llvm::Function *qualified_func_ref(const FuncDecl *f, const SourceLoc *loc = nullptr)
 	{
 		const std::string sym = func_symbol(*f);
 		if (llvm::Function *F = module->getFunction(sym))
+		{
+			record_sym_ref(sym, loc);
 			return F;
+		}
 		llvm::FunctionType *ft = to_func_type(*f);
 		llvm::FunctionCallee FC = module->getOrInsertFunction(sym, ft);
 		if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee()))
 			F->addFnAttr("uwtable");
-		return llvm::cast<llvm::Function>(FC.getCallee());
+		auto *RF = llvm::cast<llvm::Function>(FC.getCallee());
+		record_sym_ref(sym, loc);
+		return RF;
 	}
 
 	// 路 B 阶段1b-iii：限定访问目标全局变量取址（他桶定义→本造 External 声明，合并后由链接器归并）。
@@ -365,12 +397,27 @@ struct CodeGenImpl
 		if (!g) return nullptr;
 		const std::string sym = global_symbol(*g);
 		if (llvm::GlobalVariable *gv = module->getGlobalVariable(sym))
+		{
+			record_sym_ref(sym, &e->loc);
 			return gv;
+		}
 		llvm::Type *ty = g->type ? to_llvm_alloca_type(g->type)
 			: llvm::Type::getInt32Ty(ctx); // 类型缺失兵底（不应发生，sema 已拦 void）
 		auto *gvar = new llvm::GlobalVariable(*module, ty, false,
 			llvm::GlobalValue::ExternalLinkage, nullptr, sym);
+		record_sym_ref(sym, &e->loc);
 		return gvar;
+	}
+
+	// P380：登记一处外部符号引用点（over-record）。仅在取得调用点源码位置时记录；
+	//   同一符号引用点上限 32，避免热点外部符号（如 printf）被大量调用时表膨胀。
+	//   键为最终发射符号名（与 lld 报的 undefined symbol 同轴）；本桶已定义的内部符号
+	//   不会出现在链接期 undefined 列表，故 over-record 无害。
+	void record_sym_ref(const std::string &sym, const SourceLoc *loc)
+	{
+		if (sym.empty() || !loc) return;
+		auto &v = sym_refs_[sym];
+		if (v.size() < 32) v.push_back(SymRef{ loc->file, loc->line, loc->column });
 	}
 
 	CodeGenImpl(const std::string &mod_name, const TargetInfo &tgt, std::vector<Error> &errors)
@@ -443,7 +490,10 @@ struct CodeGenImpl
 			return llvm::IntegerType::get(ctx, t->bit_width);
 		case TypeKind::Struct:
 		case TypeKind::Union:
-			// struct/union 在值上下文中按 pointer 处理（参数传递/返回）
+		case TypeKind::Complex:
+			// struct/union/复数 在值上下文中按 pointer 处理（参数传递/返回）。
+			//   _Complex 复用现成聚合体链（P352 sig_val_type/win64_agg_abi_type）：colang
+			//   「复数表达式值 = 指向 {elem,elem} 存储的指针」不变量与 struct 同构。
 			return llvm::PointerType::getUnqual(ctx);
 		case TypeKind::Class:
 			// P300 Co class：heap-only 引用语义，变量持有句柄（指针）
@@ -463,6 +513,16 @@ struct CodeGenImpl
 		return llvm::Type::getInt32Ty(ctx);
 	}
 
+	// _Complex 的存储形态：匿名 `{elem, elem}` struct（LLVM 23 无 ComplexType，与 clang 同降 {T,T}）。
+	//   元素型取自 CType::base（Float→float、Double→double）。LLVM 对匿名 struct 按内容唯一化。
+	llvm::StructType *complex_llvm_struct(const CTypePtr &t)
+	{
+		llvm::Type *elem = (t && t->base && t->base->kind == TypeKind::Float)
+		                       ? static_cast<llvm::Type *>(llvm::Type::getFloatTy(ctx))
+		                       : static_cast<llvm::Type *>(llvm::Type::getDoubleTy(ctx));
+		return llvm::StructType::get(ctx, {elem, elem});
+	}
+
 	// 用于 alloca 的实际类型（数组保留 ArrayType，struct 保留 StructType）
 	llvm::Type *to_llvm_alloca_type(const CTypePtr &t)
 	{
@@ -474,6 +534,8 @@ struct CodeGenImpl
 		}
 		if (t->kind == TypeKind::Struct || t->kind == TypeKind::Union)
 			return get_struct_type(t->tag);
+		if (t->kind == TypeKind::Complex)
+			return complex_llvm_struct(t);
 		return to_llvm_type(t);
 	}
 
@@ -514,6 +576,14 @@ struct CodeGenImpl
 			unsigned a = static_cast<unsigned>(DL.getABITypeAlign(lt).value());
 			auto sa = struct_align_.find(t->tag);
 			if (sa != struct_align_.end() && sa->second > a) a = sa->second;
+			if (t->align > a) a = t->align;
+			return a;
+		}
+		if (t->kind == TypeKind::Complex)
+		{
+			// 复数对齐 = 其 {elem,elem} 匿名 struct 的自然对齐（float complex→4、double complex→8）。
+			llvm::Type *lt = complex_llvm_struct(t);
+			unsigned a = static_cast<unsigned>(DL.getABITypeAlign(lt).value());
 			if (t->align > a) a = t->align;
 			return a;
 		}
@@ -895,7 +965,19 @@ struct CodeGenImpl
 	//   （隐指针），与 colang 旧「降 ptr」一致，故回 nullptr 表示维持旧口径。
 	llvm::Type *win64_agg_abi_type(const CTypePtr &t)
 	{
-		if (!t || (t->kind != TypeKind::Struct && t->kind != TypeKind::Union))
+		if (!t) return nullptr;
+		if (t->kind == TypeKind::Complex)
+		{
+			// float _Complex {float,float}=8B → i64（与 clang winx64 同形，probe.mk_f/f_add 实测）；
+			//   double _Complex {double,double}=16B → nullptr（按参考传/返，与 clang sret/ptr 同）。
+			uint64_t sz = module->getDataLayout().getTypeStoreSize(complex_llvm_struct(t));
+			if (sz == 1) return llvm::Type::getInt8Ty(ctx);
+			if (sz == 2) return llvm::Type::getInt16Ty(ctx);
+			if (sz == 4) return llvm::Type::getInt32Ty(ctx);
+			if (sz == 8) return llvm::Type::getInt64Ty(ctx);
+			return nullptr;
+		}
+		if (t->kind != TypeKind::Struct && t->kind != TypeKind::Union)
 			return nullptr;
 		uint64_t sz = module->getDataLayout().getTypeStoreSize(get_struct_type(t->tag));
 		if (sz == 1) return llvm::Type::getInt8Ty(ctx);
@@ -1130,6 +1212,63 @@ struct CodeGenImpl
 		}
 	}
 
+	// 路 B / P381：.co 产 ELF 共享对象（-o *.so）的顶层初始化载体——新建 void @__co_init()，
+	//   entry 内跑 emit_top_level_init（与 main/DllMain/WinMain 共用同一初始化序），收尾 ret void；
+	//   再把 @__co_init 追加进 @llvm.global_ctors（section .init_array，加载期由动态链接器执行）。
+	void synthesize_init_ctor(const TranslationUnit &tu, std::vector<TlPendingInit> &tl_pending_inits)
+	{
+		llvm::Type *VoidTy = llvm::Type::getVoidTy(ctx);
+		llvm::FunctionType *ft = llvm::FunctionType::get(VoidTy, /*Params=*/{}, /*isVarArg=*/false);
+		auto *F = llvm::Function::Create(ft, llvm::GlobalValue::InternalLinkage,
+			"__co_init", module.get());
+		F->addFnAttr("uwtable");
+		{
+			auto saved_vars = vars_;
+			auto saved_types = var_types_;
+			vars_.clear();
+			var_types_.clear();
+			loop_stack_.clear();
+			label_blocks_.clear();
+			case_label_bb_.clear();
+			pending_gotos_.clear();
+			label_rc_depth_.clear();
+			label_vla_depth_.clear();
+			vla_frames_.assign(1, nullptr);
+			cur_func_name_ = "__co_init";
+			rc_frames_.clear();
+			rc_frames_.emplace_back(); // 顶层 RC 帧（与合成初始化体同生命周期）
+			auto *entry = llvm::BasicBlock::Create(ctx, "entry", F);
+			builder.SetInsertPoint(entry);
+			in_synthesized_main_body_ = true;
+			emit_top_level_init(tu, tl_pending_inits, F);
+			in_synthesized_main_body_ = false;
+			llvm::BasicBlock *cur = builder.GetInsertBlock();
+			if (!cur || cur->empty() || !cur->back().isTerminator())
+				builder.CreateRetVoid();
+			for (llvm::BasicBlock &bb : *F)
+				if (bb.empty()) { builder.SetInsertPoint(&bb); builder.CreateUnreachable(); }
+			tl_pending_inits.clear(); // 已消费
+			vars_ = std::move(saved_vars);
+			var_types_ = std::move(saved_types);
+			cur_func_name_.clear();
+		}
+		// 把 @__co_init 登记为一条 .init_array 记录：对象层 .init_array 存放裸函数指针，
+		//   lld 据该段生成 DT_INIT_ARRAY、动态链接器在加载/dlopen 期逐个调用。
+		//   用普通 InternalLinkage 全局 + 显式 section（而非 llvm.global_ctors/AppendingLinkage）：
+		//   后者受 Appending 仅允许 llvm.* 特殊名约束、且本精简 codegen 管线不触发其后端下降，
+		//   实测会把该全局整体丢弃；裸指针数组直落 .init_array 段则端到端可靠。@__co_init 被本
+		//   数组引用而保活；管线无 DCE，InternalLinkage 定义照常发射、不外泄到 .dynsym。
+		{
+			llvm::Type *PtrTy = llvm::PointerType::getUnqual(ctx);
+			llvm::ArrayType *ArrTy = llvm::ArrayType::get(PtrTy, 1);
+			llvm::Constant *arr = llvm::ConstantArray::get(ArrTy, { F });
+			auto *gv = new llvm::GlobalVariable(*module, ArrTy, /*isConstant=*/false,
+				llvm::GlobalValue::InternalLinkage, arr, "__co_init_array");
+			gv->setSection(".init_array");
+			gv->setAlignment(llvm::Align(8));
+		}
+	}
+
 	// 路 B 阶段3：.co GUI exe（WinMain 入口）的顶层初始化载体——用户 WinMain 改名
 	//   __co_WinMain__，合成新 WinMain（同签名）= 顶层初始化→转发 __co_WinMain__、以其返回为退出码。
 	void synthesize_winmain_wrapper(const TranslationUnit &tu, std::vector<TlPendingInit> &tl_pending_inits)
@@ -1310,7 +1449,7 @@ struct CodeGenImpl
 		for (const auto &f : tu.funcs)
 			if (f.body && f.name == "WinMain" && f.source_module_key.empty()) { has_winmain_def = true; break; }
 		// 载体仅对 `.co` 新面开启（DLL 产物 / WinMain 入口）；纯 C 档 .c 恒 co_has_bare、逐字等价。
-		const bool synth_carrier = co_has_bare || (is_co_ && (output_is_dll_ || has_winmain_def));
+		const bool synth_carrier = co_has_bare || (is_co_ && (output_is_dll_ || output_is_so_ || has_winmain_def));
 		// P241：预登记全部全局变量的类型（名 → CType），使「文件作用域初始化器」折叠过程中
 		//   经 CodegenTypeEnv::var_type 解析「声明在当前全局之后」的全局时能命中类型，
 		//   sizeof/alignof 不再回退 int32(4)（P234 旁支② / P227 同族「按名查全局」）。
@@ -1363,18 +1502,43 @@ struct CodeGenImpl
 			//   命中 globals_[gv.name]。旧路径 fold 早于登记 → 自引用 &a 落 forward-ref 分支折成
 			//   null，运行期解引用越界（CTS 0010/0011/0048 崩族）。折叠永不返回 nullptr，故
 			//   先建零初值再 setInitializer 与原「以 init_val 建」终态逐字一致（零回归）。
-			auto *gvar = new llvm::GlobalVariable(*module, ty, is_const,
-				linkage, llvm::Constant::getNullValue(ty), global_symbol(gv));
-			if (auto a = obj_align(gv.type, ty, gv.align)) gvar->setAlignment(*a);
-			// P211 B.3：public 仅叠加 DLL 导出 storage class，不改 linkage。
-			// COFF 约束：内部链接（static/P212 strip）符号不得带 DLL 存储类
-			//   （"symbol with local linkage cannot have a DLL storage class"）；故仅当
-			//   最终 linkage 为 External 时才打 Export。static public 在 exe 场景本就无导出语义。
-			if (target_.is_windows && gv.is_public && linkage == llvm::GlobalValue::ExternalLinkage &&
-				(!per_module_ || cur_bucket_key_.empty())) // 裁定⑥：分桶仅主桶导出
-				gvar->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
-			globals_[gv.name] = gvar;
-			global_types_[gv.name] = gv.type;
+			// C-08：同桶同名文件作用域定义实体只建一次。重复声明（tentative definition，
+			//   C 6.9.2）合并进同一枚全局——修前定义分支无去重，第二条同名经 LLVM 自动改名成
+			//   @X.1 并覆盖 globals_[name]，致模块内写入落 @X.1、导出/跨模块消费取干净 @X（初值），
+			//   实例分裂、静默错值（外部报障 C-08）。存在即复用：带强初值则就地下方折叠装配，
+			//   tentative 重声明不新建/不改名/不覆盖。非重声明路径逐字等价旧行为（begin_bucket
+			//   每桶清 globals_，故按裸名去重天然限定到 (bucket,name)，不误并跨模块同名）。
+			llvm::GlobalVariable *gvar = nullptr;
+			if (auto gex = globals_.find(gv.name); gex != globals_.end())
+			{
+				gvar = gex->second; // 复用：先前 tentative 定义，或 extern 声明升级成定义
+				if (!gv.init && !gvar->hasInitializer())
+					gvar->setInitializer(llvm::Constant::getNullValue(gvar->getValueType()));
+				// 对齐：extern 声明分支建 gvar 时不设 alignment，定义升级为同名复用须补 _Alignas；
+				//   仅当新对齐高于已有值时抬升（取 max），避免 tentative 重声明（无 _Alignas）把已抬高对齐拉低。
+				if (auto a = obj_align(gv.type, ty, gv.align))
+					if (a->value() > gvar->getAlignment()) gvar->setAlignment(*a);
+				if (target_.is_windows && gv.is_public && !gvar->hasDLLExportStorageClass() &&
+					gvar->getLinkage() == llvm::GlobalValue::ExternalLinkage &&
+					(!per_module_ || cur_bucket_key_.empty()))
+					gvar->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+			}
+			else
+			{
+				auto *nv = new llvm::GlobalVariable(*module, ty, is_const,
+					linkage, llvm::Constant::getNullValue(ty), global_symbol(gv));
+				if (auto a = obj_align(gv.type, ty, gv.align)) nv->setAlignment(*a);
+				// P211 B.3：public 仅叠加 DLL 导出 storage class，不改 linkage。
+				// COFF 约束：内部链接（static/P212 strip）符号不得带 DLL 存储类
+				//   （"symbol with local linkage cannot have a DLL storage class"）；故仅当
+				//   最终 linkage 为 External 时才打 Export。static public 在 exe 场景本就无导出语义。
+				if (target_.is_windows && gv.is_public && linkage == llvm::GlobalValue::ExternalLinkage &&
+					(!per_module_ || cur_bucket_key_.empty())) // 裁定⑥：分桶仅主桶导出
+					nv->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+				globals_[gv.name] = nv;
+				global_types_[gv.name] = gv.type;
+				gvar = nv;
+			}
 			bool tl_need_runtime = false; // P219：顶层非恒定初始化标记
 			if (gv.init)
 			{
@@ -1552,6 +1716,11 @@ struct CodeGenImpl
 			{
 				synthesize_dllmain(tu, tl_pending_inits);
 			}
+			// 路 B / P381：.co 产 ELF 共享对象 → .init_array 载体（顶层初始化在加载期执行）。
+			else if (output_is_so_ && is_co_)
+			{
+				synthesize_init_ctor(tu, tl_pending_inits);
+			}
 			else if (use_winmain_ && is_co_ &&
 				(has_bare || !tl_pending_inits.empty() || !imported_init_names_.empty()))
 			{
@@ -1595,19 +1764,22 @@ struct CodeGenImpl
 					cur_this_ = nullptr;
 					rc_frames_.clear();
 					rc_frames_.emplace_back(); // 顶层 RC 帧（与合成 main 同生命周期）
-					// 将 argc/argv/envp 入作域（argv 本批不向用户暴露，仅为下一批预留映射入口）。
+					// 将 argc/argv/envp 入作域（P382：argc/argv 向 .co 顶层裸代码暴露为内建名，
+					//   类型登记必须与 sema 注入逐字一致——argc:int、argv:char**（C 形，非带长度值类型），
+					//   否则 argv[i] 指针算术步长按 var_types_ 缺失塌回 i32 → 运行期越界崩溃（承 P184）。
+					//   envp 本批仍不向用户暴露（sema 侧不认、引用即 undeclared），仅入 vars_ 占位）。
 					{
 						auto ait = m->arg_begin();
 						llvm::AllocaInst *ac = builder.CreateAlloca(
 							llvm::Type::getInt32Ty(ctx), nullptr, "argc");
 						builder.CreateStore(&*ait++, ac);
-						vars_["argc"] = ac; var_types_["argc"] = nullptr;
+						vars_["argc"] = ac; var_types_["argc"] = make_type(TypeKind::Int);
 						if (ait != m->arg_end())
 						{
 							llvm::AllocaInst *av = builder.CreateAlloca(
 								llvm::PointerType::getUnqual(ctx), nullptr, "argv");
 							builder.CreateStore(&*ait++, av);
-							vars_["argv"] = av;
+							vars_["argv"] = av; var_types_["argv"] = make_pointer(make_pointer(make_type(TypeKind::Char)));
 						}
 						if (ait != m->arg_end())
 						{
@@ -4160,7 +4332,7 @@ struct CodeGenImpl
 				if (!pty || pty->kind == TypeKind::Void)
 					continue;
 				llvm::AllocaInst *al = nullptr;
-				if (pty && (pty->kind == TypeKind::Struct || pty->kind == TypeKind::Union))
+				if (pty && (pty->kind == TypeKind::Struct || pty->kind == TypeKind::Union || pty->kind == TypeKind::Complex))
 				{
 					// struct/union 形参按值收编（修 plct 00204 arg()）：colang 把 struct 值按 ptr 传，
 					// 旧代码统一 CreateAlloca(arg_ty=ptr) 建了 ptr 型 alloca，而 var_types_ 记的是 struct 型，
@@ -5613,7 +5785,8 @@ vla_restore_emit(0);       // P348：同上
 				break;
 			bool is_arr = (s->var_type && s->var_type->kind == TypeKind::Array);
 			bool is_struct = (s->var_type && (s->var_type->kind == TypeKind::Struct || s->var_type->kind == TypeKind::Union));
-			llvm::Type *ty = (is_arr || is_struct) ? to_llvm_alloca_type(s->var_type) : to_llvm_type(s->var_type);
+			bool is_complex = (s->var_type && s->var_type->kind == TypeKind::Complex);
+			llvm::Type *ty = (is_arr || is_struct || is_complex) ? to_llvm_alloca_type(s->var_type) : to_llvm_type(s->var_type);
 			// VLA（P208/P209，C99 标准）：数组链含任一运行期维（外/中/内皆可）。
 			// 旧路径 eval_const_int 把 `[len]` 折成 0 → `alloca [0 x double]` 零存储 → 写入即越界 AV
 			// （CTS 0066/0106/0062/0090/0189 族 clang 可运行而 colang 崩）。
@@ -5742,6 +5915,30 @@ vla_restore_emit(0);       // P348：同上
 					// 复用 fold_global_init 构造精确 N 元素常量数组（已含补零/截断），整体 store。
 					if (llvm::Constant *c = fold_global_init(s->var_init, ty))
 						builder.CreateStore(c, addr);
+				}
+				else if (is_complex)
+				{
+					// 复数初始化：花括号 {re[,im]} 零填后按位写入；其它表达式（算术/调用/另一复数/实数）
+					//   按目标元素宽规整写入（cplx_store_value 拆分量，兼容实数/异宽复数源）。
+					if (s->var_init->kind == ExprKind::InitList)
+					{
+						llvm::Type *ety = cplx_elem_ty(s->var_type);
+						llvm::StructType *sty = complex_llvm_struct(s->var_type);
+						uint64_t sz = module->getDataLayout().getTypeAllocSize(sty);
+						builder.CreateMemSet(addr, llvm::ConstantInt::get(llvm::Type::getInt8Ty(ctx), 0), sz, llvm::MaybeAlign(1));
+						const auto &a = s->var_init->args;
+						for (std::size_t k = 0; k < a.size() && k < 2; ++k)
+						{
+							llvm::Value *v = gen_expr(a[k]);
+							if (v->getType() != ety) v = convert_value(v, ety, get_expr_ctype(a[k]));
+							builder.CreateStore(v, builder.CreateStructGEP(sty, addr, static_cast<unsigned>(k)));
+						}
+					}
+					else
+					{
+						llvm::Value *sv = gen_expr(s->var_init);
+						cplx_store_value(addr, s->var_type, sv, get_expr_ctype(s->var_init));
+					}
 				}
 				else if (is_struct)
 				{
@@ -6140,7 +6337,7 @@ vla_restore_emit(0);       // P348：同上
 		//   且目标为整数时，从存储指针整块 load 出等宽整数（与 clang 将聚合体 bitcast 为整数同效）。
 		//   须经此于「ptr→非ptr 标量」分支之前，否则下方 CreatePtrToInt 会把地址当值传。
 		if (win64_abi_ && from->isPointerTy() && target->isIntegerTy() && src_t &&
-			(src_t->kind == TypeKind::Struct || src_t->kind == TypeKind::Union))
+			(src_t->kind == TypeKind::Struct || src_t->kind == TypeKind::Union || src_t->kind == TypeKind::Complex))
 			return builder.CreateLoad(target, v);
 		if (from->isPointerTy() && !target->isPointerTy())
 		{
@@ -6249,7 +6446,7 @@ vla_restore_emit(0);       // P348：同上
 	{
 		if (!win64_abi_ || !ret_ct)
 			return call;
-		if (ret_ct->kind != TypeKind::Struct && ret_ct->kind != TypeKind::Union)
+		if (ret_ct->kind != TypeKind::Struct && ret_ct->kind != TypeKind::Union && ret_ct->kind != TypeKind::Complex)
 			return call;
 		llvm::Type *it = call->getType();
 		if (!it->isIntegerTy())
@@ -6395,7 +6592,7 @@ vla_restore_emit(0);       // P348：同上
 				return v;
 			}
 			// 回退：查找函数符号
-			llvm::Function *F = func_ref(e->name);
+			llvm::Function *F = func_ref(e->name, &e->loc);
 			if (F) return F;
 			return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
 		}
@@ -6593,6 +6790,68 @@ vla_restore_emit(0);       // P348：同上
 						return builder.CreateSelect(builder.CreateICmpULE(x, one), one, calc);
 					}
 				}
+			}
+			// _Complex 访问器 + 虚数单位内建（colang 按名 lowering，不链接外部复数函数；
+			//   精度取自参数复数元素，返回宽度取自声明返回型 e->type，二者不符时拓宽）。
+			if (!e->lhs && !e->name.empty() && e->args.size() == 1)
+			{
+				const std::string nm = e->name;
+				const bool acc = (nm == "creal" || nm == "crealf" || nm == "cimag" || nm == "cimagf" ||
+				                    nm == "conj" || nm == "conjf" || nm == "cabs" || nm == "cabsf" ||
+				                    nm == "carg" || nm == "cargf" || nm == "projection" || nm == "projectionf");
+				if (acc)
+				{
+					CTypePtr at = get_expr_ctype(e->args[0]);
+					// 返回标量/复数的元素 FP 宽：优先取参数复数元素宽，但若声明返回更宽（double）则提升。
+					llvm::Type *elem = cplx_elem_ty(at);
+					llvm::Type *out_ty = elem;
+					if (e->type && e->type->kind != TypeKind::Complex && e->type->kind != TypeKind::Float)
+						out_ty = llvm::Type::getDoubleTy(ctx);
+					if (elem == llvm::Type::getFloatTy(ctx) && out_ty == llvm::Type::getDoubleTy(ctx))
+						elem = out_ty;
+					llvm::Value *cv = gen_expr(e->args[0]);
+					llvm::Value *re, *im;
+					cplx_decompose(cv, at, elem, re, im);
+					if (nm == "creal" || nm == "crealf")
+						return re->getType() != out_ty ? to_fp(re, out_ty) : re;
+					if (nm == "cimag" || nm == "cimagf")
+						return im->getType() != out_ty ? to_fp(im, out_ty) : im;
+					if (nm == "conj" || nm == "conjf")
+						return cplx_build(elem, re, builder.CreateFNeg(im));
+					if (nm == "cabs" || nm == "cabsf")
+					{
+						// 朴素 sqrt(re²+im²)（走 UCRT sqrt/sqrtf）；溢出/inf 边界与 clang hypot 可不一致。
+						llvm::Value *sq = builder.CreateFAdd(builder.CreateFMul(re, re), builder.CreateFMul(im, im));
+						llvm::Value *arg = sq->getType() != out_ty ? to_fp(sq, out_ty) : sq;
+						llvm::FunctionCallee sc = module->getOrInsertFunction(
+							out_ty == llvm::Type::getFloatTy(ctx) ? "sqrtf" : "sqrt",
+							llvm::FunctionType::get(out_ty, {out_ty}, false));
+						return builder.CreateCall(sc, {arg});
+					}
+					if (nm == "carg" || nm == "cargf")
+					{
+						llvm::Value *a = re->getType() != out_ty ? to_fp(re, out_ty) : re;
+						llvm::Value *b = im->getType() != out_ty ? to_fp(im, out_ty) : im;
+						llvm::FunctionCallee sc = module->getOrInsertFunction(
+							out_ty == llvm::Type::getFloatTy(ctx) ? "atan2f" : "atan2",
+							llvm::FunctionType::get(out_ty, {out_ty, out_ty}, false));
+						return builder.CreateCall(sc, {b, a}); // atan2(im, re)
+					}
+					// projection（Annex G 6.7.1）：任一成分为 ±inf → (+inf, im)；否则原值。
+					llvm::Value *infr = builder.CreateFCmpOEQ(
+						builder.CreateIntrinsic(elem, llvm::Intrinsic::fabs, {re}), llvm::ConstantFP::getInfinity(elem));
+					llvm::Value *infi = builder.CreateFCmpOEQ(
+						builder.CreateIntrinsic(elem, llvm::Intrinsic::fabs, {im}), llvm::ConstantFP::getInfinity(elem));
+					llvm::Value *any = builder.CreateOr(infr, infi);
+					llvm::Value *newre = builder.CreateSelect(any, llvm::ConstantFP::getInfinity(elem), re);
+					return cplx_build(elem, newre, im);
+				}
+			}
+			// 虚数单位 `I`（经 complex.h 宏展开为 `_Complex_I`→本内建）：常量 {0,1}。
+			if (!e->lhs && e->name == "__colang_complex_i")
+			{
+				llvm::Type *elem = cplx_elem_ty(e->type);
+				return cplx_build(elem, llvm::ConstantFP::get(elem, 0.0), llvm::ConstantFP::get(elem, 1.0));
 			}
 			// alloca/__builtin_alloca：POSIX/GNU 栈分配，按名 lowering 为 LLVM alloca 指令
 			//   （符号不进入链接；对齐取 16 字节，满足 max_align_t）。
@@ -6959,7 +7218,7 @@ vla_restore_emit(0);       // P348：同上
 			// 路 B 阶段1b-iii：限定直接调用 m.f() —— lhs 为已绑定 q_func 的 Member → 按符号直调（非间接）。
 			if (e->lhs && e->lhs->kind == ExprKind::Member && e->lhs->q_func)
 			{
-				llvm::Function *callee = qualified_func_ref(e->lhs->q_func);
+				llvm::Function *callee = qualified_func_ref(e->lhs->q_func, &e->loc);
 				llvm::FunctionType *ft = callee->getFunctionType();
 				coerce_call_args(ft, args, arg_cts);
 				return finalize_call_result(get_expr_ctype(e), builder.CreateCall(callee, args));
@@ -7001,7 +7260,7 @@ vla_restore_emit(0);       // P348：同上
 					}
 				}
 				// 直接函数调用
-				llvm::Function *callee = func_ref(e->name);
+				llvm::Function *callee = func_ref(e->name, &e->loc);
 				if (callee)
 				{
 					// UCRT(x64) setjmp ABI：_setjmp 必须以调用者帧地址作隐藏第二参数
@@ -7066,6 +7325,9 @@ vla_restore_emit(0);       // P348：同上
 							i < arg_cts.size() ? arg_cts[i] : nullptr);
 					llvm::FunctionType *ft = llvm::FunctionType::get(I32, /*Params=*/{}, /*isVarArg=*/true);
 					callee = llvm::cast<llvm::Function>(module->getOrInsertFunction(e->name, ft).getCallee());
+					// P380：隐式声明即外部引用（本 TU 无定义、链接期多半报 undefined）——记引用点。
+					//   发射符号用裸名 e->name（与 lld undefined symbol 同轴），供链接诊断反查回填。
+					record_sym_ref(e->name, &e->loc);
 					return builder.CreateCall(callee, args);
 				}
 			}
@@ -7094,7 +7356,7 @@ vla_restore_emit(0);       // P348：同上
 				if (vt->isArrayTy() || vt->isStructTy()) return gv; // 数组/结构退化：返回地址
 				return builder.CreateLoad(vt, gv);
 			}
-			if (e->q_func) return qualified_func_ref(e->q_func); // 函数名作值：函数地址（指针）
+			if (e->q_func) return qualified_func_ref(e->q_func, &e->loc); // 函数名作值：函数地址（指针）
 			// P300 Co class：Class::static_member 读取（静态类变量）。
 			if (e->op == "::" && e->lhs && e->lhs->kind == ExprKind::VarRef &&
 				class_defs_.count(e->lhs->name))
@@ -7288,6 +7550,107 @@ vla_restore_emit(0);       // P348：同上
 		return { conv(l), conv(r) };
 	}
 
+	// ===== _Complex 值级辅助（表征：{elem,elem} 匿名 struct；colang 复数值 = 指向其存储的 ptr）=====
+	// 复数表达式值与 struct 同不变量（= ptr），以下辅助按元素宽度拆分量/回装临时对象。
+	// 元素 LLVM FP 型：Complex(Float)→float、Complex(Double)→double。
+	llvm::Type *cplx_elem_ty(const CTypePtr &ct)
+	{
+		if (ct && ct->base && ct->base->kind == TypeKind::Float)
+			return llvm::Type::getFloatTy(ctx);
+		return llvm::Type::getDoubleTy(ctx);
+	}
+	// 把一侧操作数解成复数分量 (re, im)，均规整到 elem。Complex→GEP load 两分量（必要时拓宽）；
+	//   实数/整→re=cast(elem)、im=0。v 为 gen_expr 产出：复数侧是 ptr、实数侧是标量。
+	void cplx_decompose(llvm::Value *v, const CTypePtr &ct, llvm::Type *elem,
+	                    llvm::Value *&re, llvm::Value *&im)
+	{
+		if (ct && ct->kind == TypeKind::Complex)
+		{
+			llvm::StructType *sty = complex_llvm_struct(ct);
+			llvm::Type *ety = cplx_elem_ty(ct);
+			re = builder.CreateLoad(ety, builder.CreateStructGEP(sty, v, 0));
+			im = builder.CreateLoad(ety, builder.CreateStructGEP(sty, v, 1));
+			if (re->getType() != elem) re = to_fp(re, elem, ct->base);
+			if (im->getType() != elem) im = to_fp(im, elem, ct->base);
+		}
+		else
+		{
+			re = to_fp(v, elem, ct);
+			im = llvm::ConstantFP::get(elem, 0.0);
+		}
+	}
+	// 新建 {elem,elem} 临时对象（alloca 提升 entry，与 p352.retval 同法）、写入 (re,im)，返回 ptr。
+	llvm::Value *cplx_build(llvm::Type *elem, llvm::Value *re, llvm::Value *im)
+	{
+		llvm::StructType *sty = llvm::StructType::get(ctx, {elem, elem});
+		llvm::BasicBlock *cur_bb = builder.GetInsertBlock();
+		llvm::Function *F = cur_bb->getParent();
+		llvm::BasicBlock::iterator saved_ip = builder.GetInsertPoint();
+		llvm::BasicBlock &EB = F->getEntryBlock();
+		builder.SetInsertPoint(&EB, EB.begin());
+		llvm::Value *al = builder.CreateAlloca(sty, nullptr, "cplx.tmp");
+		builder.SetInsertPoint(cur_bb, saved_ip);
+		builder.CreateStore(re, builder.CreateStructGEP(sty, al, 0));
+		builder.CreateStore(im, builder.CreateStructGEP(sty, al, 1));
+		return al;
+	}
+	// 复数四则（朴素式，不追 Annex G robust、不 bit-match clang __mul?c3/__div?c3）。
+	llvm::Value *cplx_binop_arith(const std::string &op, llvm::Value *lv, const CTypePtr &lc,
+	                              llvm::Value *rv, const CTypePtr &rc, llvm::Type *elem)
+	{
+		llvm::Value *are, *aim, *bre, *bim;
+		cplx_decompose(lv, lc, elem, are, aim);
+		cplx_decompose(rv, rc, elem, bre, bim);
+		llvm::Value *re, *im;
+		if (op == "+") { re = builder.CreateFAdd(are, bre); im = builder.CreateFAdd(aim, bim); }
+		else if (op == "-") { re = builder.CreateFSub(are, bre); im = builder.CreateFSub(aim, bim); }
+		else if (op == "*")
+		{
+			// (ac-bd) + (ad+bc)i
+			llvm::Value *ac = builder.CreateFMul(are, bre);
+			llvm::Value *bd = builder.CreateFMul(aim, bim);
+			llvm::Value *ad = builder.CreateFMul(are, bim);
+			llvm::Value *bc = builder.CreateFMul(aim, bre);
+			re = builder.CreateFSub(ac, bd);
+			im = builder.CreateFAdd(ad, bc);
+		}
+		else // "/"
+		{
+			// ((ac+bd) + (bc-ad)i) / (c*c + d*d)：朴素式，边界（溢出/NaN/inf）与 clang 可不一致。
+			llvm::Value *ac = builder.CreateFMul(are, bre);
+			llvm::Value *bd = builder.CreateFMul(aim, bim);
+			llvm::Value *ad = builder.CreateFMul(are, bim);
+			llvm::Value *bc = builder.CreateFMul(aim, bre);
+			llvm::Value *den = builder.CreateFAdd(builder.CreateFMul(bre, bre), builder.CreateFMul(bim, bim));
+			re = builder.CreateFDiv(builder.CreateFAdd(ac, bd), den);
+			im = builder.CreateFDiv(builder.CreateFSub(bc, ad), den);
+		}
+		return cplx_build(elem, re, im);
+	}
+	// 复数相等比较：== 两分量 FCmp OEQ 后 and；!= 两分量 FCmp UNE 后 or（与 clang probe.f_eq/f_ne 同形）。
+	llvm::Value *cplx_binop_cmp(const std::string &op, llvm::Value *lv, const CTypePtr &lc,
+	                            llvm::Value *rv, const CTypePtr &rc, llvm::Type *elem)
+	{
+		llvm::Value *are, *aim, *bre, *bim;
+		cplx_decompose(lv, lc, elem, are, aim);
+		cplx_decompose(rv, rc, elem, bre, bim);
+		bool eq = (op == "==");
+		llvm::Value *c1 = eq ? builder.CreateFCmpOEQ(are, bre) : builder.CreateFCmpUNE(are, bre);
+		llvm::Value *c2 = eq ? builder.CreateFCmpOEQ(aim, bim) : builder.CreateFCmpUNE(aim, bim);
+		llvm::Value *b = eq ? builder.CreateAnd(c1, c2) : builder.CreateOr(c1, c2);
+		return builder.CreateZExt(b, llvm::Type::getInt32Ty(ctx));
+	}
+	// 将复数/实数源值写入目标复数存储地址 dst（按 dst 元素宽度规整，实数源→{v,0}、异宽复数源→收窄/拓宽）。
+	void cplx_store_value(llvm::Value *dst, const CTypePtr &dst_ct, llvm::Value *sv, const CTypePtr &sc_ct)
+	{
+		llvm::Type *elem = cplx_elem_ty(dst_ct);
+		llvm::Value *re, *im;
+		cplx_decompose(sv, sc_ct, elem, re, im);
+		llvm::StructType *sty = complex_llvm_struct(dst_ct);
+		builder.CreateStore(re, builder.CreateStructGEP(sty, dst, 0));
+		builder.CreateStore(im, builder.CreateStructGEP(sty, dst, 1));
+	}
+
 	llvm::Value *gen_binary(const ExprPtr &e)
 	{
 		// 数组下标：ptr + idx -> load
@@ -7343,6 +7706,24 @@ vla_restore_emit(0);       // P348：同上
 			return gen_short_circuit(e, true);
 		if (e->op == "||")
 			return gen_short_circuit(e, false);
+		// _Complex 参与的算术/相等（colang 复数值=ptr，须先于标量 FP/INT 分派）。
+		{
+			CTypePtr lc = get_expr_ctype(e->lhs);
+			CTypePtr rc = get_expr_ctype(e->rhs);
+			if ((lc && lc->kind == TypeKind::Complex) || (rc && rc->kind == TypeKind::Complex))
+			{
+				llvm::Type *elem = cplx_elem_ty(get_expr_ctype(e));
+				llvm::Value *lv = gen_expr(e->lhs);
+				llvm::Value *rv = gen_expr(e->rhs);
+				const std::string &op = e->op;
+				if (op == "+" || op == "-" || op == "*" || op == "/")
+					return cplx_binop_arith(op, lv, lc, rv, rc, elem);
+				if (op == "==" || op == "!=")
+					return cplx_binop_cmp(op, lv, lc, rv, rc, elem);
+				// 其余（% 位运算 关系）已由 sema 拒收；兜底返左值、不崩。
+				return lv;
+			}
+		}
 		// 普通二元：求值两侧，根据类型选择 FP/INT 路径
 		llvm::Value *l_raw = gen_expr(e->lhs);
 		llvm::Value *r_raw = gen_expr(e->rhs);
@@ -7509,7 +7890,7 @@ vla_restore_emit(0);       // P348：同上
 			if (pt && pt->kind == TypeKind::Array)
 			{
 				CTypePtr et = pt->base;
-				if (et && (et->kind == TypeKind::Array || et->kind == TypeKind::Struct || et->kind == TypeKind::Union))
+				if (et && (et->kind == TypeKind::Array || et->kind == TypeKind::Struct || et->kind == TypeKind::Union || et->kind == TypeKind::Complex))
 					return ptr;
 				llvm::Type *load_ty = et ? to_llvm_alloca_type(et) : llvm::Type::getInt32Ty(ctx);
 				return builder.CreateLoad(load_ty, ptr);
@@ -7520,8 +7901,8 @@ vla_restore_emit(0);       // P348：同上
 				// 函数指针: *fp 返回指针本身（不 load）
 				if (pt->base->kind == TypeKind::Function)
 					return ptr;
-				// struct/union/array 的解引用: 返回地址（不 load）
-				if (pt->base->kind == TypeKind::Struct || pt->base->kind == TypeKind::Union || pt->base->kind == TypeKind::Array)
+				// struct/union/array/复数 的解引用: 返回地址（不 load，守 colang 聚合体值=ptr 不变量）
+				if (pt->base->kind == TypeKind::Struct || pt->base->kind == TypeKind::Union || pt->base->kind == TypeKind::Array || pt->base->kind == TypeKind::Complex)
 					return ptr;
 				// P330：`*vp`（void pointee）同 `vp[1]`——无值可取、不得 load（`load void` 编译期崩溃）。
 				if (pt->base->kind == TypeKind::Void)
@@ -7650,6 +8031,15 @@ vla_restore_emit(0);       // P348：同上
 		// 0xFFFF 误当 -1，致 -(unsigned short)(-1) 判非负、PTYPE 符号错（c-testsuite 00200）。
 		if (e->op == "-" || e->op == "+")
 		{
+			// 复数取负/正：两侧分量各自 FNeg/直传（colang 复数值=ptr）。
+			if (CTypePtr lt = get_expr_ctype(e->lhs); lt && lt->kind == TypeKind::Complex)
+			{
+				llvm::Type *elem = cplx_elem_ty(lt);
+				llvm::Value *re, *im;
+				cplx_decompose(gen_expr(e->lhs), lt, elem, re, im);
+				if (e->op == "-") { re = builder.CreateFNeg(re); im = builder.CreateFNeg(im); }
+				return cplx_build(elem, re, im);
+			}
 			llvm::Value *raw = gen_expr(e->lhs);
 			if (raw->getType()->isFloatingPointTy())
 				return (e->op == "-") ? builder.CreateFNeg(raw) : raw;
@@ -7700,6 +8090,24 @@ vla_restore_emit(0);       // P348：同上
 	{
 		// struct/union 整体赋值: dst = src → memcpy
 		CTypePtr lhs_t = get_expr_ctype(e->lhs);
+		// _Complex 赋值：= 直接拆分量回装（同/异元素宽均由 cplx_store_value 按 dst 宽规整）；
+		//   复合赋值 z op= rhs → z = z op rhs（朴素四则，与 gen_binary 同口径）。
+		if (lhs_t && lhs_t->kind == TypeKind::Complex)
+		{
+			llvm::Value *dst = gen_lvalue_addr(e->lhs);
+			if (e->op == "=")
+			{
+				llvm::Value *sv = gen_expr(e->rhs);
+				cplx_store_value(dst, lhs_t, sv, get_expr_ctype(e->rhs));
+				return dst;
+			}
+			const std::string bop = e->op.substr(0, e->op.size() - 1);
+			llvm::Type *elem = cplx_elem_ty(lhs_t);
+			llvm::Value *rv = gen_expr(e->rhs);
+			llvm::Value *res = cplx_binop_arith(bop, dst, lhs_t, rv, get_expr_ctype(e->rhs), elem);
+			cplx_store_value(dst, lhs_t, res, lhs_t);
+			return dst;
+		}
 		if (lhs_t && (lhs_t->kind == TypeKind::Struct || lhs_t->kind == TypeKind::Union))
 		{
 			llvm::Value *dst = gen_lvalue_addr(e->lhs);
@@ -8456,7 +8864,7 @@ vla_restore_emit(0);       // P348：同上
 	{
 		// 路 B 阶段1b-iii：限定访问左值形（m.x = / &m.x / m.f 取函数地址）——直接返回目标符号地址。
 		if (e->q_global) return qualified_global_addr(e);
-		if (e->q_func) return qualified_func_ref(e->q_func);
+		if (e->q_func) return qualified_func_ref(e->q_func, &e->loc);
 		// P300 Co class：Class::static_member 左值（写静态类变量）。
 		if (e->op == "::" && e->lhs && e->lhs->kind == ExprKind::VarRef &&
 			class_defs_.count(e->lhs->name))
@@ -8771,7 +9179,7 @@ vla_restore_emit(0);       // P348：同上
 //     故此处用 TM->createDataLayout() 覆写模块 DL（与 clang 喂 .bc 时行为一致）。
 //   - X86 TargetMachine 构造器由 LLVMInitializeX86Target() 注册（非 ...TargetMC）。
 static bool emit_object_file(llvm::Module *M, const std::string &obj_path,
-                             const std::string &src, std::vector<Error> &errors)
+                             const std::string &src, bool pic, std::vector<Error> &errors)
 {
 	auto fail = [&](const std::string &msg) -> bool {
 		errors.push_back(Error{src, Pos{1, 1}, msg, false});
@@ -8797,8 +9205,12 @@ static bool emit_object_file(llvm::Module *M, const std::string &obj_path,
 		return fail("target lookup: " + lookup_err);
 
 	llvm::TargetOptions Options;
+	// P381：ELF 共享对象（-o *.so）须以 PIC 下降，否则 -shared 链接报绝对重定位；
+	//   exe/COFF 维持默认（std::nullopt）逐字零回归。该重载第 5 参即 Reloc::Model。
+	const std::optional<llvm::Reloc::Model> reloc =
+		pic ? std::optional<llvm::Reloc::Model>(llvm::Reloc::PIC_) : std::nullopt;
 	std::unique_ptr<llvm::TargetMachine> TM(TheTarget->createTargetMachine(
-		TT, "x86-64", "", Options, std::nullopt));
+		TT, "x86-64", "", Options, reloc));
 	if (!TM)
 		return fail("createTargetMachine failed");
 
@@ -8894,6 +9306,7 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 			return true;
 		};
 		cg.output_is_dll_ = opts.link_output && ci_ends(".dll");
+		cg.output_is_so_ = opts.link_output && ci_ends(".so");
 	}
 	// 路 B 阶段3：`.co` 新面标志（driver 同口径的后缀判定）。
 	{
@@ -8911,6 +9324,8 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 	// P229：回传入口子系统标志（供链接层依 -subsystem/-entry 分岔）。
 	state.windows_subsystem = cg.windows_subsystem_;
 	state.use_winmain = cg.use_winmain_;
+	// P380：回传外部符号引用点旁路表（供 link_exe/link_elf 失败时回填源码坐标）。
+	state.sym_refs = std::move(cg.sym_refs_);
 
 	// 路 B 阶段2：分桶隔离 + 单 obj 合回——各导入桶按逆拓序 linkInModule 并入主 Module，
 	//   发一个 .obj，链接层与现状完全同路径（Linux/多 obj 配方零改动）。合并后继续下行走单 obj 发射。
@@ -8964,14 +9379,14 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 		for (std::size_t bi = 0; bi < cg.done_buckets_.size(); ++bi)
 		{
 			const std::string obj_out = (tmp / (module_name + "_b" + std::to_string(bi) + ".obj")).string();
-			if (!emit_object_file(cg.done_buckets_[bi].get(), obj_out, opts.source_path, errors))
+			if (!emit_object_file(cg.done_buckets_[bi].get(), obj_out, opts.source_path, cg.output_is_so_, errors))
 				{ all_ok = false; break; }
 			state.obj_paths.push_back(obj_out);
 		}
 		if (all_ok)
 		{
 			const std::string main_obj = (tmp / (module_name + "_main.obj")).string();
-			if (!emit_object_file(cg.module.get(), main_obj, opts.source_path, errors))
+			if (!emit_object_file(cg.module.get(), main_obj, opts.source_path, cg.output_is_so_, errors))
 				all_ok = false;
 			else
 				state.obj_paths.push_back(main_obj);
@@ -9014,7 +9429,7 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 	{
 		const std::string obj_out = opts.output.empty() ? (module_name + ".obj") : opts.output;
 		state.obj_path = obj_out; // 保留（不删除）
-		return emit_object_file(cg.module.get(), obj_out, opts.source_path, errors);
+		return emit_object_file(cg.module.get(), obj_out, opts.source_path, false, errors);
 	}
 
 	// 链接模式：经 X86 TargetMachine 下 Lower 为 COFF .obj（写临时目录，进程内 lld 链接后删除）
@@ -9027,7 +9442,7 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 			tmp = std::filesystem::current_path(ec);
 		}
 		state.obj_path = (tmp / (module_name + ".obj")).string();
-		return emit_object_file(cg.module.get(), state.obj_path, opts.source_path, errors);
+		return emit_object_file(cg.module.get(), state.obj_path, opts.source_path, cg.output_is_so_, errors);
 	}
 
 	return true;

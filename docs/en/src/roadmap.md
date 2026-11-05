@@ -24,6 +24,7 @@ Within 0.\*, **MINOR** bumps denote milestones (a key Co-layer capability). **PA
 | 0.3.2   | Linux native ELF toolchain        | Released |
 | 0.4.0   | `class`                           | Released |
 | 0.4.1   | Diagnostics conformance & winapi  | Released |
+| 0.6.0   | Complex core slice + stdlib headers + linker diagnostics | Released |
 
 Details for 1.\* / 2.\* / 3.\* will be finalized by the maintainer before 0.\* wraps up.
 
@@ -56,7 +57,7 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - [ ] `import` extended to consume `.obj` / `.dll` / `.lib` as importable modules (bundling compile-time declaration metadata).
 - [ ] Module-alias-limited access: `m.f()`, `m.x`.
 - [ ] Refinement of `DllMain` synthesis and top-level body triggering for DLL outputs.
-- [ ] User-visible `argv` (shipped with array-with-length infrastructure).
+- [x] User-visible command-line arguments `argv`: delivered via **route A** (`.co` top-level entry has built-in `argc`(`int`) + `argv`(`char**`), C-form and self-contained, iterated by the `argc` count with `argv[argc]==NULL`), **decoupled from the array-with-length infrastructure**; `argv` as a globally visible, self-length-carrying string-array value type still awaits D37 (same batch as `string`/general arrays).
 
 ### 0.3.1 — Windows GUI & winapi.co
 
@@ -98,6 +99,14 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - CLI and source-surface tightening: new `-l`/`--lib` to specify external libraries; `[[lib]]` and `class` definitions restricted to `.co` sources (rejected in `.c`/`.h`).
 - Co-layer robustness: fixed the degradation/crash when using a cross-module `public struct` by value inside an `import`ed module.
 - `winapi.co` continues to expand: up to roughly 356 prototypes / 45 struct-union layouts / 503 constants, adding the winsock (ws2_32) socket family, the crypt32 string-encoding family, and more.
+
+### 0.6.0 — Complex core slice + stdlib headers
+
+- C complex types `float _Complex` / `double _Complex` core slice: `+ - * /` arithmetic, `== !=` comparison, the constant `I` (`_Complex_I`), and the `<complex.h>` accessors `creal` / `cimag` / `conj` / `cabs` / `carg` / `projection` (with `f` variants). Transcendental functions such as `cexp` / `clog` / `csqrt` and the standalone `_Imaginary` type are not yet supported.
+- Link-time `undefined symbol` diagnostics now report the real call-site file, line and column.
+- `<threads.h>` adds the C11 timed functions `thrd_sleep` / `mtx_timedlock` / `cnd_timedwait`, and now includes `<time.h>` so `struct timespec` is visible.
+- Fixed duplicate `public` global declarations in one `.co` module making cross-module consumers read back the initial value.
+- Note: this release corresponds to the internal development cycle `0.5.5`.
 
 ## Planned
 

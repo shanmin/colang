@@ -1,6 +1,6 @@
 # 程序入口与执行
 
-> 本章描述 Co 的程序入口与执行模型。**入口分派、`main` 可选、顶层 `return` 与退出码自 0.2.0 已实装；跨模块（`import`）顶层代码的集中拓序执行自 0.3.0 已实装；Windows GUI 入口 `WinMain` 与 `[[subsystem("windows")]]` 子系统切换自 0.3.1 已实装**；命令行参数 `argv` 仍未提供（见末尾「当前实装边界」）。
+> 本章描述 Co 的程序入口与执行模型。**入口分派、`main` 可选、顶层 `return` 与退出码自 0.2.0 已实装；跨模块（`import`）顶层代码的集中拓序执行自 0.3.0 已实装；Windows GUI 入口 `WinMain` 与 `[[subsystem("windows")]]` 子系统切换自 0.3.1 已实装；顶层入口内建命令行参数 `argc`/`argv` 自 0.5.5 已实装（见「命令行参数」）**。
 
 ## 顶层语句顺序执行
 
@@ -45,11 +45,27 @@ int WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow)
 
 ## 命令行参数
 
-命令行参数通过一个全局的 `argv` 读取：
+自 **0.5.5** 起，`.co` 顶层入口（**不写 `main`**、由编译器合成控制台入口的场景）可直接引用两个编译器**内建名** `argc` 与 `argv`：
 
-- `argv` 是字符串数组，`argv[0]` 通常是程序自身的路径，其后依次是各参数；
-- 参数个数取 `argv` 这个数组的长度（Co 的数组自带长度，无需另设计数变量）；
-- `argv` 全局可见，在函数、方法里也能读。
+- `argc` 是 `int`，为参数个数（含程序名本身，故 `argc >= 1`）；
+- `argv` 是 `char**`（字符串指针），`argv[0]` 通常是程序自身的路径，其后依次是各参数；
+- 遍历以 `argc` 计数为准；`argv[argc]` 恒为 `NULL`（C 语言保证）。`argv` 是**裸指针**、**不带长度属性、无越界检查**（C 语义），越界需自行用 `argc` 约束；
+- 二者作用域**限于合成入口的顶层代码**：在 `.c` 文件、动态库（`-o *.dll` / `*.so`）产物、或 GUI `WinMain` 入口下引用 `argv`，编译器按「未声明标识符」报错。
+
+```
+// hello.co —— 不写 main，顶层直接读 argc/argv
+int i = 1;              // 从 1 起，跳过 argv[0]（程序名）
+while (i < argc)        // 以 argc 计数遍历，不靠越界试探
+{
+    // 处理 argv[i]（如 argv[i][0] 取首字符）……
+    i = i + 1;
+}
+return 0;
+```
+
+若你写了显式的 `main`（C 风格），仍按 C 惯例以形参接收：`int main(int argc, char** argv)`。
+
+> **规划中**：让 `argv` 成为**全局可见、自带长度**的字符串数组值类型（在函数、方法里也能读、无需 `argc`），依赖 Co 的数组自带长度基础设施（与 `string`/通用数组同批），尚未提供；当前以 C 形 `argc` + `char**` 先行落地。
 
 ## 没有可执行入口时
 
@@ -74,7 +90,8 @@ int WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow)
 - 文件既无顶层裸指令、也无 `main`：产出可执行文件时编译器告警、仍产一个什么都不做、退出码为 `0` 的空入口。
 - 纯 C 写法（无顶层裸指令 + 含 `main`）仍沿用 C 入口链入行为，不进入合成入口。
 - **Windows GUI 入口**（自 0.3.1）：源里定义 `WinMain` 则取 GUI 入口（无控制台）；或入口函数标 `[[subsystem("windows")]]` 切 windows 子系统。`WinMain` 与顶层裸指令互斥、形参须 4 个。
+- **命令行参数**（自 0.5.5）：`.co` 顶层入口（合成控制台 `main`）内建 `argc`(`int`)/`argv`(`char**`)，靠 `argc` 计数遍历、`argv[argc]==NULL`；仅合成入口的顶层代码作内建名作用域内有效（`.c`/`-o *.dll`/`*.so`/`WinMain` 下引用 `argv` 报 undeclared）；若走显式 `main`（纯 C 写法）仍按形参接收 argc/argv。
 
 尚未提供的部分：
 
-- 命令行参数 `argv` 未在本版提供（无内置全局 `argv` 数组、也无数组自带长度基础设施）。
+- `argv` 作为**全局可见、自带长度**的字符串数组值类型（函数/方法内可读、无需 `argc`）尚未提供，依赖数组自带长度基础设施（D37，与 `string`/通用数组同批）；当前仅以 C 形 `argc` + `char**` 顶层内建名先行落地。

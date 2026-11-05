@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -40,6 +41,7 @@ enum class TypeKind
 	LongLong,   // long long (C99)
 	Float,
 	Double,
+	Complex,    // _Complex (C99 Annex G)：base 存元素型（Float/Double），降 {elem,elem}
 	Pointer,
 	Array,
 	Function,
@@ -129,6 +131,15 @@ inline CTypePtr make_array(CTypePtr elem, std::size_t n)
 	t->kind = TypeKind::Array;
 	t->base = std::move(elem);
 	t->array_size = n;
+	return t;
+}
+
+// _Complex（C99 Annex G）：元素型经 base 存（Float/Double），整体降 {elem,elem} 匿名 struct。
+inline CTypePtr make_complex(CTypePtr elem)
+{
+	auto t = std::make_shared<CType>();
+	t->kind = TypeKind::Complex;
+	t->base = std::move(elem);
 	return t;
 }
 
@@ -374,9 +385,6 @@ struct FuncDecl
 	// P212 loader 归属标记：源模块规范化绝对路径 key；空串 = 主源 TU 本体。
 	//   仅 loader 在合并前写入；parser/sema/codegen 默认空即视为「主源」。
 	std::string source_module_key;
-	// 路 B 阶段2-c：sema 撞名分流裁定的 LLVM 链接符号名（空 = 用 name）。
-	//   跨模块同名需共存时挂 dunder 合成名 `__<stem>__<name>`（仍合法 C 标识符）；codegen 取符号一律走此。
-	std::string symbol_name;
 };
 
 struct GlobalVar
@@ -399,8 +407,6 @@ struct GlobalVar
 	SourceLoc ident_loc;          // 声明符标识符位置（「must be specified on definition」指此列）
 	SourceLoc loc;
 	std::string source_module_key;  // P212 同 FuncDecl
-	// 路 B 阶段2-c：sema 撞名分流裁定的 LLVM 链接符号名（空 = 用 name；同 FuncDecl）。
-	std::string symbol_name;
 };
 
 // ============================================================
@@ -558,6 +564,12 @@ struct TypedefExport
 	SourceLoc loc{};
 };
 
+// 单元级符号表键：把 (module_key, name) 编码为单串（0x1F 单元分隔符，不会出现在路径/标识符中）。
+inline std::string symbol_table_key(const std::string &module_key, const std::string &name)
+{
+	return module_key + '\x1f' + name;
+}
+
 struct TranslationUnit
 {
 	std::vector<FuncDecl> funcs;
@@ -593,6 +605,12 @@ struct TranslationUnit
 	// --per-module 探针（路 B）：逐模块顶层裸句分段视图（拓序：最深依赖在前）。
 	//   双写字段：top_level_body 照旧摊平前插、既有路径零变动；仅 codegen 分桶模式读此。key＝规范化绝对路径。
 	std::vector<std::pair<std::string, std::vector<StmtPtr>>> top_level_segments;
+	// 单元级符号单真值表（路 B 阶段2-c dunder 撞名分流的收敛存放）：键 = symbol_table_key(source_module_key, name)，
+	//   值 = 需共存时的 LLVM 链接符号名 `__<stem>__<name>`；仅由 sema `build_catalog` 在撞名分流（定义计数 >1）时灌入。
+	//   codegen 各取值点（func_symbol / global_symbol / 限定成员与限定全局回查）与 `-o *.dll` 导入导出视图统一查此表、
+	//   查不到回退裸名。「判据不变、只换存放形态」：取代旧的逐节点 `FuncDecl`/`GlobalVar::symbol_name` 字段
+	//   （每份声明各存一份的派生状态）。非分桶或未经 build_catalog 时表恒空 ⇒ 全部回退裸名、与旧默认路径逐字等价。
+	std::unordered_map<std::string, std::string> symbol_table;
 };
 
 using TUPtr = std::shared_ptr<TranslationUnit>;

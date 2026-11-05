@@ -1,6 +1,6 @@
 # Program Entry and Execution
 
-> This chapter describes Co's program entry and execution model. **Entry dispatch, optional `main`, top-level `return` and the exit-code model are implemented since 0.2.0; cross-module (`import`) top-level execution in a centralized topological order is implemented since 0.3.0; the Windows GUI entry `WinMain` and the `[[subsystem("windows")]]` subsystem switch are implemented since 0.3.1**; command-line `argv` is still not provided (see "Currently implemented boundary" at the end).
+> This chapter describes Co's program entry and execution model. **Entry dispatch, optional `main`, top-level `return` and the exit-code model are implemented since 0.2.0; cross-module (`import`) top-level execution in a centralized topological order is implemented since 0.3.0; the Windows GUI entry `WinMain` and the `[[subsystem("windows")]]` subsystem switch are implemented since 0.3.1; the top-level built-in command-line `argc`/`argv` are implemented since 0.5.5 (see "Command-line arguments")**.
 
 ## Top-level statements run in order
 
@@ -45,11 +45,27 @@ Key point: **a `return` at the top level ends the whole program** (not some func
 
 ## Command-line arguments
 
-Command-line arguments are read through a single global `argv`:
+Since **0.5.5**, the `.co` top-level entry (the case where you **do not write `main`** and the compiler synthesizes the console entry) can directly reference two compiler **built-in names**, `argc` and `argv`:
 
-- `argv` is an array of strings; `argv[0]` is usually the program's own path, followed by the arguments in order;
-- the argument count is taken from the length of the `argv` array (Co arrays carry their own length, so no separate count variable is needed);
-- `argv` is globally visible and can be read inside functions and methods too.
+- `argc` is an `int`, the number of arguments (including the program name itself, so `argc >= 1`);
+- `argv` is a `char**` (a pointer to strings); `argv[0]` is usually the program's own path, followed by the arguments in order;
+- iterate by the `argc` count; `argv[argc]` is always `NULL` (guaranteed by C). `argv` is a **raw pointer**, **carries no length property, and has no bounds checking** (C semantics) — keep within range using `argc` yourself;
+- both are scoped **to the synthesized entry's top-level code**: referencing `argv` in a `.c` file, in a shared-library artifact (`-o *.dll` / `*.so`), or under the GUI `WinMain` entry makes the compiler report an undeclared identifier.
+
+```
+// hello.co -- no main, read argc/argv directly at the top level
+int i = 1;              // start at 1, skipping argv[0] (the program name)
+while (i < argc)        // iterate by the argc count, do not probe past the end
+{
+    // handle argv[i] (e.g. argv[i][0] for its first character)...
+    i = i + 1;
+}
+return 0;
+```
+
+If you write an explicit `main` (C style), arguments still arrive as its parameters, per C convention: `int main(int argc, char** argv)`.
+
+> **Planned**: making `argv` a **globally visible, self-length-carrying** string-array value type (readable inside functions and methods, with no `argc`) depends on Co's array-carries-own-length infrastructure (same batch as `string`/general arrays) and is not yet provided; for now it ships as the C-form `argc` + `char**`.
 
 ## When there is no executable entry
 
@@ -74,7 +90,8 @@ Since **0.2.0**, entry dispatch and exit-code behavior are implemented as specif
 - A file with neither top-level bare statements nor `main`: when producing an executable, the compiler warns and still emits an empty entry that does nothing and exits with code `0`.
 - Pure C style (no top-level bare statements + a `main`) keeps the traditional C entry chaining and does not enter the synthesized entry.
 - **Windows GUI entry** (since 0.3.1): defining `WinMain` in the source takes the GUI entry (no console); or mark the entry function with `[[subsystem("windows")]]` to switch to the windows subsystem. `WinMain` is mutually exclusive with top-level bare statements and must take 4 parameters.
+- **Command-line arguments** (since 0.5.5): the `.co` top-level entry (synthesized console `main`) has built-in `argc`(`int`)/`argv`(`char**`), iterated by the `argc` count with `argv[argc]==NULL`; valid only as built-in names in the synthesized entry's top-level code (referencing `argv` in `.c`/`-o *.dll`/`*.so`/`WinMain` reports undeclared); an explicit `main` (pure C style) still receives argc/argv as parameters.
 
 Not yet provided:
 
-- Command-line `argv` is not exposed in this version (no built-in global `argv` array, and no array-carries-own-length infrastructure yet).
+- `argv` as a **globally visible, self-length-carrying** string-array value type (readable in functions/methods, no `argc` needed) is not yet provided; it depends on the array-carries-own-length infrastructure (D37, same batch as `string`/general arrays). For now it ships only as the C-form `argc` + `char**` top-level built-in names.

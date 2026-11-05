@@ -122,7 +122,7 @@ bool is_keyword(const std::string &word)
 		"sizeof", "struct", "switch", "typedef", "union", "unsigned",
 		"void", "volatile", "while",
 		// C99
-		"_Bool", "_Complex", "_Imaginary", "restrict",
+		"_Bool", "_Complex", "_Imaginary", "_Complex_I", "restrict",
 		// 标准类型名（C 里由 <stddef.h>/<wchar.h> 提供 typedef；此处按内置类型名识别，
 		// 以便给出与宿主 CRT 一致的确定宽度，见 ADR-104 裁定）
 		"wchar_t",

@@ -384,12 +384,17 @@ public:
 			if (f.body) fn_def_keys[f.name].insert(f.source_module_key);
 		for (const auto &g : tu->globals)
 			if (!g.is_extern) g_def_keys[g.name].insert(g.source_module_key);
-		for (auto &f : tu->funcs)
+		// 收敛存放（单元级单真值表）：不再逐节点写 symbol_name，改为往合并 TU 的 symbol_table
+		//   灌 (source_module_key,name)->dunder。灌入谓词与原逐节点赋值逐字相同、且只依赖 (mod,name)，
+		//   故同 (mod,name) 的任意声明节点命中/落空一致 ⇒ codegen 查表结果与旧字段等价（零漂移）。
+		for (const auto &f : tu->funcs)
 			if (!f.source_module_key.empty() && fn_def_keys[f.name].size() > 1)
-				f.symbol_name = "__" + sanitize_ident(stem_of_key(f.source_module_key)) + "__" + f.name;
-		for (auto &g : tu->globals)
+				tu->symbol_table[symbol_table_key(f.source_module_key, f.name)] =
+					"__" + sanitize_ident(stem_of_key(f.source_module_key)) + "__" + f.name;
+		for (const auto &g : tu->globals)
 			if (!g.source_module_key.empty() && g_def_keys[g.name].size() > 1)
-				g.symbol_name = "__" + sanitize_ident(stem_of_key(g.source_module_key)) + "__" + g.name;
+				tu->symbol_table[symbol_table_key(g.source_module_key, g.name)] =
+					"__" + sanitize_ident(stem_of_key(g.source_module_key)) + "__" + g.name;
 	}
 
 	// 模块 key → 文件名 stem（去扩展名）——默认限定名（与 alias 同名）。
@@ -447,6 +452,56 @@ public:
 		cur_func_ = nullptr;
 		scopes_.clear();
 		scopes_.emplace_back(); // 文件作用域（全局变量已入 globals_，本层仅充局部声明用）
+		// P382（route A·与 D37 解耦）：`.co` 控制台 exe 合成 main 入口下，把内建名 argc/argv
+		//   注入文件作用域，供顶层裸代码直接引用（argc:int、argv:char**——C 形自足，非带长度值类型，
+		//   靠 argc 计数遍历、argv[argc]==NULL 为 C 保证）。门控谓词必须与 codegen 合成 main 注入分支
+		//   逐字一致（is_co && link && !compile_only && !emit_llvm && 非 .dll/.so && 无 WinMain && !pure_c），
+		//   否则一侧注入一侧不注入会静默错编译。仅注入 scopes_.front()（不入 globals_）：避开全局重定义
+		//   检查与 -Wunused 全局路径；用户已自声明同名（globals_/funcs_/classes_）则不注入（用户胜出）。
+		{
+			const std::string &sp = opts_.source_path;
+			const bool is_co_tl = sp.size() >= 3 &&
+				(sp.compare(sp.size() - 3, 3, ".co") == 0 || sp.compare(sp.size() - 3, 3, ".CO") == 0);
+			auto ci_ends_tl = [this](const char *s)
+			{
+				const std::string &op = opts_.output;
+				const std::size_t n = std::string(s).size();
+				if (op.size() < n) return false;
+				for (std::size_t k = 0; k < n; ++k)
+				{
+					const char a = (char)std::tolower((unsigned char)op[op.size() - n + k]);
+					const char b = (char)std::tolower((unsigned char)s[k]);
+					if (a != b) return false;
+				}
+				return true;
+			};
+			bool has_bare_tl = !tu->top_level_body.empty();
+			bool user_main_tl = false;
+			bool winmain_tl = false;
+			for (const auto &f : tu->funcs)
+			{
+				if (!f.body || !f.source_module_key.empty()) continue; // P231：仅主模块
+				if (f.name == "main") user_main_tl = true;
+				if (f.name == "WinMain") winmain_tl = true;
+			}
+			const bool pure_c_tl = !has_bare_tl && user_main_tl;
+			const bool expose_argv = is_co_tl && opts_.link_output && !opts_.compile_only &&
+				!opts_.emit_llvm && !ci_ends_tl(".dll") && !ci_ends_tl(".so") &&
+				!winmain_tl && !pure_c_tl;
+			if (expose_argv)
+			{
+				if (!globals_.count("argc") && !funcs_.count("argc") && !classes_.count("argc"))
+				{
+					scopes_.front()["argc"] = { make_type(TypeKind::Int), SourceLoc{} };
+					builtin_argv_names_.insert("argc");
+				}
+				if (!globals_.count("argv") && !funcs_.count("argv") && !classes_.count("argv"))
+				{
+					scopes_.front()["argv"] = { make_pointer(make_pointer(make_type(TypeKind::Char))), SourceLoc{} };
+					builtin_argv_names_.insert("argv");
+				}
+			}
+		}
 		// P212：拓序前插的 imported 项需“不查跨模块可见性”（子模块引用同模块非 public 助手合法）。
 		//   以 imported_top_level_body_count 为界：前缀项标“imported”、后缀项标“主源”（空串）。
 		// P344：前缀项还须带上**自己的模块 key**——模块内裸名引用（含与宿主同名的非 public 记录）
@@ -1094,6 +1149,16 @@ private:
 			return Compat::Skip; // 整数↔浮点等仍另族（本就不判）
 		}
 		if (fp) return pointee_compat(f, t);
+		// 复数（C99 Annex G 核心切片）：非指针、非 is_arithmetic_kind，须单列。
+		//   · 复数→复数（含 float↔double _Complex 隐式转换）→ Ok，元素宽规整交 codegen cplx_store_value；
+		//   · 实数/整型→复数（虚部补 0）→ Ok；
+		//   · 复数→实数/整型（丢弃虚部）、复数→聚合/类 → C 不允许，落 AggMismatch（clang 同拒）。
+		{
+			const bool fc = f->kind == TypeKind::Complex;
+			const bool tc = t->kind == TypeKind::Complex;
+			if (tc) return (fc || is_arithmetic_kind(f->kind)) ? Compat::Ok : Compat::AggMismatch;
+			if (fc) return Compat::AggMismatch;
+		}
 		if (is_arithmetic_kind(f->kind) && is_arithmetic_kind(t->kind)) return Compat::Ok;
 		// class 句柄同类约束交 check_class_handle_compat（避免双报）
 		if (f->kind == TypeKind::Class && t->kind == TypeKind::Class) return Compat::Ok;
@@ -2927,13 +2992,39 @@ private:
 	{
 		if (!e || !e->lhs || !e->rhs) return false;
 		const std::string &op = e->op;
+		const CTypePtr lt = resolve_type(e->lhs);
+		const CTypePtr rt = resolve_type(e->rhs);
+		// _Complex 无全序、不可取模/位运算/移位：施于此位置 clang 报 invalid operands。
+		//   放行：+ - * / （算术）、== != （相等）、= 赋值、&& ||（复数作标量参与条件合法）。
+		{
+			const bool lcx = lt && lt->kind == TypeKind::Complex;
+			const bool rcx = rt && rt->kind == TypeKind::Complex;
+			if (lcx || rcx)
+			{
+				bool bad = (op == "%" || op == "&" || op == "|" || op == "^" ||
+							op == "<<" || op == ">>" ||
+							op == "<" || op == ">" || op == "<=" || op == ">=");
+				if (!bad && e->kind == ExprKind::Assign && op.size() > 1 && op != "=")
+				{
+					const char c0 = op[0];
+					if (c0 == '%' || c0 == '&' || c0 == '|' || c0 == '^' ||
+						c0 == '<' || c0 == '>')
+						bad = true;
+				}
+				if (bad)
+				{
+					report(e->kind == ExprKind::Assign ? e->loc : e->op_loc,
+						   "invalid operands to binary expression (" +
+						   describe_type(lt) + " and " + describe_type(rt) + ")");
+					return true;
+				}
+			}
+		}
 		// 排除：比较/逻辑/下标/逗号
 		if (op == "[]" || op == "," || op == "&&" || op == "||" ||
 			op == "==" || op == "!=" || op == "<" || op == ">" ||
 			op == "<=" || op == ">=")
 			return false;
-		const CTypePtr lt = resolve_type(e->lhs);
-		const CTypePtr rt = resolve_type(e->rhs);
 		if (!lt || !rt) return false;
 		// void 侧交 P331 先手
 		if (lt->kind == TypeKind::Void || rt->kind == TypeKind::Void) return false;
@@ -3034,8 +3125,12 @@ private:
 					suppress_read_once_.clear();
 				else
 					read_var_names_.insert(e->name);
-				check_ambiguous_bare(e->name, e->loc); // P路 B 阶段1b：裁定③ host 裸名歧义
-				enforce_import_visibility(e->name, e->loc); // P212
+				// P382：编译器注入的 argv 内建名非模块符号，豁免跨模块可见性/裸名歧义检查。
+				if (!builtin_argv_names_.count(e->name))
+				{
+					check_ambiguous_bare(e->name, e->loc); // P路 B 阶段1b：裁定③ host 裸名歧义
+					enforce_import_visibility(e->name, e->loc); // P212
+				}
 				// P214：[[deprecated]] 引用点告警（对象名；函数名作为值使用时同路径）
 				if (!is_declared_local(e->name))
 				{
@@ -3243,6 +3338,8 @@ private:
 		}
 		case ExprKind::Call:
 		{
+			// 虚数单位内建 `__colang_complex_i`：非模块符号、零参、类型由 parser 定，跳过可见性/元数检查。
+			if (e->name == "__colang_complex_i") break;
 			if (!e->lhs && !e->name.empty())
 			{
 				// P212：函数调用跨模块可见性检查（与 VarRef 同机制）。
@@ -3933,6 +4030,9 @@ private:
 	const TranslationUnit *main_tu_ = nullptr;
 	// 路 B 阶段1（ambient 切断）：主源自身声明（含其 #include）的裸名集；命中则跨模块可见性门禁豁免。
 	std::unordered_set<std::string> host_own_names_;
+	// P382：编译器注入的 argv 内建名（argc/argv），仅作文件作用域符号供顶层裸代码引用。
+	//   豁免跨模块可见性/裸名歧义检查（它们对非模块符号本就 no-op，此处显式登记以明语义、防未来误伤）。
+	std::unordered_set<std::string> builtin_argv_names_;
 	// 路 B 阶段1b：per-module 转正开关（true 时 run() 末建 catalog；旧单遍路径恒 false、零改动）。
 	bool per_module_ = false;
 	// 路 B 阶段1b：逐模块 public 视图目录（per_module_ 为 true 时填充）。

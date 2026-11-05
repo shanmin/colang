@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace colang
@@ -40,6 +41,19 @@ struct SourceLoc
 	std::size_t line = 1;
 	std::size_t column = 1;
 };
+
+// P380 链接期诊断：外部符号引用点（源码坐标）。codegen 在解析到外部声明引用时
+// over-record 到 CompileState::sym_refs（键＝最终发射符号名、含 dunder）；链接失败时
+// 按 lld 报的 undefined symbol 反查、回填真实源码坐标（未命中则回退旧 obj:1:1 行为）。
+struct SymRef
+{
+	std::string file;
+	std::size_t line = 1;
+	std::size_t column = 1;
+};
+
+// P380：外部符号引用旁路表类型（键＝最终发射符号名、含 dunder）。
+using SymRefMap = std::unordered_map<std::string, std::vector<SymRef>>;
 
 // 语言标准档已取消：本项只实现单一 “C 超集方言”，不按 -std 做版本门控/诊断。
 // （最终 Co 语言会彻底消除该规则；C89→C23 仅作为施工顺序，非对外开关。）

@@ -52,6 +52,90 @@ void push_link_error(const std::string &file, const std::string &msg,
 	errors.push_back(Error{file, Pos{1, 1}, "linker: " + msg, false});
 }
 
+// 去首尾空白（含 \r、\t）。
+std::string trim_ascii(const std::string &s)
+{
+	std::size_t b = 0, e = s.size();
+	auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+	while (b < e && ws(s[b])) ++b;
+	while (e > b && ws(s[e - 1])) --e;
+	return s.substr(b, e - b);
+}
+
+// P380：解析 lld 诊断文本 blob，把「undefined symbol: X」按 sym_refs 回填为源码坐标诊断。
+//   口径：仅当「blob 内每条 error 行都是 undefined symbol、且每条都能在 sym_refs 命中」
+//   时，才以结构化诊断（主诊断@首个引用点源码坐标、余引用点作 note）完全替换原始 blob；
+//   否则整段 blob 原样兼底（file=objs.front()/out_path、Pos{1,1}）——零回归。
+void emit_link_blob(const std::string &file, const std::string &blob,
+                    const SymRefMap &sym_refs, std::vector<Error> &errors)
+{
+	// 按行切分（剥 \r）。
+	std::vector<std::string> lines;
+	{
+		std::string cur;
+		for (char c : blob)
+		{
+			if (c == '\n')
+			{
+				if (!cur.empty() && cur.back() == '\r') cur.pop_back();
+				lines.push_back(cur);
+				cur.clear();
+			}
+			else
+				cur += c;
+		}
+		if (!cur.empty())
+		{
+			if (cur.back() == '\r') cur.pop_back();
+			lines.push_back(cur);
+		}
+	}
+
+	const std::string kErr = "error:";
+	const std::string kUndef = "undefined symbol:";
+	std::size_t err_count = 0, undef_count = 0;
+	for (const auto &ln : lines)
+	{
+		if (ln.find(kErr) != std::string::npos) ++err_count;
+		if (ln.find(kUndef) != std::string::npos) ++undef_count;
+	}
+
+	// 无 undefined、或另有非 undefined 的链接错误 → 整段 blob 兼底（旧行为）。
+	if (undef_count == 0 || err_count != undef_count)
+	{
+		push_link_error(file, blob, errors);
+		return;
+	}
+
+	// 逐条 undefined symbol：抽符号名→查 sym_refs；全部命中才产结构化诊断。
+	std::vector<Error> structured;
+	for (const auto &ln : lines)
+	{
+		const std::size_t up = ln.find(kUndef);
+		if (up == std::string::npos) continue;
+		const std::string sym = trim_ascii(ln.substr(up + kUndef.size()));
+		auto it = sym_refs.find(sym);
+		if (it == sym_refs.end() || it->second.empty())
+		{
+			// 未命中（如 CRT/启动例程等未登记引用）→ 回退整段 blob。
+			push_link_error(file, blob, errors);
+			return;
+		}
+		const auto &refs = it->second;
+		Error e;
+		e.file = refs[0].file;
+		e.pos = Pos{refs[0].line, refs[0].column};
+		e.message = "linker: undefined symbol: " + sym;
+		for (std::size_t k = 1; k < refs.size(); ++k)
+			e.notes.push_back(Error{refs[k].file,
+				Pos{refs[k].line, refs[k].column},
+				"another reference to '" + sym + "' is here", false});
+		structured.push_back(std::move(e));
+	}
+	for (auto &e : structured)
+		errors.push_back(std::move(e));
+}
+
 #ifdef _WIN32
 // 大小写无关的后缀判定（Windows 扩展名 .dll/.DLL 同义）。
 bool ends_with_ci(const std::string& s, const std::string& suffix)
@@ -158,6 +242,7 @@ bool link_exe(const std::vector<std::string> &objs, const std::string &out_path,
               bool windows_subsystem, bool use_winmain,
               const std::vector<std::string> &res_files,
               const std::vector<std::string> &libs,
+              const SymRefMap &sym_refs,
               std::vector<Error> &errors)
 {
 	// 组装 lld 参数向量（首元素为程序名占位，lld COFF 驱动忽略之）。
@@ -222,13 +307,13 @@ bool link_exe(const std::vector<std::string> &objs, const std::string &out_path,
 	if (!ok)
 	{
 		const std::string file = objs.empty() ? out_path : objs.front();
-		push_link_error(file, out_buf + err_buf, errors);
+		emit_link_blob(file, out_buf + err_buf, sym_refs, errors);
 	}
 	return ok;
 }
 
 bool link_elf(const std::vector<std::string> &, const std::string &,
-              const std::vector<std::string> &, std::vector<Error> &errors)
+              const std::vector<std::string> &, const SymRefMap &, std::vector<Error> &errors)
 {
 	push_link_error("colang",
 	                "ELF linking is not available in this (Windows/COFF-only) build",
@@ -243,7 +328,7 @@ bool link_elf(const std::vector<std::string> &, const std::string &,
 
 bool link_exe(const std::vector<std::string> &, const std::string &, bool, bool,
               const std::vector<std::string> &, const std::vector<std::string> &,
-              std::vector<Error> &errors)
+              const SymRefMap &, std::vector<Error> &errors)
 {
 	push_link_error("colang",
 	                "COFF linking is not available in this (Linux/ELF-only) build",
@@ -253,6 +338,7 @@ bool link_exe(const std::vector<std::string> &, const std::string &, bool, bool,
 
 bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
               const std::vector<std::string> &libs,
+              const SymRefMap &sym_refs,
               std::vector<Error> &errors)
 {
 	const std::string file = objs.empty() ? out_path : objs.front();
@@ -267,14 +353,20 @@ bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
 		return false;
 	}
 	const std::filesystem::path crt(crt_dir);
-	// 静态 libc.a 存在性预检：缺失给专一诊断，避免 lld 的泛化 undefined/-lc not found。
+	// P381：依输出扩展名分岔——*.so → 共享对象（-shared、动态 libc、无 crt1.o/_start）；
+	//   其余 → 静态可执行文件（-static、libc.a、crt1.o）。exe 分支逐字维持现状。
+	const bool as_so = out_path.size() >= 3 &&
+	                   out_path.compare(out_path.size() - 3, 3, ".so") == 0;
+	// libc 存在性预检：exe 查 libc.a（静态）、.so 查 libc.so（动态）；缺失给专一诊断，避免 lld 的泛化 undefined/-lc not found。
 	{
 		std::error_code ec;
-		if (!std::filesystem::exists(crt / "libc.a", ec))
+		const std::string libfile = as_so ? "libc.so" : "libc.a";
+		if (!std::filesystem::exists(crt / libfile, ec))
 		{
 			push_link_error(file,
-			                "static libc not found: " + (crt / "libc.a").string() +
-			                    " (install libc6-dev / glibc-static)",
+			                std::string(as_so ? "dynamic libc not found: " : "static libc not found: ") +
+			                    (crt / libfile).string() +
+			                    (as_so ? " (install libc6-dev)" : " (install libc6-dev / glibc-static)"),
 			                errors);
 			return false;
 		}
@@ -286,11 +378,12 @@ bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
 	const std::string gcc_dir = find_gcc_lib_dir();
 	std::vector<std::string> argv;
 	argv.emplace_back("ld.lld");
-	argv.push_back((crt / "crt1.o").string());
+	if (!as_so)
+		argv.push_back((crt / "crt1.o").string()); // .so 无 _start 可执行入口（crt1.o 专属 exe）
 	argv.push_back((crt / "crti.o").string());
 	for (const auto &o : objs)
 		argv.push_back(o);
-	argv.emplace_back("-static");
+	argv.emplace_back(as_so ? "-shared" : "-static");
 	argv.emplace_back("-o");
 	argv.push_back(out_path);
 	argv.push_back("-L" + crt_dir);
@@ -326,7 +419,7 @@ bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
 	err_os.flush();
 
 	if (!ok)
-		push_link_error(file, out_buf + err_buf, errors);
+		emit_link_blob(file, out_buf + err_buf, sym_refs, errors);
 	return ok;
 }
 

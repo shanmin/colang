@@ -4,7 +4,8 @@
  * 句柄类型 thrd_t/mtx_t/cnd_t/once_flag 按其「不透明」性质以等宽 size_t 数组承载，
  * 尺寸/对齐取自本机 ground-truth（thrd_t=16/8, mtx_t=32/8, cnd_t=8/8, once_flag=8/8）；
  * tss_t 为 4 字节整型（键值，非句柄）。
- * 务实子集：暂不含需 <time.h> struct timespec 的定时变体（thrd_sleep/mtx_timedlock/cnd_timedwait）。
+ * C11 定时变体（thrd_sleep/mtx_timedlock/cnd_timedwait）已补齐：本头 #include <time.h>
+ * 以保证 struct timespec 自洽可见（C11 要求；外部 C-03 第②项已闭合）。
  * 边界：面向 Windows/MSVC ABI；glibc(Linux) 下各句柄尺寸不同（如 thrd_t=8、mtx_t=48…），
  *       待 colang 引入平台分派后按平台取布局（平台预定义宏清单见项目内部设计文档）。
  */
@@ -12,6 +13,7 @@
 #define _COLANG_THREADS_H
 
 #include <stddef.h>
+#include <time.h>   /* struct timespec（C11 要求 <threads.h> 保证其可见） */
 
 typedef int (*thrd_start_t)(void *arg);
 typedef void (*tss_dtor_t)(void *val);
@@ -68,5 +70,25 @@ extern void* tss_get(tss_t key);
 
 /* —— 一次性调用（C 标准）—— */
 extern void call_once(once_flag *flag, thrd_cb_t func);
+
+/* —— C11 定时变体（thrd_sleep / mtx_timedlock / cnd_timedwait）——
+ * UCRT 不直接导出这三个 C11 名，真实 MSVC <threads.h> 以 static inline 包装 _*64 家族。
+ * 本仓 time_t 恒 8 字节（等价 MSVC 的 64 位分支），故只取 _*64 变体、省去 _USE_32BIT_TIME_T /
+ * _CRT_NO_TIME_T 分岔。_timespec64 与 <time.h> 的 struct timespec 布局逐字节相同（{ __int64, long }），
+ * 包装层在二者间做指针转型（与 MSVC 做法一致）。 */
+struct _timespec64 { long long tv_sec; long tv_nsec; };
+extern int _thrd_sleep64(const struct _timespec64 *duration, struct _timespec64 *remaining);
+extern int _mtx_timedlock64(mtx_t *mtx, const struct _timespec64 *ts);
+extern int _cnd_timedwait64(cnd_t *cond, mtx_t *mtx, const struct _timespec64 *ts);
+
+static inline int thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
+	return _thrd_sleep64((const struct _timespec64 *) duration, (struct _timespec64 *) remaining);
+}
+static inline int mtx_timedlock(mtx_t *mtx, const struct timespec *ts) {
+	return _mtx_timedlock64(mtx, (const struct _timespec64 *) ts);
+}
+static inline int cnd_timedwait(cnd_t *cond, mtx_t *mtx, const struct timespec *ts) {
+	return _cnd_timedwait64(cond, mtx, (const struct _timespec64 *) ts);
+}
 
 #endif /* _COLANG_THREADS_H */

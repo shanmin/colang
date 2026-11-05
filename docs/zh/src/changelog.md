@@ -3,6 +3,12 @@
 本记录按发布版本列出 Co（colang）语言/编译器的主要变化。
 版本策略：0.* 为开发测试版，1.* 为正式版，2.* 为自举版。
 
+## 0.6.0
+- **支持 C 复数类型 `_Complex`（核心切片）**：`.c` / `.co` 现可用 `float _Complex` / `double _Complex` 类型、`+ - * /` 四则运算、`== !=` 比较、常量 `I`（`_Complex_I`），以及 `<complex.h>` 的访问器 `creal` / `cimag` / `conj` / `cabs` / `carg` / `projection`（含 `f` 变体）。本批为核心切片：`cexp` / `clog` / `csqrt` 等超越函数、独立 `_Imaginary` 类型暂不支持；`int _Complex` 写即报错；仍保留 `__STDC_NO_COMPLEX__` 特性宏，依赖它跳过复数的可移植代码行为不变。
+- **链接错误回填源码位置**：链接期 `undefined symbol` 此前一律指向 `<obj>:1:1`、给不出出错行；现会解析每条未定义符号、反查回真实调用点的源码文件与行列并附上（仅当无法定位时才回退旧形态）。
+- **`<threads.h>` 补齐 C11 定时函数**：新增 `thrd_sleep` / `mtx_timedlock` / `cnd_timedwait`；且 `<threads.h>` 现自动包含 `<time.h>`，`struct timespec` 直接可见，无需使用者自行补头。
+- **修复同一模块内重复声明 `public` 全局变量导致消费者读回初值**：此前一个 `.co` 模块内对同名 `public` 全局变量写了两条声明时，模块内部实例与跨模块导出实例会分裂，消费者读到的是初值（0）而非最新值；现两条声明归并为同一实例。
+
 ## 0.5.4
 - **`ptr - ptr` 指针差修复为 64 位**：两个指针相减此前被截成 32 位整数，跨度超过 2 GiB 会得到负数或错值；现与 clang 一致返回 64 位，`sizeof(p - q)` 也从 4 修正为 8。
 - **引用 `public struct` 不再崩溃**：当 `public struct` 含未标 `public` 的成员类型时，导入方编译器此前会直接崩溃；现在能正确获得其大小，仅在展开未导出的成员字段时给出明确报错。被 `public struct` 引用的成员类型仍建议一并标 `public`。

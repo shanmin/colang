@@ -721,8 +721,10 @@ int main(int argc, char **argv)
 		// 链接层按 target 分平台：Windows → 进程内 lldCOFF；Linux → 进程内 lldELF。
 		const bool ok = opts.target.is_windows
 			? colang::link_exe(objs, out_path, state.windows_subsystem,
-					state.use_winmain, opts.res_files, opts.link_libs, errors)
-			: colang::link_elf(objs, out_path, opts.link_libs, errors);
+					state.use_winmain, opts.res_files, opts.link_libs,
+					state.sym_refs, errors)
+			: colang::link_elf(objs, out_path, opts.link_libs,
+					state.sym_refs, errors);
 		std::error_code ec;
 		// 临时 obj 统一删（-c 路径不走本块；per-module 的 obj_paths 均为链接模式临时产物）。
 		for (const std::string &o : objs)

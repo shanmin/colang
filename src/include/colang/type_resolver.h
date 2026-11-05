@@ -118,6 +118,8 @@ inline bool types_compatible(const CTypePtr &a, const CTypePtr &b)
 		return a->tag == b->tag;
 	case TypeKind::BitInt:
 		return a->bit_width == b->bit_width && a->is_unsigned == b->is_unsigned;
+	case TypeKind::Complex:
+		return types_compatible(a->base, b->base); // float _Complex ≠ double _Complex；复数与结构/整型天然不相容（kind 已先分）
 	default:
 		return a->is_unsigned == b->is_unsigned; // 基本整/浮：符号一致
 	}
@@ -351,7 +353,8 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 			//   旧路一律过 int_promo_of，其 default 把 Float/Double 收成 {32,false}，令
 			//   `sizeof(-d)`/`sizeof(d+d)` 在 codegen 侧得 4，而 parser 自算那份给 8——两引擎分叉。
 			CTypePtr ot = resolve_expr_type(e->lhs, env);
-			if (ot && (ot->kind == TypeKind::Float || ot->kind == TypeKind::Double))
+			if (ot && (ot->kind == TypeKind::Float || ot->kind == TypeKind::Double ||
+				ot->kind == TypeKind::Complex))
 				return ot;
 			IntPromo p = int_promo_of(ot, env.long_bits());
 			return int_ctype_of(p.bits, p.is_unsigned);
@@ -412,6 +415,17 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		//   旧路只走 int_uac，令 `d+d`/`1+d`/`d/2` 在 codegen 侧全被当 int（parser 侧反而对）。
 		if (bop == "+" || bop == "-" || bop == "*" || bop == "/")
 		{
+			// 复数算术转换：任一侧 Complex → 结果 Complex（与实数混算升复数），元素型取宽者。
+			const bool lCx = lt && lt->kind == TypeKind::Complex;
+			const bool rCx = rt && rt->kind == TypeKind::Complex;
+			if (lCx || rCx)
+			{
+				const bool wide =
+					(lt && lt->kind == TypeKind::Double) || (rt && rt->kind == TypeKind::Double) ||
+					(lCx && lt->base && lt->base->kind == TypeKind::Double) ||
+					(rCx && rt->base && rt->base->kind == TypeKind::Double);
+				return make_complex(make_type(wide ? TypeKind::Double : TypeKind::Float));
+			}
 			const bool lD = lt && lt->kind == TypeKind::Double;
 			const bool rD = rt && rt->kind == TypeKind::Double;
 			const bool lF = lt && lt->kind == TypeKind::Float;
@@ -461,11 +475,19 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		//   转浮点时因缺 CType 回退 SIToFP，把 4294967295 折成 -1.0；其它缺型组合
 		//   （如 ULL vs int）还会让 codegen 把宽臂截成 i32。指针/空指针常量路径保持原状。
 		const bool a_arith = is_integer_kind(a->kind) || a->kind == TypeKind::Float ||
-			a->kind == TypeKind::Double;
+			a->kind == TypeKind::Double || a->kind == TypeKind::Complex;
 		const bool b_arith = is_integer_kind(b->kind) || b->kind == TypeKind::Float ||
-			b->kind == TypeKind::Double;
+			b->kind == TypeKind::Double || b->kind == TypeKind::Complex;
 		if (a_arith && b_arith)
 		{
+			if (a->kind == TypeKind::Complex || b->kind == TypeKind::Complex)
+			{
+				const bool wide =
+					a->kind == TypeKind::Double || b->kind == TypeKind::Double ||
+					(a->kind == TypeKind::Complex && a->base && a->base->kind == TypeKind::Double) ||
+					(b->kind == TypeKind::Complex && b->base && b->base->kind == TypeKind::Double);
+				return make_complex(make_type(wide ? TypeKind::Double : TypeKind::Float));
+			}
 			if (a->kind == TypeKind::Double || b->kind == TypeKind::Double)
 				return make_type(TypeKind::Double);
 			if (a->kind == TypeKind::Float || b->kind == TypeKind::Float)
@@ -481,6 +503,8 @@ CTypePtr resolve_expr_type(const ExprPtr &e, Env &env)
 		// va_arg(ap, T)：结果类型由 parser 直接写入 e->type；成员访问/取址需据此解析
 		//   （缺失时 (va_arg(ap, test_t)).i 会按空 tag 造出 opaque %struct.，CTS 0043 族）。
 		if (e->name == "va_arg" && e->type) return e->type;
+		// 虚数单位内建 `__colang_complex_i`：类型由 parser 写入（double _Complex）。
+		if (e->name == "__colang_complex_i" && e->type) return e->type;
 		// C23 stdckdint 内建返回 bool（此处以 i32 0/1 承载）：报告 Int 供转换使用
 		if (e->name == "ckd_add" || e->name == "ckd_sub" || e->name == "ckd_mul")
 			return make_type(TypeKind::Int);

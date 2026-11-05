@@ -62,6 +62,9 @@ struct CompileState
 	// P229 codegen 产出：入口子系统标志（供 main.cpp 链接调用传 link_exe）。
 	bool windows_subsystem = false; // [[subsystem("windows")]] 或 WinMain → -subsystem:windows
 	bool use_winmain = false;       // 定义 WinMain → -entry:WinMainCRTStartup
+	// P380 codegen 产出：外部符号引用点旁路表（键＝最终发射符号名、含 dunder），供
+	//   link_exe/link_elf 失败时按 undefined symbol 反查、回填源码坐标（未命中回退旧行为）。
+	std::unordered_map<std::string, std::vector<SymRef>> sym_refs;
 };
 
 // 运行整条管线；诊断追加到 errors，成功返回 true。

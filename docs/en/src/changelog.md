@@ -3,6 +3,12 @@
 This record lists major changes to the Co (colang) language/compiler by release version.
 Versioning policy: 0.* = development/test releases, 1.* = official releases, 2.* = bootstrap.
 
+## 0.6.0
+- **C `_Complex` support (core slice)**: `.c` / `.co` now support the `float _Complex` / `double _Complex` types, `+ - * /` arithmetic, `== !=` comparison, the constant `I` (`_Complex_I`), and the `<complex.h>` accessors `creal` / `cimag` / `conj` / `cabs` / `carg` / `projection` (with `f` variants). This batch is a core slice: transcendental functions such as `cexp` / `clog` / `csqrt` and the standalone `_Imaginary` type are not yet supported; `int _Complex` is an error when written; `__STDC_NO_COMPLEX__` remains defined, so portable code that relies on it to skip complex behaviour is unchanged.
+- **Linker errors now report the source location**: link-time `undefined symbol` previously always pointed at `<obj>:1:1` with no source line; each undefined symbol is now resolved back to the real call-site file, line and column (falling back to the old form only when it cannot be located).
+- **`<threads.h>` adds the C11 timed functions**: `thrd_sleep` / `mtx_timedlock` / `cnd_timedwait` are now provided; and `<threads.h>` now includes `<time.h>`, so `struct timespec` is directly visible without the user including the header themselves.
+- **Fix duplicate `public` global declarations in one module making consumers read the initial value**: previously, declaring the same `public` global variable twice in one `.co` module split the module-internal instance from the exported one, so consumers read the initial value (0) instead of the latest; the two declarations now resolve to a single instance.
+
 ## 0.5.4
 - **`ptr - ptr` pointer difference fixed to 64 bits**: subtracting two pointers was truncated to a 32-bit `int`, so a span over 2 GiB came out negative or wrong; it now returns a 64-bit value like clang, and `sizeof(p - q)` is corrected from 4 to 8.
 - **Referencing a `public struct` no longer crashes**: when a `public struct` had a member type not marked `public`, the importing compiler used to crash outright; it now gets the size correctly and reports a clear error only when expanding the non-exported member's fields. Member types referenced by a `public struct` should still be marked `public`.

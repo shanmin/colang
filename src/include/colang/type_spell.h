@@ -156,6 +156,8 @@ inline std::string spell_type_at(const CType *t, bool sugar)
 	case TypeKind::LongLong: core = t->is_unsigned ? "unsigned long long" : "long long"; break;
 	case TypeKind::Float: core = "float"; break;
 	case TypeKind::Double: core = "double"; break;
+	// _Complex：clang 拼作 `_Complex float`/`_Complex double`（实观 binary-operand 诊断同形）。
+	case TypeKind::Complex: core = "_Complex " + spell_type_at(t->base.get(), sugar); break;
 	case TypeKind::Enum: core = "enum " + spell_tag(t->tag); break;
 	case TypeKind::Struct: core = "struct " + spell_tag(t->tag); break;
 	case TypeKind::Union: core = "union " + spell_tag(t->tag); break;

@@ -24,6 +24,7 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 | 0.3.2 | Linux 原生 ELF 工具链            | 已发布  |
 | 0.4.0 | 实现 class                   | 已发布  |
 | 0.4.1 | 诊断符合性与 winapi 扩容     | 已发布  |
+| 0.6.0 | 复数核心切片 + 标准库头补全 + 链接诊断回填 | 已发布  |
 
 后续 1.\* / 2.\* / 3.\* 具体条目将在 0.\* 收官前由维护方主动细化。
 
@@ -56,7 +57,7 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - [ ] `import` 扩展到可消费 `.obj`/`.dll`/`.lib` 作导入模块（自带编译期声明元数据）。
 - [ ] 模块别名限定访问：`m.f()`、`m.x`。
 - [ ] DLL 场景下的 `DllMain` 合成与顶层段触发时机细化。
-- [ ] 用户可见的命令行参数 `argv`（与数组自带长度基础设施同批）。
+- [x] 用户可见的命令行参数 `argv`：已按 **route A** 交付（`.co` 顶层入口内建 `argc`(`int`) + `argv`(`char**`)，C 形自足、靠 `argc` 计数遍历、`argv[argc]==NULL`），**与数组自带长度基础设施解耦**；`argv` 作为全局可见、自带长度的字符串数组值类型仍待 D37（与 `string`/通用数组同批）。
 
 ### 0.3.1 — Windows GUI 与 winapi.co
 
@@ -98,6 +99,14 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - 命令行与源面收紧：新增 `-l`/`--lib` 指定外部库；`[[lib]]` 与 `class` 定义限定于 `.co` 源（`.c`/`.h` 中拒收）。
 - Co 层健壮性：修复被 `import` 模块内按值使用跨模块 `public struct` 的退化/崩溃。
 - `winapi.co` 继续扩容：增至约 356 原型 / 45 结构·联合体 / 503 常量，新增 winsock（ws2_32）套接字族、crypt32 字符串编解码族等。
+
+### 0.6.0 — 复数核心切片 + 标准库头补全
+
+- C 复数类型 `float _Complex` / `double _Complex` 核心切片：`+ - * /` 四则运算、`== !=` 比较、常量 `I`（`_Complex_I`），`<complex.h>` 访问器 `creal` / `cimag` / `conj` / `cabs` / `carg` / `projection`（含 `f` 变体）。`cexp` / `clog` / `csqrt` 等超越函数与独立 `_Imaginary` 类型暂未支持。
+- 链接期 `undefined symbol` 诊断回填真实调用点的源码文件与行列。
+- `<threads.h>` 补齐 C11 定时函数 `thrd_sleep` / `mtx_timedlock` / `cnd_timedwait`，并自动包含 `<time.h>` 使 `struct timespec` 可见。
+- 修复同一 `.co` 模块内重复声明 `public` 全局变量导致跨模块消费者读回初值。
+- 说明：本发布对应内部开发周期 `0.5.5`。
 
 ## 计划中
 
