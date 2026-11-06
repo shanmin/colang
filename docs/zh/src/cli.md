@@ -16,7 +16,7 @@ colang [选项] <源文件.co>
 | `-v`, `--version` | 显示编译器版本（四段）、所用 LLVM 版本与目标平台 |
 | `-E` | 仅做预处理，把展开后的 token 清单打到标准输出 |
 | `-c` | 仅编译，产出目标文件（Windows 目标为 COFF `.obj`、Linux 目标为 ELF `.o`），不链接 |
-| `-o <file>` | 指定输出文件 |
+| `-o <file>` | 指定输出文件；省略时按「产物与默认名」一节的规则命名 |
 | `-I <dir>` | 追加头文件搜索目录，也可写作 `-I<dir>`；可重复给出 |
 | `--target <triple>` | 指定目标三元组（如 `x86_64-unknown-linux-gnu`）；省略时默认取宿主平台 |
 | `--resource <file>` | 向可执行文件嵌入 PE 资源，可重复给出；接受 `.rc`（内置资源编译器编译）或预编译的 `.res`（原样嵌入）；仅 Windows 目标 |
@@ -28,10 +28,26 @@ colang [选项] <源文件.co>
 | 动作 | 产物 | 未写 `-o` 时的默认名 |
 | --- | --- | --- |
 | 默认（编译 + 链接） | 可执行文件 | Windows：`<源文件名去扩展>.exe`；其他平台：`<源文件名去扩展>` |
-| `-c` | `.obj` 目标文件 | `<源文件名去扩展>.obj`，留在当前目录 |
+| `-c` | `.obj` 目标文件 | `<源文件名去扩展>.obj` |
 | `-E` | 标准输出 | 固定走标准输出，`-o` 对其无效 |
 
+不带 `-o` 时，上述默认产物一律写在**当前工作目录**（即调用 colang 时所在的目录），而非源文件所在目录。`-o` 指定的目录若不存在，链接步会直接报错（`cannot open output file ...`），colang **不会**自动创建该目录。
+
 链接方式调用时，中间的 `.obj` 写在系统临时目录，链接完成后自动删除。
+
+## 使用示例
+
+以下示例都在命令行所在目录执行，产物落在同一**当前目录**：
+
+```
+colang hello.co                    # 编译并链接，产出当前目录下的 hello.exe
+colang hello.co -o app.exe         # 同上，输出改名为 app.exe
+colang -c hello.co                 # 仅编译，产出当前目录下的 hello.obj
+colang -E hello.co                 # 仅预处理，把展开后的 token 清单打到标准输出
+colang -I myinc hello.co           # 追加头文件 / import 模块的搜索目录 myinc
+colang -luser32 app.c              # 纯 .c 档在链接时拉入外部库 user32
+colang --resource app.rc app.co    # 先嵌入 PE 资源 app.rc，再链接为 app.exe
+```
 
 ## 版本号的四段形式
 

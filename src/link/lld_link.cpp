@@ -230,6 +230,51 @@ std::string find_gcc_lib_dir()
 	}
 	return {};
 }
+
+// P385：从输出文件名识别共享对象及其版本后缀，并算出 SONAME。
+//   接受形态：NAME.so / NAME.so.M / NAME.so.M.m / NAME.so.M.m.p（M/m/p 为十进制段）。
+//   SONAME 口径：无版本（NAME.so）→ 原样 NAME.so；带版本 → NAME.so.M（取主版本号）。
+//   非共享对象（结尾不是 .so/.so.数字）→ is_so=false、返回空串。
+std::string soname_of(const std::string &out_path, bool &is_so)
+{
+	is_so = false;
+	const std::string name = std::filesystem::path(out_path).filename().string();
+	const std::size_t pos = name.rfind(".so");
+	if (pos == std::string::npos)
+		return {};
+	const std::size_t after = pos + 3;  // ".so" 之后
+	std::size_t i = after;
+	std::string major;
+	const bool has_version = (i < name.size());
+	if (has_version)
+	{
+		if (name[i] != '.')
+			return {};  // 如 ".soft"：非共享对象
+		++i;
+		const std::size_t ds = i;
+		while (i < name.size() && std::isdigit(static_cast<unsigned char>(name[i])))
+			++i;
+		if (i == ds)
+			return {};  // ".so." 后无数字
+		major = name.substr(ds, i - ds);
+		// 余下须为若干 ".<digits>" 段或结尾
+		while (i < name.size())
+		{
+			if (name[i] != '.')
+				return {};
+			++i;
+			const std::size_t s2 = i;
+			while (i < name.size() && std::isdigit(static_cast<unsigned char>(name[i])))
+				++i;
+			if (i == s2)
+				return {};
+		}
+	}
+	is_so = true;
+	if (!has_version)
+		return name;  // NAME.so → soname NAME.so
+	return name.substr(0, after) + "." + major;  // NAME.so.M
+}
 #endif
 }  // namespace
 
@@ -355,8 +400,9 @@ bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
 	const std::filesystem::path crt(crt_dir);
 	// P381：依输出扩展名分岔——*.so → 共享对象（-shared、动态 libc、无 crt1.o/_start）；
 	//   其余 → 静态可执行文件（-static、libc.a、crt1.o）。exe 分支逐字维持现状。
-	const bool as_so = out_path.size() >= 3 &&
-	                   out_path.compare(out_path.size() - 3, 3, ".so") == 0;
+	// P385：.so 判定放宽为「NAME.so 或 NAME.so.M[.m[.p]]」，并据主版本号算 SONAME。
+	bool as_so = false;
+	const std::string soname = soname_of(out_path, as_so);
 	// libc 存在性预检：exe 查 libc.a（静态）、.so 查 libc.so（动态）；缺失给专一诊断，避免 lld 的泛化 undefined/-lc not found。
 	{
 		std::error_code ec;
@@ -384,6 +430,9 @@ bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
 	for (const auto &o : objs)
 		argv.push_back(o);
 	argv.emplace_back(as_so ? "-shared" : "-static");
+	// P385：共享对象带 SONAME（NAME.so 或 NAME.so.M），供运行时按名解析、版本隔离。
+	if (as_so && !soname.empty())
+		argv.emplace_back("--soname=" + soname);
 	argv.emplace_back("-o");
 	argv.push_back(out_path);
 	argv.push_back("-L" + crt_dir);

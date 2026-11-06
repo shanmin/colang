@@ -1,6 +1,7 @@
 # Summary
 
 - [Introduction](README.md)
+- [Getting Started with Co](walkco.md)
 - [Program Entry and Execution](entry.md)
 - [Function Definition](function.md)
 - [Attributes ([[...]])](attribute.md)

@@ -682,6 +682,27 @@ struct Parser
 		seed_import_typedefs(); // P304：再登记跨模块 public typedef 种子（携带底层类型）
 		while (!at_end())
 		{
+			// P386 Co 层应用级属性指令：文件作用域里独立的 `[[...]]` 属性表（其后不接声明）。
+			//   判定口径：先试解析属性表，peek 后继 token——若 !is_type_start()（即接 import / 裸语句 /
+			//   `;` / `}` / EOF）→ 认定为应用级指令，并入 TU 级标志后 continue（其后的 import/语句交下一轮
+			//   既有分支处理）；否则（其后是声明起始，或属性表本身有致命语法错）回滚 pos/errs，落既有
+			//   「声明/语句属性前缀」路径——函数级 [[subsystem]] 贴 main/WinMain 的行为逐字不变。仅 .co 生效。
+			if (is_co_source_file(peek().loc.file) &&
+				check_punct("[") && peek(1).kind == TokKind::Punct && peek(1).text == "[")
+			{
+				const std::size_t save_pos = pos;
+				const std::size_t save_errs = errs.size();
+				DeclAttributes app_attrs;
+				parse_attributes(app_attrs, true);
+				if (!attr_fatal_ && !is_type_start())
+				{
+					apply_application_attributes(*tu, app_attrs);
+					continue;
+				}
+				pos = save_pos;
+				errs.resize(save_errs);
+				attr_fatal_ = false;
+			}
 			// P212 Co 层：`import` 前置识别。词法上属 Keyword，不匹 is_type_start
 			//   → parse_global_decl_or_func 失败回滚 → 落入裸语句兜底 → 会误报
 			//   “expected declaration or statement”而无法产 ImportDecl；此处短路。
@@ -2502,6 +2523,32 @@ struct Parser
 		if (eval_const_int(cond) == 0)
 			error(loc, "static assertion failed" + (msg.empty() ? std::string() : ": " + msg));
 		return true;
+	}
+
+	// P386：文件作用域应用级属性指令的处理——目前仅 [[subsystem]] 具有应用级语义。
+	//   其余已识别属性（deprecated/nodiscard/noreturn/lib）本质须附着于声明，落应用位报错；
+	//   未知属性在 parse_attributes 里已按 "unknown attribute ignored" 处理，此处不重复。
+	//   subsystem 跨两条应用级指令重复 → 「can only be applied once」，与声明位同口径。
+	void apply_application_attributes(TranslationUnit &tu, const DeclAttributes &a)
+	{
+		SourceLoc loc = a.spellings.empty() ? SourceLoc{} : a.spellings.front().first;
+		if (a.deprecated)    error(loc, "'deprecated' attribute at file scope requires a declaration");
+		if (a.nodiscard)     error(loc, "'nodiscard' attribute at file scope requires a declaration");
+		if (a.noreturn_attr) error(loc, "'noreturn' attribute at file scope requires a declaration");
+		if (a.has_lib)       error(loc, "'lib' attribute at file scope requires a declaration");
+		if (a.subsystem_windows)
+		{
+			for (const auto &sp : a.spellings)
+				if (sp.second == "subsystem") { loc = sp.first; break; }
+			if (tu.app_subsystem_windows)
+			{
+				error(loc, "'subsystem' attribute can only be applied once");
+				return;
+			}
+			tu.app_subsystem_windows = true;
+			tu.app_subsystem_loc = loc;
+		}
+		// [[subsystem("console")]] → subsystem_windows 保持 false（显式默认、无效果），合法接受。
 	}
 
 	bool parse_global_decl_or_func(TranslationUnit &tu)

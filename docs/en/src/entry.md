@@ -1,6 +1,6 @@
 # Program Entry and Execution
 
-> This chapter describes Co's program entry and execution model. **Entry dispatch, optional `main`, top-level `return` and the exit-code model are implemented since 0.2.0; cross-module (`import`) top-level execution in a centralized topological order is implemented since 0.3.0; the Windows GUI entry `WinMain` and the `[[subsystem("windows")]]` subsystem switch are implemented since 0.3.1; the top-level built-in command-line `argc`/`argv` are implemented since 0.5.5 (see "Command-line arguments")**.
+> This chapter describes Co's program entry and execution model. **Entry dispatch, optional `main`, top-level `return` and the exit-code model are implemented since V0.2.0; cross-module (`import`) top-level execution in a centralized topological order is implemented since V0.3.0; the Windows GUI entry `WinMain` and the `[[subsystem("windows")]]` subsystem switch are implemented since V0.3.1; the top-level built-in command-line `argc`/`argv` are implemented since V0.5.5 (see "Command-line arguments")**.
 
 ## Top-level statements run in order
 
@@ -45,7 +45,7 @@ Key point: **a `return` at the top level ends the whole program** (not some func
 
 ## Command-line arguments
 
-Since **0.5.5**, the `.co` top-level entry (the case where you **do not write `main`** and the compiler synthesizes the console entry) can directly reference two compiler **built-in names**, `argc` and `argv`:
+Since **V0.5.5**, the `.co` top-level entry (the case where you **do not write `main`** and the compiler synthesizes the console entry) can directly reference two compiler **built-in names**, `argc` and `argv`:
 
 - `argc` is an `int`, the number of arguments (including the program name itself, so `argc >= 1`);
 - `argv` is a `char**` (a pointer to strings); `argv[0]` is usually the program's own path, followed by the arguments in order;
@@ -73,7 +73,7 @@ If a program has **neither top-level statements nor `main`** (there is genuinely
 
 ## Cross-module execution timing
 
-Since **0.3.0**, when a program consists of several modules (`.co` files) that `import` one another, each module's top-level statements follow:
+Since **V0.3.0**, when a program consists of several modules (`.co` files) that `import` one another, each module's top-level statements follow:
 
 - **Exactly once at first load**: no matter how many times a module is imported, its top-level code runs only once.
 - **Centralized topological order**: all imported modules' top-level statements are emitted **before the main entry**, arranged in DFS-postorder of the dependency closure (dependencies run before dependents). The physical position of `import` lines in the main source has no effect on this order.
@@ -83,14 +83,14 @@ See the "import (Module Import)" and "Module" chapters for details.
 
 ## Currently implemented boundary
 
-Since **0.2.0**, entry dispatch and exit-code behavior are implemented as specified above:
+Since **V0.2.0**, entry dispatch and exit-code behavior are implemented as specified above:
 
 - When a file contains top-level bare statements, the compiler synthesizes an entry and runs the top level in source order; if a user-defined `main` also exists, `main` is entered automatically after all top-level statements finish, and `main`'s return value becomes the exit code.
 - `return V;` at the top level ends the whole program immediately with exit code `V`; a bare `return;` uses exit code `0`.
 - A file with neither top-level bare statements nor `main`: when producing an executable, the compiler warns and still emits an empty entry that does nothing and exits with code `0`.
 - Pure C style (no top-level bare statements + a `main`) keeps the traditional C entry chaining and does not enter the synthesized entry.
-- **Windows GUI entry** (since 0.3.1): defining `WinMain` in the source takes the GUI entry (no console); or mark the entry function with `[[subsystem("windows")]]` to switch to the windows subsystem. `WinMain` is mutually exclusive with top-level bare statements and must take 4 parameters.
-- **Command-line arguments** (since 0.5.5): the `.co` top-level entry (synthesized console `main`) has built-in `argc`(`int`)/`argv`(`char**`), iterated by the `argc` count with `argv[argc]==NULL`; valid only as built-in names in the synthesized entry's top-level code (referencing `argv` in `.c`/`-o *.dll`/`*.so`/`WinMain` reports undeclared); an explicit `main` (pure C style) still receives argc/argv as parameters.
+- **Windows GUI entry** (since V0.3.1): defining `WinMain` in the source takes the GUI entry (no console); or mark the entry function with `[[subsystem("windows")]]` to switch to the windows subsystem. `WinMain` is mutually exclusive with top-level bare statements and must take 4 parameters.
+- **Command-line arguments** (since V0.5.5): the `.co` top-level entry (synthesized console `main`) has built-in `argc`(`int`)/`argv`(`char**`), iterated by the `argc` count with `argv[argc]==NULL`; valid only as built-in names in the synthesized entry's top-level code (referencing `argv` in `.c`/`-o *.dll`/`*.so`/`WinMain` reports undeclared); an explicit `main` (pure C style) still receives argc/argv as parameters.
 
 Not yet provided:
 

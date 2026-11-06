@@ -377,6 +377,11 @@ void merge_bundle(TranslationUnit &main_tu,
 		//   仅供按模块视角解 alias.Tag；**不并入 main_tu.imports**（维持下方「sub.imports 不搬」
 		//   不变量），故既有裸名/可见性走查逐字不变。
 		main_tu.module_import_views.emplace_back(*rit, sub.imports);
+		// P386：子模块文件作用域的应用级 [[subsystem("windows")]] 不影响宿主进程（对齐
+			//   P231 入口属性仅主模块生效）——不并入 main_tu.app_subsystem_windows（子模块置自身
+			//   TU、合并后即弃），但登记 (模块 key, 位置) 供 sema 逐条报 ignored-attributes 警告。
+		if (sub.app_subsystem_windows)
+			main_tu.imported_app_subsystems.emplace_back(*rit, sub.app_subsystem_loc);
 		// 拓序前插时子模块顶层裸语句项数（供 imported_stmt_prefix 累加）。
 		const std::size_t sub_stmt_count = sub.top_level_body.size();
 		// P212 归属标记：将子模块中所有顶层项的 source_module_key = 规范化绝对路径（*rit）。

@@ -216,6 +216,9 @@ struct CodeGenImpl
 	// 路 B / P381：ELF 共享对象产出——`-o *.so` 判定（driver→codegen 透传）。为真时 emit 走
 	//   PIC 下降、入口合成改走 .init_array 载体（synthesize_init_ctor）；exe/.dll/纯 C 恒 false。
 	bool output_is_so_ = false;                      // generate() 从 opts 注入
+	// P384：静态库归档产出——`-o *.lib`/`*.a` 判定（driver→codegen 透传）。为真时入口合成
+	//   整体跳过（不合成 main/DllMain/init_ctor），避免归档成员携带 main 与消费方 exe 冲突。
+	bool output_is_archive_ = false;                 // generate() 从 opts 注入
 	// 路 B 阶段3：`.co` 新面标志（仅 .co 的 WinMain/DllMain 载体参与顶层初始化捕获，
 	//   纯 C 档恒 false、逐字不变）。
 	bool is_co_ = false;                             // generate() 从 opts 注入
@@ -1691,6 +1694,9 @@ struct CodeGenImpl
 			if (f.subsystem_windows) windows_subsystem_ = true;
 		}
 		if (use_winmain_) windows_subsystem_ = true;
+		// P386：应用级文件作用域 [[subsystem("windows")]]——仅主源 TU 携带（merge 不并子模块），
+		//   直接置 windows 子系统；与函数级同走「windows 子系统 + 非 WinMain → 钉 mainCRTStartup」。
+		if (tu.app_subsystem_windows) windows_subsystem_ = true;
 		// ============================================================
 		// P211 A.4 入口合成（仅当非"纯 C 档"）
 		//   has_bare = 顶层裸指令存在（.co 新面）
@@ -1712,7 +1718,13 @@ struct CodeGenImpl
 			//   ① `.co` 产 DLL → 合成 DllMain（PROCESS_ATTACH 跑顶层初始化、转发用户 DllMain）；
 			//   ② `.co` GUI exe（WinMain 入口）且有顶层初始化内容 → 包裹 WinMain 转发；
 			//   ③ 其余非纯 C 档 → 原 main 合成（逐字等价）。
-			if (output_is_dll_ && is_co_)
+			if (output_is_archive_)
+			{
+				// P384：静态库归档——不合成任何入口（main/DllMain/init_ctor）。
+				//   归档成员若携带合成 main，会与消费方 exe 自身的 main 撞 LNK2005（multiply defined）。
+				//   库模块应为纯声明/函数定义（无顶层裸代码）；顶层初始化载体不适用于归档。
+			}
+			else if (output_is_dll_ && is_co_)
 			{
 				synthesize_dllmain(tu, tl_pending_inits);
 			}
@@ -9306,7 +9318,40 @@ bool generate(const CompileOptions &opts, CompileState &state, std::vector<Error
 			return true;
 		};
 		cg.output_is_dll_ = opts.link_output && ci_ends(".dll");
-		cg.output_is_so_ = opts.link_output && ci_ends(".so");
+		// P385：`.so` 判定放宽为含版本后缀（NAME.so / NAME.so.M[.m[.p]]），与 lld_link 的
+		//   soname_of 同口径——否则 `libfoo.so.1.2.3` 会漏走 SO 载体（误合成 main）。
+		auto is_so_output = [&op]() -> bool
+		{
+			const std::size_t pos = op.rfind(".so");
+			if (pos == std::string::npos)
+				return false;
+			std::size_t i = pos + 3;
+			if (i >= op.size())
+				return true;  // NAME.so
+			if (op[i] != '.')
+				return false;  // 如 ".soft"
+			++i;
+			const std::size_t s = i;
+			while (i < op.size() && std::isdigit((unsigned char)op[i]))
+				++i;
+			if (i == s)
+				return false;  // ".so." 后无数字
+			while (i < op.size())
+			{
+				if (op[i] != '.')
+					return false;
+				++i;
+				const std::size_t s2 = i;
+				while (i < op.size() && std::isdigit((unsigned char)op[i]))
+					++i;
+				if (i == s2)
+					return false;
+			}
+			return true;
+		};
+		cg.output_is_so_ = opts.link_output && is_so_output();
+		// P384：静态库归档（.lib/.a）——随 host 在链接层选形，codegen 侧只需知道「不合成入口」。
+		cg.output_is_archive_ = opts.link_output && (ci_ends(".lib") || ci_ends(".a"));
 	}
 	// 路 B 阶段3：`.co` 新面标志（driver 同口径的后缀判定）。
 	{

@@ -16,7 +16,7 @@ One invocation handles **one** source file. When no action option is given, the 
 | `-v`, `--version` | Show the compiler version (four segments), the LLVM version used, and the target platform |
 | `-E` | Preprocess only; send the expanded token listing to standard output |
 | `-c` | Compile only; produce an object file (COFF `.obj` for a Windows target, ELF `.o` for a Linux target) without linking |
-| `-o <file>` | Write the output to `<file>` |
+| `-o <file>` | Write the output to `<file>`; when omitted, the name follows the "Output files and default names" section |
 | `-I <dir>` | Add a header search directory; may also be written `-I<dir>` and repeated |
 | `--target <triple>` | Set the target triple (e.g. `x86_64-unknown-linux-gnu`); defaults to the host platform when omitted |
 | `--resource <file>` | Embed a PE resource into the executable; may be repeated. Accepts a `.rc` (compiled by the built-in resource compiler) or a precompiled `.res` (embedded as-is). Windows targets only |
@@ -28,10 +28,26 @@ One invocation handles **one** source file. When no action option is given, the 
 | Action | Output | Default name when `-o` is omitted |
 | --- | --- | --- |
 | Default (compile + link) | Executable | Windows: `<source basename>.exe`; other platforms: `<source basename>` |
-| `-c` | `.obj` object file | `<source basename>.obj`, left in the current directory |
+| `-c` | `.obj` object file | `<source basename>.obj` |
 | `-E` | Standard output | Always goes to standard output; `-o` has no effect |
 
+When `-o` is omitted, all of the default outputs above are written to the **current working directory** (the directory from which colang is invoked), not next to the source file. If the directory given to `-o` does not exist, the link step fails outright (`cannot open output file ...`); colang does **not** create the directory for you.
+
 When linking, the intermediate `.obj` is written to the system temporary directory and removed automatically after the link.
+
+## Usage examples
+
+All examples below are run from the command-line directory; outputs land in that same **current directory**:
+
+```
+colang hello.co                    # compile and link, producing hello.exe in the current directory
+colang hello.co -o app.exe         # same, but rename the output to app.exe
+colang -c hello.co                 # compile only, producing hello.obj in the current directory
+colang -E hello.co                 # preprocess only, sending the expanded token listing to standard output
+colang -I myinc hello.co           # add myinc as a header / import-module search directory
+colang -luser32 app.c              # pull in external library user32 at link time for a pure .c unit
+colang --resource app.rc app.co    # embed the PE resource app.rc, then link into app.exe
+```
 
 ## The four-segment version
 

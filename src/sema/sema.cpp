@@ -544,6 +544,10 @@ public:
 				if (f.subsystem_windows && f.name != "main" && f.name != "WinMain")
 					warn(f.loc, "'subsystem' attribute is only effective on the entry function 'main' or 'WinMain'", "ignored-attributes");
 			}
+			// P386：导入模块里的应用级（文件作用域）[[subsystem("windows")]] 无效果（子系统由主模块决定），
+			//   逐条报 ignored-attributes，与函数级导入模块属性同口径（P231）。
+			for (const auto &ia : tu->imported_app_subsystems)
+				warn(ia.second, "'subsystem' attribute in an imported module has no effect; the subsystem is determined by the main module only", "ignored-attributes");
 			if (winmain_fn)
 			{
 				// 路 B 阶段3：WinMain 入口与顶层裸指令不再互斥——codegen 合成 WinMain 载体
@@ -578,6 +582,41 @@ public:
 				return true;
 			};
 			if (ci_ends(".dll")) return;
+			// P384/P385：静态库归档（.lib/.a）与共享对象（.so / .so.M[.m[.p]]）均无 exe 入口语义，
+			//   「无入口点」告警不适用（库模块无 main 属正常）。
+			if (ci_ends(".lib") || ci_ends(".a")) return;
+			{
+				const std::size_t spos = op.rfind(".so");
+				if (spos != std::string::npos)
+				{
+					std::size_t j = spos + 3;
+					bool so = true;
+					if (j < op.size())
+					{
+						if (op[j] != '.')
+							so = false;
+						else
+						{
+							++j;
+							const std::size_t ds = j;
+							while (j < op.size() && std::isdigit((unsigned char)op[j]))
+								++j;
+							if (j == ds)
+								so = false;
+							while (j < op.size() && so)
+							{
+								if (op[j] != '.') { so = false; break; }
+								++j;
+								const std::size_t s2 = j;
+								while (j < op.size() && std::isdigit((unsigned char)op[j]))
+									++j;
+								if (j == s2) { so = false; break; }
+							}
+						}
+					}
+					if (so) return;
+				}
+			}
 		}
 		bool has_bare = !tu->top_level_body.empty();
 		bool has_user_main = false;

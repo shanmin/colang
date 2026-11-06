@@ -50,4 +50,15 @@ bool link_elf(const std::vector<std::string> &objs, const std::string &out_path,
               const SymRefMap &sym_refs,
               std::vector<Error> &errors);
 
+// P384：把 objs 归档为静态库 out_path（不链接、不链 CRT、无入口，仅打包目标文件 + 符号索引）。
+// 触发＝out_path 扩展名（随 host 构建分平台，与链接层铁律同口径）：
+//   Windows 构建 .lib → COFF 归档（object::Archive::K_COFF）；
+//   Linux 构建   .a   → GNU  归档（object::Archive::K_GNU）。
+// 走 LLVM object::writeArchive（Object 组件已链入），Deterministic=true 保可复现。
+// 交叉格式（Windows 构建收到 .a、Linux 构建收到 .lib）由调用方（main.cpp）先行拦下报错，
+//   本函数只在匹配 host 的扩展名时被调用。
+// 成功返回 true；失败把诊断追加到 errors 并返回 false。
+bool link_archive(const std::vector<std::string> &objs, const std::string &out_path,
+                  std::vector<Error> &errors);
+
 }  // namespace colang

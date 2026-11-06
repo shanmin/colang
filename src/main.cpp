@@ -716,6 +716,58 @@ int main(int argc, char **argv)
 			if (opts.target.is_windows)
 				out_path += ".exe";
 		}
+		// P384：静态库归档产出——-o 扩展名命中 .lib/.a 时打包目标文件、不链接。
+		// 随 host 构建分平台：Windows 构建认 .lib（COFF）、Linux 构建认 .a（GNU）；
+		//   请求对侧格式→专一诊断、不回退成 exe。
+		{
+			std::string aext = std::filesystem::path(out_path).extension().string();
+			for (auto &c : aext)
+				c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+			const bool want_lib = (aext == ".lib");
+			const bool want_a = (aext == ".a");
+			if (want_lib || want_a)
+			{
+				const bool native_archive =
+#ifdef _WIN32
+					want_lib; // Windows 构建：.lib 为本机归档
+#else
+					want_a; // Linux 构建：.a 为本机归档
+#endif
+				if (!native_archive)
+				{
+					errors.push_back(colang::Error{out_path, colang::Pos{1, 1},
+						std::string("linker: static archive '") + aext +
+							"' is not produced by this "
+#ifdef _WIN32
+							"(Windows/COFF) build; use -o <name>.lib",
+#else
+							"(Linux/ELF) build; use -o <name>.a",
+#endif
+						false});
+					print_errors(std::vector<colang::Error>{errors.back()});
+					std::fprintf(stderr, "colang: error: archiving failed\n");
+					return 1;
+				}
+				const std::size_t pre_arch_size = errors.size();
+				const bool ok_arch = colang::link_archive(objs, out_path, errors);
+				std::error_code ec;
+				for (const std::string &o : objs)
+					std::filesystem::remove(o, ec);
+				for (const std::string &tr : rc_temp_res)
+					std::filesystem::remove(tr, ec);
+				if (!ok_arch)
+				{
+					if (errors.size() > pre_arch_size)
+						print_errors(std::vector<colang::Error>(
+							errors.begin() +
+								static_cast<std::ptrdiff_t>(pre_arch_size),
+							errors.end()));
+					std::fprintf(stderr, "colang: error: archiving failed\n");
+					return 1;
+				}
+				return 0;
+			}
+		}
 		// 记录链接前的诊断数量——链接失败时仅打印新增的链接错误，避免重复输出已打印的编译 warning。
 		const std::size_t pre_link_size = errors.size();
 		// 链接层按 target 分平台：Windows → 进程内 lldCOFF；Linux → 进程内 lldELF。

@@ -611,6 +611,14 @@ struct TranslationUnit
 	//   查不到回退裸名。「判据不变、只换存放形态」：取代旧的逐节点 `FuncDecl`/`GlobalVar::symbol_name` 字段
 	//   （每份声明各存一份的派生状态）。非分桶或未经 build_catalog 时表恒空 ⇒ 全部回退裸名、与旧默认路径逐字等价。
 	std::unordered_map<std::string, std::string> symbol_table;
+	// P386 Co 层应用级属性：文件作用域 `[[subsystem("windows")]]` 属性指令（独立于声明/语句的
+	//   应用级标志）。仅主源 TU 生效——merge_bundle 不把子模块的本标志并入（子模块置自身 TU、
+	//   合并后即弃），与 P231「入口属性仅主模块生效」同口径；子模块侧经 imported_app_subsystems
+	//   登记供 sema 出 ignored-attributes 警告。parser 写、codegen 读、经 CompileState 交链接层。
+	bool app_subsystem_windows = false;
+	SourceLoc app_subsystem_loc; // 应用级 [[subsystem]] 指令位置（诊断定位用）
+	//   导入模块里的应用级 subsystem（模块 key, 位置）：无效果、sema 逐条报 ignored-attributes。
+	std::vector<std::pair<std::string, SourceLoc>> imported_app_subsystems;
 };
 
 using TUPtr = std::shared_ptr<TranslationUnit>;

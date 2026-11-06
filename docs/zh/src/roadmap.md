@@ -17,34 +17,34 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 
 | 版本  | 主题                          | 状态   |
 | --- | --------------------------- | ---- |
-| 0.1.0 | C 语言编译器                     | 已发布  |
-| 0.2.0 | Co 入口模型 + `public`           | 已发布  |
-| 0.3.0 | 实现链接                        | 已发布  |
-| 0.3.1 | Windows GUI 与 `winapi.co`      | 已发布  |
-| 0.3.2 | Linux 原生 ELF 工具链            | 已发布  |
-| 0.4.0 | 实现 class                   | 已发布  |
-| 0.4.1 | 诊断符合性与 winapi 扩容     | 已发布  |
-| 0.6.0 | 复数核心切片 + 标准库头补全 + 链接诊断回填 | 已发布  |
+| V0.1.0 | C 语言编译器                     | 已发布  |
+| V0.2.0 | Co 入口模型 + `public`           | 已发布  |
+| V0.3.0 | 实现链接                        | 已发布  |
+| V0.3.1 | Windows GUI 与 `winapi.co`      | 已发布  |
+| V0.3.2 | Linux 原生 ELF 工具链            | 已发布  |
+| V0.4.0 | 实现 class                   | 已发布  |
+| V0.4.1 | 诊断符合性与 winapi 扩容     | 已发布  |
+| V0.6.0 | 复数核心切片 + 标准库头补全 + 链接诊断回填 | 已发布  |
 
 后续 1.\* / 2.\* / 3.\* 具体条目将在 0.\* 收官前由维护方主动细化。
 
 ## 已发布
 
-### 0.1.0 — C 语言编译器
+### V0.1.0 — C 语言编译器
 
 - C17 完整覆盖，并纳入 C23 关键特性（`_BitInt`、`nullptr`、`auto`、`bool` 按 C++ 语义、属性语法等）。
 - 自制标准库头文件（`colib`），避免跨 ABI 依赖。
 - 通过 Fujitsu `c-testsuite` 一致性测试。
 - 编译器主体：词法 → 预处理 → 语法 → 语义 → LLVM codegen 分层，产出单个 `.bc` 后交外部链接器。
 
-### 0.2.0 — Co 入口模型 + `public`
+### V0.2.0 — Co 入口模型 + `public`
 
 - 顶层命令按源码顺序执行，可**不写 `main`**（编译器合成入口）。
 - 用户自写 `main` 与合成入口共存、顶层 `return V;` 决定进程退出码。
 - `public` 关键字标注导出符号；`-o *.dll` / `-o *.so` 由输出扩展名自动切换产物形态。
 - 无入口三档规则：有顶层裸指令→正常执行；无裸指令但有 `main`→转调不警告；两者都无→警告 + 空 `ret 0`。
 
-### 0.3.0 — 实现链接
+### V0.3.0 — 实现链接
 
 首发交付 `import`（`.co` 源合并）与「链接核心」（下列已勾选项）；未勾选条目滚动至后续里程碑。
 
@@ -59,10 +59,10 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - [ ] DLL 场景下的 `DllMain` 合成与顶层段触发时机细化。
 - [x] 用户可见的命令行参数 `argv`：已按 **route A** 交付（`.co` 顶层入口内建 `argc`(`int`) + `argv`(`char**`)，C 形自足、靠 `argc` 计数遍历、`argv[argc]==NULL`），**与数组自带长度基础设施解耦**；`argv` 作为全局可见、自带长度的字符串数组值类型仍待 D37（与 `string`/通用数组同批）。
 
-### 0.3.1 — Windows GUI 与 winapi.co
+### V0.3.1 — Windows GUI 与 winapi.co
 
 - Windows GUI 子系统与 `WinMain` 入口：`[[subsystem("windows")]]` 或源里定义 `WinMain` 即切无控制台产物；`WinMain` 与顶层裸指令互斥。
-- `winapi.co` 标准库模块取代 `windows.h`：起步子集、随版本滚动扩容，至 0.4.0 累计 323 原型 / 39 结构·联合体 / 396 常量（经 SDK 核验），库归属由 `[[lib(...)]]` 声明；程序化 GUI 常用 API 子集（窗口、消息循环、内存 DC 绘制、裁剪、文本度量、系统颜色）。
+- `winapi.co` 标准库模块取代 `windows.h`：起步子集、随版本滚动扩容，至 V0.4.0 累计 323 原型 / 39 结构·联合体 / 396 常量（经 SDK 核验），库归属由 `[[lib(...)]]` 声明；程序化 GUI 常用 API 子集（窗口、消息循环、内存 DC 绘制、裁剪、文本度量、系统颜色）。
 - `const` 一致性：只读强制落地（诊断与 clang 对齐）；`public const int` 跨模块穿透数组维度与 `switch` 的 `case` 标签，非常量标签从静默折 0 改为报错。
 - 属性首批语义：`[[nodiscard]]` / `[[noreturn]]` 生效，`[[deprecated]]` 同位重复标注 first-wins。
 - C 符合性批次：指定初始化器全链（链式设计符、匿名聚合提升、`union` 宿主、位域初始化掩码写入、DFS 续位）、`sizeof`/`_Alignof` 常量语境扩展、标识符与字面量通用字符名（`\uXXXX`/`\UXXXXXXXX`）、带前缀字符常量定型、`_Alignas` 语境约束与跨声明一致性、`static_assert` 多作用域。
@@ -72,7 +72,7 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - Co 层裸标签（C++ 风格）：`.co` 里 `struct`/`union`/`enum` 可省略关键字作类型（`Point p;`），被 import 的 `public` 标签同样可裸用。
 - 发布包版本号扩为四段 `MAJOR.MINOR.PATCH.Build`（第四段为构建计数，`-v` 与产物 PE 版本信息同步）。
 
-### 0.3.2 — Linux 原生 ELF 工具链
+### V0.3.2 — Linux 原生 ELF 工具链
 
 - 单一 target/data-model 抽象（`__LP64__`/`__LLP64__`）贯穿预处理宏、类型宽度、代码生成与链接，消除前端与后端的数据模型分裂。
 - Linux 上由进程内 `lld::elf` **静态**链本机 glibc/libgcc 产出原生 ELF 可执行文件（不依赖外部链接器）；`crt1.o`/`libc.a`/`libm.a`/`libgcc` 自动定位。
@@ -82,7 +82,7 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - 新增默认设置头 `include/colang.h` 自动预加载。
 - 后续（长尾）：`.so` 动态共享对象、动态 PIE、x86-64 SysV ABI 边角、`winapi.co` 的 ELF 映射、全 stdlib 头 glibc 审计。
 
-### 0.4.0 — 实现 class
+### V0.4.0 — 实现 class
 
 - `class` 引用类型 + `new` 实例化 + `this` 成员访问。
 - 四个生命周期协议：`__new__` / `__retain__` / `__release__` / `__delete__`。
@@ -92,7 +92,7 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - 已交付增量（超出原计划）：成员与形参类型放开（`class` 句柄、`struct`/`union`/数组值语义内嵌；形参借用、成员宿主拥有）；`delete` 语句强制销毁与断环；`goto`/`break`/`continue` 路径终结的正确释放。
 - 后续（长尾）：继承与虚函数；被 `import` 模块的 `public class` 跨模块消费；多 obj（`--per-module`）下的 class 形态；环形引用自动断环（现靠 `delete` 强破）。
 
-### 0.4.1 — 诊断符合性与 winapi 扩容
+### V0.4.1 — 诊断符合性与 winapi 扩容
 
 - 诊断符合性大批：编译期错误/警告及诊断上下文全面向 clang 与 ISO C/C++ 对齐，收敛多处静默错值/误判（含文件作用域 `bool`/整型常量折叠按「非零即真」修正）。
 - 诊断改进：每条 error/warning 默认附出错行 ±2 行源码与 caret 定位；新增 `-fno-diag-context` 关闭。
@@ -100,7 +100,7 @@ colang（Co 语言编译器）遵循「先完整实现 C 语言编译器，再�
 - Co 层健壮性：修复被 `import` 模块内按值使用跨模块 `public struct` 的退化/崩溃。
 - `winapi.co` 继续扩容：增至约 356 原型 / 45 结构·联合体 / 503 常量，新增 winsock（ws2_32）套接字族、crypt32 字符串编解码族等。
 
-### 0.6.0 — 复数核心切片 + 标准库头补全
+### V0.6.0 — 复数核心切片 + 标准库头补全
 
 - C 复数类型 `float _Complex` / `double _Complex` 核心切片：`+ - * /` 四则运算、`== !=` 比较、常量 `I`（`_Complex_I`），`<complex.h>` 访问器 `creal` / `cimag` / `conj` / `cabs` / `carg` / `projection`（含 `f` 变体）。`cexp` / `clog` / `csqrt` 等超越函数与独立 `_Imaginary` 类型暂未支持。
 - 链接期 `undefined symbol` 诊断回填真实调用点的源码文件与行列。

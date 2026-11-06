@@ -17,34 +17,34 @@ Within 0.\*, **MINOR** bumps denote milestones (a key Co-layer capability). **PA
 
 | Version | Theme                             | Status   |
 | ------- | --------------------------------- | -------- |
-| 0.1.0   | C compiler                        | Released |
-| 0.2.0   | Co entry model + `public`         | Released |
-| 0.3.0   | Linking                           | Released |
-| 0.3.1   | Windows GUI & `winapi.co`         | Released |
-| 0.3.2   | Linux native ELF toolchain        | Released |
-| 0.4.0   | `class`                           | Released |
-| 0.4.1   | Diagnostics conformance & winapi  | Released |
-| 0.6.0   | Complex core slice + stdlib headers + linker diagnostics | Released |
+| V0.1.0   | C compiler                        | Released |
+| V0.2.0   | Co entry model + `public`         | Released |
+| V0.3.0   | Linking                           | Released |
+| V0.3.1   | Windows GUI & `winapi.co`         | Released |
+| V0.3.2   | Linux native ELF toolchain        | Released |
+| V0.4.0   | `class`                           | Released |
+| V0.4.1   | Diagnostics conformance & winapi  | Released |
+| V0.6.0   | Complex core slice + stdlib headers + linker diagnostics | Released |
 
 Details for 1.\* / 2.\* / 3.\* will be finalized by the maintainer before 0.\* wraps up.
 
 ## Released
 
-### 0.1.0 — C compiler
+### V0.1.0 — C compiler
 
 - Full C17 coverage plus key C23 features (`_BitInt`, `nullptr`, `auto`, `bool` following C++ semantics, attribute syntax, etc.).
 - Hand-made `colib` standard headers to avoid cross-ABI dependencies.
 - Passes the Fujitsu `c-testsuite` conformance test suite.
 - Layered compiler structure: lexer → preprocessor → parser → sema → LLVM codegen, producing a single `.bc` that is handed to an external linker.
 
-### 0.2.0 — Co entry model + `public`
+### V0.2.0 — Co entry model + `public`
 
 - Top-level statements execute in source order; a user `main` is not required (the compiler synthesizes the entry).
 - Coexistence of a user-written `main` and the synthesized entry; top-level `return V;` sets the process exit code.
 - The `public` keyword marks exported symbols; `-o *.dll` / `-o *.so` selects the output kind by file extension.
 - Three-way entry rule: bare statements present → normal execution; only `main` → forward without warning; neither → warn and emit an empty `ret 0`.
 
-### 0.3.0 — Linking
+### V0.3.0 — Linking
 
 First delivery covers `import` (`.co` source merge) and the **linking core** (checked items below); unchecked items roll to later milestones.
 
@@ -59,10 +59,10 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - [ ] Refinement of `DllMain` synthesis and top-level body triggering for DLL outputs.
 - [x] User-visible command-line arguments `argv`: delivered via **route A** (`.co` top-level entry has built-in `argc`(`int`) + `argv`(`char**`), C-form and self-contained, iterated by the `argc` count with `argv[argc]==NULL`), **decoupled from the array-with-length infrastructure**; `argv` as a globally visible, self-length-carrying string-array value type still awaits D37 (same batch as `string`/general arrays).
 
-### 0.3.1 — Windows GUI & winapi.co
+### V0.3.1 — Windows GUI & winapi.co
 
 - Windows GUI subsystem and `WinMain` entry: `[[subsystem("windows")]]` or defining `WinMain` switches the artifact to a console-less GUI program; `WinMain` is mutually exclusive with top-level bare statements.
-- `winapi.co` replaces `windows.h`: a starting subset, expanded through 0.4.0 to 323 prototypes / 39 struct-union layouts / 396 constants (SDK-verified), library attribution via `[[lib(...)]]`; a practical subset of programmatic GUI APIs (window, message loop, memory-DC drawing, clipping, text metrics, system colors).
+- `winapi.co` replaces `windows.h`: a starting subset, expanded through V0.4.0 to 323 prototypes / 39 struct-union layouts / 396 constants (SDK-verified), library attribution via `[[lib(...)]]`; a practical subset of programmatic GUI APIs (window, message loop, memory-DC drawing, clipping, text metrics, system colors).
 - `const` consistency: read-only enforcement (diagnostics matching clang); `public const int` values flow across modules into array dimensions and `switch` `case` labels, with non-constant labels now rejected instead of silently folded to 0.
 - First batch of attribute semantics: `[[nodiscard]]` / `[[noreturn]]` in effect; `[[deprecated]]` same-position duplicates accepted first-wins.
 - C-conformance batch: designated initializers across the chain (chained designators, promoted anonymous aggregates, `union` hosts, mask-merged bit-field initialization, DFS continuation), `sizeof`/`_Alignof` in constant contexts, universal character names (`\uXXXX`/`\UXXXXXXXX`) in identifiers and literals, prefixed character constant typing, `_Alignas` context constraints and cross-declaration consistency, `static_assert` in more scopes.
@@ -72,7 +72,7 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - Bare tags in the Co layer (C++ style): in `.co` sources a `struct`/`union`/`enum` may be used as a type without its keyword (`Point p;`), including a `public` tag of an imported module.
 - Release version strings extended to four segments `MAJOR.MINOR.PATCH.Build` (the fourth is a build counter, shown by `-v` and in the PE version info of artifacts).
 
-### 0.3.2 — Linux native ELF toolchain
+### V0.3.2 — Linux native ELF toolchain
 
 - A single target/data-model abstraction (`__LP64__`/`__LLP64__`) drives predefined macros, type widths, code generation and linking, eliminating the front-end/back-end data-model split.
 - On Linux an in-process `lld::elf` **statically** links the local glibc/libgcc into a native ELF executable (no external linker); `crt1.o`/`libc.a`/`libm.a`/`libgcc` are located automatically.
@@ -82,7 +82,7 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - New default settings header `include/colang.h` preloaded automatically.
 - Follow-ups (long tail): `.so` shared objects, dynamic PIE, x86-64 SysV ABI edge cases, ELF mapping of `winapi.co`, glibc audit of all stdlib headers.
 
-### 0.4.0 — class
+### V0.4.0 — class
 
 - Reference type `class` with `new` instantiation and `this` member access.
 - Four lifecycle protocols: `__new__` / `__retain__` / `__release__` / `__delete__`.
@@ -92,7 +92,7 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - Delivered beyond the original plan: member and parameter types opened up (`class` handles, `struct`/`union`/array embedded by value; parameters borrow, members are owned by the host); the `delete` statement for forced destruction and cycle breaking; correct release on `goto`/`break`/`continue` path terminations.
 - Follow-ups (long tail): inheritance and virtual functions; cross-module consumption of a `public class` from an `import`ed module; the class form under multi-obj (`--per-module`); automatic cycle breaking (currently done with `delete`).
 
-### 0.4.1 — Diagnostics conformance & winapi expansion
+### V0.4.1 — Diagnostics conformance & winapi expansion
 
 - Diagnostics-conformance wave: compile-time errors/warnings and the diagnostic context realigned with clang and ISO C/C++, converging several silent-wrong-value/misjudgement sites (file-scope `bool`/integer constant folding now follows "nonzero is true").
 - Diagnostics: every error/warning now shows the offending line with +/-2 lines of surrounding source and a caret; `-fno-diag-context` disables it.
@@ -100,7 +100,7 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 - Co-layer robustness: fixed the degradation/crash when using a cross-module `public struct` by value inside an `import`ed module.
 - `winapi.co` continues to expand: up to roughly 356 prototypes / 45 struct-union layouts / 503 constants, adding the winsock (ws2_32) socket family, the crypt32 string-encoding family, and more.
 
-### 0.6.0 — Complex core slice + stdlib headers
+### V0.6.0 — Complex core slice + stdlib headers
 
 - C complex types `float _Complex` / `double _Complex` core slice: `+ - * /` arithmetic, `== !=` comparison, the constant `I` (`_Complex_I`), and the `<complex.h>` accessors `creal` / `cimag` / `conj` / `cabs` / `carg` / `projection` (with `f` variants). Transcendental functions such as `cexp` / `clog` / `csqrt` and the standalone `_Imaginary` type are not yet supported.
 - Link-time `undefined symbol` diagnostics now report the real call-site file, line and column.
