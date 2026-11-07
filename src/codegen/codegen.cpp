@@ -135,6 +135,8 @@ struct CodeGenImpl
 	// 当前类方法上下文（this 绑定 / 裸成员名解析）
 	std::string cur_class_tag_;
 	llvm::Value *cur_this_ = nullptr;
+	// P396/P397：正在编译属性 getter 体——Return 路径据此抑制句柄 retain（getter 采 borrowed(+0) 模型，读取点已 retain）。
+	bool cur_prop_getter_ = false;
 	// 位域访问信息：key = "tag.member_name"
 	struct BitfieldAccess {
 		unsigned storage_idx;   // LLVM struct 字段索引（存储单元）
@@ -4445,6 +4447,15 @@ struct CodeGenImpl
 			if (!m.name.empty()) field_index_map_[tag + "." + m.name] = i;
 			++i;
 		}
+		// P391 Co class 属性：含自动访问器的属性合成一个隐藏后备字段占布局槽；
+		//   纯显式访问器属性（无 backing）不占存储。
+		for (const auto &p : cd->properties)
+		{
+			if (p.backing_field.empty()) continue;
+			fields.push_back(to_llvm_alloca_type(p.type));
+			field_index_map_[tag + "." + p.backing_field] = i;
+			++i;
+		}
 		if (fields.size() == 1)
 			fields.push_back(llvm::Type::getInt64Ty(ctx)); // 空类保持非零尺寸
 		st->setBody(fields, false);
@@ -4482,6 +4493,42 @@ struct CodeGenImpl
 	static std::string class_static_symbol(const ClassDef &cd, const std::string &name)
 	{
 		return class_tag_symbol(cd) + "." + name;
+	}
+
+	// P391 Co class 属性访问器符号：tag_symbol + "." + prop + ".get"/".set"（跨模块自动带 dunder 前缀）。
+	static std::string class_property_accessor_symbol(const ClassDef &cd, const ClassProperty &cp, const std::string &kind)
+	{
+		return class_tag_symbol(cd) + "." + cp.name + "." + kind;
+	}
+	// 属性访问器函数类型：get = ty(ptr this)；set = void(ptr this, ty value)。
+	llvm::FunctionType *class_property_get_ft(const ClassProperty &cp)
+	{
+		return llvm::FunctionType::get(to_llvm_type(cp.type), {llvm::PointerType::getUnqual(ctx)}, false);
+	}
+	llvm::FunctionType *class_property_set_ft(const ClassProperty &cp)
+	{
+		std::vector<llvm::Type *> pts{llvm::PointerType::getUnqual(ctx)};
+		if (cp.has_set) pts.push_back(to_llvm_type(cp.type));
+		return llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), pts, false);
+	}
+	// 属性访问器引用点：本桶无定义时按需建 External 声明（他桶定义经 linkInModule 归并）。
+	llvm::Function *class_property_accessor_ref(const ClassDef &cd, const ClassProperty &cp, const std::string &kind)
+	{
+		const std::string sym = class_property_accessor_symbol(cd, cp, kind);
+		if (llvm::Function *F = module->getFunction(sym)) return F;
+		llvm::FunctionType *ft = (kind == "get") ? class_property_get_ft(cp) : class_property_set_ft(cp);
+		llvm::FunctionCallee FC = module->getOrInsertFunction(sym, ft);
+		if (auto *F = llvm::dyn_cast<llvm::Function>(FC.getCallee())) { F->addFnAttr("uwtable"); return F; }
+		return nullptr;
+	}
+	// P391：按裸 tag + 属性名查属性（非属性/类未定义 → nullptr）。
+	const ClassProperty *find_property(const std::string &tag, const std::string &name)
+	{
+		auto cit = class_defs_.find(tag);
+		if (cit == class_defs_.end()) return nullptr;
+		for (const auto &p : cit->second->properties)
+			if (p.name == name) return &p;
+		return nullptr;
 	}
 
 	// 方法签名：实例方法（含 ctor/dtor）首参隐式 ptr this；static 无 this。
@@ -4745,6 +4792,16 @@ struct CodeGenImpl
 					llvm::Value *f = builder.CreateStructGEP(ct, obj, fi->second, m.name.c_str());
 					builder.CreateStore(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptr_ty)), f);
 				}
+				// P391 Co class 属性：自动后备字段零初始化（malloc 不清零；只读自动属性读取须得确定零值而非垃圾）。
+				for (const auto &p : cd.properties)
+				{
+					if (p.backing_field.empty()) continue;
+					auto fi = field_index_map_.find(tag + "." + p.backing_field);
+					if (fi == field_index_map_.end()) continue;
+					llvm::Value *f = builder.CreateStructGEP(ct, obj, fi->second, p.backing_field.c_str());
+					llvm::Type *ft = to_llvm_alloca_type(p.type);
+					builder.CreateStore(llvm::Constant::getNullValue(ft), f);
+				}
 				if (ctor && ctor->body)
 				{
 					llvm::Function *cf = module->getFunction(base + ".__ctor__");
@@ -4826,6 +4883,20 @@ struct CodeGenImpl
 					llvm::Value *v = builder.CreateLoad(ptr_ty, f);
 					builder.CreateCall(rf, {v});
 				}
+				// P397 句柄型属性：级联 release 句柄型自动属性的合成后备字段（不在 cd.members 内，
+				//   与上面成员 release 同 dunder 口径；__release__ 对 null 跳过，未赋值后备安全）。
+				for (const auto &p : cd.properties)
+				{
+					if (p.backing_field.empty() || !p.type || p.type->kind != TypeKind::Class || p.type->tag.empty()) continue;
+					auto fi = field_index_map_.find(tag + "." + p.backing_field);
+					if (fi == field_index_map_.end()) continue;
+					const ClassDef *bcd = class_def_of(p.type->tag);
+					llvm::Function *rf = bcd ? class_lifecycle_ref(*bcd, ".__release__", class_rc_ft()) : nullptr;
+					if (!rf) continue;
+					llvm::Value *f = builder.CreateStructGEP(ct, obj, fi->second, p.backing_field.c_str());
+					llvm::Value *v = builder.CreateLoad(ptr_ty, f);
+					builder.CreateCall(rf, {v});
+				}
 				builder.CreateCall(free_fn, {obj});
 				builder.CreateRetVoid();
 			}
@@ -4840,6 +4911,145 @@ struct CodeGenImpl
 			std::string ve; llvm::raw_string_ostream vs(ve);
 			if (llvm::verifyFunction(*F, &vs))
 				errs.push_back(Error{cd.loc.file, Pos{cd.loc.line, cd.loc.column}, "IR verification: " + ve});
+		}
+	}
+
+	// P391 Co class 属性：发射单个访问器函数体（镜像 gen_class_method 的 this/成员绑定与收尾）。
+	//   is_get=true 发射 get（ty(ptr this)）；false 发射 set（void(ptr this, ty value)）。
+	void gen_class_property_accessor(const ClassDef &cd, const ClassProperty &cp, bool is_get)
+	{
+		const std::string sym = class_property_accessor_symbol(cd, cp, is_get ? "get" : "set");
+		llvm::Function *F = module->getFunction(sym);
+		if (!F || !F->isDeclaration()) return;
+		const bool auto_acc = is_get ? cp.get_auto : cp.set_auto;
+		// ---- 自动访问器：直接 load/store 隐藏后备字段（无用户体、无 RC/VLA 帧）----
+		if (auto_acc)
+		{
+			builder.SetInsertPoint(llvm::BasicBlock::Create(ctx, "entry", F));
+			llvm::Value *thisarg = &*F->arg_begin();
+			llvm::StructType *ct = get_class_struct_type(cd.tag);
+			auto fi = field_index_map_.find(cd.tag + "." + cp.backing_field);
+			if (fi == field_index_map_.end())
+			{
+				if (is_get) builder.CreateRet(llvm::Constant::getNullValue(F->getReturnType()));
+				else builder.CreateRetVoid();
+				return;
+			}
+			llvm::Value *slot = builder.CreateStructGEP(ct, thisarg, fi->second, cp.backing_field.c_str());
+			if (is_get)
+				builder.CreateRet(builder.CreateLoad(F->getReturnType(), slot));
+			else
+			{
+				llvm::Value *val = F->getArg(1);
+				// P397 句柄型属性：自动 setter 采宿主拥有模型（与成员赋值 gen_assign 同序：先 retain 新、
+				//   后 release 旧、再 store，自赋安全）；标量属性维持裸 store。
+				if (cp.type && cp.type->kind == TypeKind::Class && !cp.type->tag.empty())
+				{
+					const ClassDef *hcd = class_def_of(cp.type->tag);
+					llvm::Type *pty = llvm::PointerType::getUnqual(ctx);
+					llvm::Value *oldv = builder.CreateLoad(pty, slot);
+					if (llvm::Function *rt = hcd ? class_lifecycle_ref(*hcd, ".__retain__", class_rc_ft()) : nullptr)
+						builder.CreateCall(rt, {val});
+					builder.CreateStore(val, slot);
+					if (llvm::Function *rf = hcd ? class_lifecycle_ref(*hcd, ".__release__", class_rc_ft()) : nullptr)
+						builder.CreateCall(rf, {oldv});
+				}
+				else
+					builder.CreateStore(val, slot);
+				builder.CreateRetVoid();
+			}
+			std::string ve; llvm::raw_string_ostream vs(ve);
+			if (llvm::verifyFunction(*F, &vs))
+				errs.push_back(Error{cp.loc.file, Pos{cp.loc.line, cp.loc.column}, "IR verification: " + ve});
+			return;
+		}
+		// ---- 显式访问器：编译用户体（get_body/set_body）----
+		const StmtPtr &body = is_get ? cp.get_body : cp.set_body;
+		if (!body) return; // 防御：非自动却无体（parser 已保证）
+		cur_class_tag_ = cd.tag;
+		cur_this_ = nullptr;
+		cur_func_name_ = sym;
+		vars_.clear(); var_types_.clear(); loop_stack_.clear();
+		label_blocks_.clear(); case_label_bb_.clear(); pending_gotos_.clear();
+		label_rc_depth_.clear(); label_vla_depth_.clear();
+		rc_frames_.clear(); rc_frames_.emplace_back();
+		vla_frames_.assign(1, nullptr);
+		borrowed_slots_.clear();
+		llvm::BasicBlock *entry = llvm::BasicBlock::Create(ctx, "entry", F);
+		builder.SetInsertPoint(entry);
+		auto it = F->arg_begin();
+		llvm::Value *thisarg = &*it; ++it;
+		cur_this_ = thisarg;
+		llvm::StructType *ct = get_class_struct_type(cd.tag);
+		// 裸成员名绑定为 GEP(this, field_idx)，令体内 `_a` ≡ `this._a`（与普通方法体同口径）。
+		for (const auto &m : cd.members)
+		{
+			if (m.is_static || m.name.empty()) continue;
+			auto f = field_index_map_.find(cd.tag + "." + m.name);
+			if (f == field_index_map_.end()) continue;
+			llvm::Value *g = builder.CreateStructGEP(ct, thisarg, f->second, m.name.c_str());
+			vars_[m.name] = g; var_types_[m.name] = m.type;
+		}
+		for (const auto &m : cd.members)
+		{
+			if (!m.is_static || m.name.empty()) continue;
+			auto g = class_static_globals_.find(cd.tag + "." + m.name);
+			if (g != class_static_globals_.end()) { vars_[m.name] = g->second; var_types_[m.name] = m.type; }
+		}
+		// setter 的隐式 value 参数：绑定为属性类型形参槽。
+		if (!is_get && it != F->arg_end())
+		{
+			llvm::Value *valarg = &*it; ++it;
+			llvm::AllocaInst *al = builder.CreateAlloca(valarg->getType(), nullptr, "value");
+			builder.CreateStore(valarg, al);
+			vars_["value"] = al; var_types_["value"] = cp.type;
+		}
+		// P394：属性访问器体内上下文关键字 field ≡ 本属性合成后备字段——绑到与自动访问器
+		//   同一个 GEP(this, backing_idx)，读写共享同一存储。仅在属性为自动实现（backing_field 非空，
+		//   即留有裸 get;/set;）时绑定；非自动体内的裸 field 由 sema 拒收（此不绑定）。此绑定置于成员
+		//   绑定之后，故类内即便声明了名为 field 的成员，裸 field 仍指后备；this.field 经 Member+cur_this_
+		//   偏移解析、不走 vars_，仍达该成员（与用户规则 B 一致）。
+		if (!cp.backing_field.empty())
+		{
+			auto fi = field_index_map_.find(cd.tag + "." + cp.backing_field);
+			if (fi != field_index_map_.end())
+			{
+				llvm::Value *fb = builder.CreateStructGEP(ct, thisarg, fi->second, cp.backing_field.c_str());
+				vars_["field"] = fb; var_types_["field"] = cp.type;
+			}
+		}
+		cur_prop_getter_ = is_get; // P396/P397：getter 体走 Return 路径时抑制 retain(+0 模型)，与读取点 retain 相配
+		gen_stmt(body, F);
+		llvm::BasicBlock *cur = builder.GetInsertBlock();
+		if (cur && (cur->empty() || !cur->back().isTerminator()))
+		{
+			release_all_rc();
+			vla_restore_emit(0);
+		}
+		cur = builder.GetInsertBlock();
+		if (cur->empty() || !cur->back().isTerminator())
+		{
+			if (F->getReturnType()->isVoidTy())
+				builder.CreateRetVoid();
+			else
+				builder.CreateRet(llvm::Constant::getNullValue(F->getReturnType()));
+		}
+		for (llvm::BasicBlock &bb : *F)
+			if (bb.empty()) { builder.SetInsertPoint(&bb); builder.CreateUnreachable(); }
+		std::string ve; llvm::raw_string_ostream vs(ve);
+		if (llvm::verifyFunction(*F, &vs))
+			errs.push_back(Error{cp.loc.file, Pos{cp.loc.line, cp.loc.column}, "IR verification: " + ve});
+		cur_prop_getter_ = false;
+		cur_class_tag_.clear();
+		cur_this_ = nullptr;
+	}
+	// 发射一个类的全部属性访问器（与 gen_class_lifecycle 并列）。
+	void gen_class_properties(const ClassDef &cd)
+	{
+		for (const auto &cp : cd.properties)
+		{
+			if (cp.has_get) gen_class_property_accessor(cd, cp, true);
+			if (cp.has_set) gen_class_property_accessor(cd, cp, false);
 		}
 	}
 
@@ -4924,6 +5134,30 @@ struct CodeGenImpl
 				F->addFnAttr("uwtable");
 				if (cls_export) F->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
 			}
+			// P391 属性访问器签名（get/set 各一；随类可见性走 cls_link/cls_export）
+			for (const auto &cp : cd.properties)
+			{
+				if (cp.has_get)
+				{
+					std::string sym = class_property_accessor_symbol(cd, cp, "get");
+					if (!module->getFunction(sym))
+					{
+						llvm::Function *F = llvm::Function::Create(class_property_get_ft(cp), cls_link, sym, module.get());
+						F->addFnAttr("uwtable");
+						if (cls_export) F->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+					}
+				}
+				if (cp.has_set)
+				{
+					std::string sym = class_property_accessor_symbol(cd, cp, "set");
+					if (!module->getFunction(sym))
+					{
+						llvm::Function *F = llvm::Function::Create(class_property_set_ft(cp), cls_link, sym, module.get());
+						F->addFnAttr("uwtable");
+						if (cls_export) F->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+					}
+				}
+			}
 			// 四件套签名
 			const ClassMethod *ctor = nullptr;
 			for (const auto &cm : cd.methods) if (cm.is_ctor) ctor = &cm;
@@ -4954,6 +5188,7 @@ struct CodeGenImpl
 			if (cd.tag.empty()) continue;
 			if (!in_cur_bucket(cd.source_module_key)) continue; // 仅 owner 桶发射定义体（他桶只有声明）
 			for (const auto &cm : cd.methods) gen_class_method(cd, cm);
+			gen_class_properties(cd);
 			gen_class_lifecycle(cd);
 		}
 	}
@@ -5735,6 +5970,22 @@ struct CodeGenImpl
 				//   因彼时 rt 从不为聚合体（现已会），故放开排除、统一由 convert_value 兜底。
 				if (rv->getType() != rt && !rt->isVoidTy())
 					rv = convert_value(rv, rt, get_expr_ctype(s->expr));
+				// P396（路线 1B）：交出「自有 class 句柄」时编译器自动 retain 一次，使 caller 采纳
+				//   （Call 按无主新鲜值不 retain）与属主的 release 各平衡一份引用，杜绝双重释放。
+				//   fresh 黑名单 New/Call/InitList 与 var-init/assign 三处严格同口径；
+				//   cur_prop_getter_ 抑制——属性 getter 采 borrowed(+0)，读取点(Member) 已 retain，勿重复。
+				if (!cur_prop_getter_)
+				{
+					CTypePtr rct = get_expr_ctype(s->expr);
+					const bool ret_fresh = s->expr->kind == ExprKind::New ||
+						s->expr->kind == ExprKind::Call || s->expr->kind == ExprKind::InitList;
+					if (rct && rct->kind == TypeKind::Class && !rct->tag.empty() && !ret_fresh)
+					{
+						const ClassDef *rcd = class_def_of(rct->tag);
+						if (llvm::Function *rt_fn = rcd ? class_lifecycle_ref(*rcd, ".__retain__", class_rc_ft()) : nullptr)
+							builder.CreateCall(rt_fn, {rv});
+					}
+				}
 				release_rc_frames_emit(0); // P300 Co class：返回路径仅发射释放、不弹 C++ 栈
 vla_restore_emit(0);       // P348：返回前回退所有 VLA 帧（与 clang 同位置：restore 紧邻 ret）
 				builder.CreateRet(rv);
@@ -6558,6 +6809,15 @@ vla_restore_emit(0);       // P348：同上
 			{
 				// 数组/结构体：返回指针（退化），不 load
 				llvm::Type *aty = get_var_llvm_type(it->second);
+				// P396：class 句柄成员在方法/访问器体内以裸名绑定为 StructGEP 槽（既非 alloca 亦非
+				//   global），get_var_llvm_type 对非 alloca/global 一律兜底 i32 → 句柄被误当 4 字节整型
+				//   load（`GEP base pointer is not a vector or a vector of pointers`）。class 值的存储形态恒为
+				//   ptr（句柄本身），按声明 CType 精确纠正为 ptr；局部句柄（alloca 已为 ptr）为等值改写、零回归。
+				{
+					auto vtc = var_types_.find(e->name);
+					if (vtc != var_types_.end() && vtc->second && vtc->second->kind == TypeKind::Class)
+						aty = llvm::PointerType::getUnqual(ctx);
+				}
 				// VLA（P208/P209）：存储形态 `alloca S, n`（S=静态元素后缀），当 S 为叶标量
 				// （多维全运行期，如 a[m][n]/b[3][m]）时 getAllocatedType 返回标量而非数组
 				// → 仅按 LLVM 类型判退化会 load 元素值再 inttoptr（非法 IR）。按「含运行期维」
@@ -6583,6 +6843,34 @@ vla_restore_emit(0);       // P348：同上
 					return builder.CreateSExt(v, llvm::Type::getInt32Ty(ctx));
 				}
 				return v;
+			}
+			// P391 Co class 属性：方法/访问器体内裸属性名读 → call <prop>.get(this)（镜像 obj.prop 读接入；
+			//   vars_ 已绑成员/形参/局部/value 优先命中，属性名≠成员名由 sema 登记保证，不与真变量抢位）。
+			if (cur_this_ && !cur_class_tag_.empty())
+			{
+				auto pcit = class_defs_.find(cur_class_tag_);
+				if (pcit != class_defs_.end())
+				{
+					for (const auto &p : pcit->second->properties)
+					{
+						if (p.name != e->name) continue;
+						if (!p.has_get)
+						{
+							errs.push_back(Error{e->loc.file, Pos{e->loc.line, e->loc.column},
+								"property '" + p.name + "' is write-only (no getter)"});
+							return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+						}
+						llvm::Function *gf = class_property_accessor_ref(*pcit->second, p, "get");
+						llvm::Value *rv = gf ? (llvm::Value *)builder.CreateCall(gf, {cur_this_})
+								: (llvm::Value *)llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+						// 整型提升：<i32 整数按符号性扩到 i32（与 obj.prop 读接入同口径）。
+						if (rv->getType()->isIntegerTy() && rv->getType()->getIntegerBitWidth() < 32)
+							rv = is_unsigned_int_type(p.type)
+								? builder.CreateZExt(rv, llvm::Type::getInt32Ty(ctx))
+								: builder.CreateSExt(rv, llvm::Type::getInt32Ty(ctx));
+						return rv;
+					}
+				}
 			}
 			// 全局变量
 			if (llvm::GlobalVariable *gv = global_ref(e->name))
@@ -7382,6 +7670,34 @@ vla_restore_emit(0);       // P348：同上
 					return builder.CreateLoad(vt, sgv);
 				}
 			}
+			// P391 Co class 属性读取：obj.prop → call <prop>.get(base)（基为 class 且名属 property）。
+			{
+				MemberInfo pmi = resolve_member_info(e);
+				auto pcit = class_defs_.find(pmi.base_tag);
+				if (pcit != class_defs_.end())
+				{
+					for (const auto &p : pcit->second->properties)
+					{
+						if (p.name != e->name) continue;
+						if (!p.has_get)
+						{
+							errs.push_back(Error{e->loc.file, Pos{e->loc.line, e->loc.column},
+								"property '" + p.name + "' is write-only (no getter)"});
+							return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+						}
+						llvm::Value *baseptr = gen_expr(e->lhs);
+						llvm::Function *gf = class_property_accessor_ref(*pcit->second, p, "get");
+						llvm::Value *rv = gf ? (llvm::Value *)builder.CreateCall(gf, {baseptr})
+								: (llvm::Value *)builder.CreateLoad(llvm::Type::getInt32Ty(ctx), baseptr);
+						// 整型提升：<i32 整数按符号性扩到 i32（与普通字段 load 口径一致；本批基元以有符号 int 为主）。
+						if (rv->getType()->isIntegerTy() && rv->getType()->getIntegerBitWidth() < 32)
+							rv = is_unsigned_int_type(p.type)
+								? builder.CreateZExt(rv, llvm::Type::getInt32Ty(ctx))
+								: builder.CreateSExt(rv, llvm::Type::getInt32Ty(ctx));
+						return rv;
+					}
+				}
+			}
 			// rvalue: 取成员地址
 			llvm::Value *addr = gen_member_addr(e);
 			// 确定成员类型（decl_tag/decl_idx 指向字段真正声明处，支持匿名 union 名提升）
@@ -7978,6 +8294,44 @@ vla_restore_emit(0);       // P348：同上
 		// ++ / -- 自增/自减（前缀/后缀）
 		if (e->op == "++" || e->op == "--")
 		{
+			// P395：属性自增/自减——obj.prop 与体内裸 prop 复用 get/set 分派，展开为
+			//   t=get(); set(t±1); 后缀返回旧值、前缀返回新值（与复合赋值同口径：先读后写）。
+			//   读写门禁（has_get&&has_set、访问器可见、静态无 this）由 sema 保证，此处 errs 不重复。
+			const std::string prop_inc_op = (e->op == "++") ? "+" : "-";
+			const auto prop_incdec = [&](const ClassDef &pcd, const ClassProperty &p, llvm::Value *baseptr) -> llvm::Value *
+			{
+				llvm::Function *gf = class_property_accessor_ref(pcd, p, "get");
+				llvm::Function *sf = class_property_accessor_ref(pcd, p, "set");
+				llvm::Value *old = gf ? builder.CreateCall(gf, {baseptr})
+					: (llvm::Value *)llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+				llvm::Value *one = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 1);
+				llvm::Value *nv = apply_compound_op(prop_inc_op, old, one, p.type, make_type(TypeKind::Int));
+				if (sf)
+				{
+					llvm::Type *arg_ty = sf->getFunctionType()->getParamType(1);
+					llvm::Value *st = (nv->getType() == arg_ty) ? nv : convert_value(nv, arg_ty, p.type);
+					builder.CreateCall(sf, {baseptr, st});
+				}
+				return e->postfix ? old : nv;
+			};
+			if (e->lhs && e->lhs->kind == ExprKind::Member && e->lhs->op != "::")
+			{
+				MemberInfo pmi = resolve_member_info(e->lhs);
+				auto pcit = class_defs_.find(pmi.base_tag);
+				if (pcit != class_defs_.end())
+					for (const auto &p : pcit->second->properties)
+						if (p.name == e->lhs->name)
+							return prop_incdec(*pcit->second, p, gen_expr(e->lhs->lhs));
+			}
+			else if (cur_this_ && !cur_class_tag_.empty() && e->lhs && e->lhs->kind == ExprKind::VarRef
+					   && !e->lhs->module_qualifier && !vars_.count(e->lhs->name))
+			{
+				auto pcit = class_defs_.find(cur_class_tag_);
+				if (pcit != class_defs_.end())
+					for (const auto &p : pcit->second->properties)
+						if (p.name == e->lhs->name)
+							return prop_incdec(*pcit->second, p, cur_this_);
+			}
 			llvm::Value *addr = gen_lvalue_addr(e->lhs);
 			CTypePtr ct = get_expr_ctype(e->lhs);
 			bool is_ptr = (ct && ct->kind == TypeKind::Pointer);
@@ -8097,6 +8451,37 @@ vla_restore_emit(0);       // P348：同上
 		builder.CreateCall(fc, {dst, src, sz, vol});
 	}
 
+	// P391：属性复合赋值的算术合成 t = t op rhs（整数按 i32、浮点按 double，与普通复合赋值口径一致）。
+	llvm::Value *apply_compound_op(const std::string &op, llvm::Value *a, llvm::Value *b, const CTypePtr &pty, const CTypePtr &bty)
+	{
+		const bool fp = pty && (pty->kind == TypeKind::Float || pty->kind == TypeKind::Double);
+		if (fp)
+		{
+			llvm::Type *dty = llvm::Type::getDoubleTy(ctx);
+			llvm::Value *x = to_fp(a, dty, pty);
+			llvm::Value *y = to_fp(b, dty, bty);
+			if (op == "+") return builder.CreateFAdd(x, y);
+			if (op == "-") return builder.CreateFSub(x, y);
+			if (op == "*") return builder.CreateFMul(x, y);
+			if (op == "/") return builder.CreateFDiv(x, y);
+			if (op == "%") return builder.CreateFRem(x, y);
+			return a;
+		}
+		llvm::Value *x = to_i32(a, pty);
+		llvm::Value *y = to_i32(b, bty);
+		if (op == "+") return builder.CreateAdd(x, y);
+		if (op == "-") return builder.CreateSub(x, y);
+		if (op == "*") return builder.CreateMul(x, y);
+		if (op == "/") return builder.CreateSDiv(x, y);
+		if (op == "%") return builder.CreateSRem(x, y);
+		if (op == "&") return builder.CreateAnd(x, y);
+		if (op == "|") return builder.CreateOr(x, y);
+		if (op == "^") return builder.CreateXor(x, y);
+		if (op == "<<") return builder.CreateShl(x, y);
+		if (op == ">>") return builder.CreateAShr(x, y);
+		return a;
+	}
+
 	// —— 赋值 ——
 	llvm::Value *gen_assign(const ExprPtr &e)
 	{
@@ -8133,7 +8518,19 @@ vla_restore_emit(0);       // P348：同上
 		// P300 Co class：句柄赋值 c1 = c2 / c = new C()。
 		//   非新（共享句柄）：先 retain 新值再 release 旧值（自赋 c=c 先 +1 后 -1 安全）；
 		//   新值（rhs 为 New）：已 refcount=1 唯一归属 → 不 retain，仅 release 旧值。
-		if (lhs_t && lhs_t->kind == TypeKind::Class && e->op == "=")
+		// P397 句柄型属性：lhs 解析为 class 属性时，赋值须交由下方属性 setter 分支（obj.prop = v →
+		//   call <prop>.set），不得被本「成员句柄赋值」分支劫持——二者对自赋/共享/覆盖旧值的 RC 口径
+		//   不同，劫持会绕开 setter 的合成后备语义并致双重释放。故先探测 lhs 是否命中 properties。
+		bool lhs_is_property = false;
+		if (e->lhs->kind == ExprKind::Member)
+		{
+			MemberInfo lmi = resolve_member_info(e->lhs);
+			auto lcit = class_defs_.find(lmi.base_tag);
+			if (lcit != class_defs_.end())
+				for (const auto &lp : lcit->second->properties)
+					if (lp.name == e->lhs->name) { lhs_is_property = true; break; }
+		}
+		if (lhs_t && lhs_t->kind == TypeKind::Class && e->op == "=" && !lhs_is_property)
 		{
 			const std::string &ctag = lhs_t->tag;
 			const ClassDef *acd = class_def_of(ctag);
@@ -8162,6 +8559,91 @@ vla_restore_emit(0);       // P348：同上
 				builder.CreateCall(rf, {oldv});
 			builder.CreateStore(newv, dst);
 			return newv; // P300：class 值是句柄本身（非槽地址），修链式赋值 `c = (b = a)` 将栈地址当对象
+		}
+		// P391 Co class 属性写入：obj.prop = rhs / obj.prop op= rhs → call <prop>.set(base, v)。
+		if (e->lhs->kind == ExprKind::Member)
+		{
+			MemberInfo pmi = resolve_member_info(e->lhs);
+			auto pcit = class_defs_.find(pmi.base_tag);
+			if (pcit != class_defs_.end())
+			{
+				for (const auto &p : pcit->second->properties)
+				{
+					if (p.name != e->lhs->name) continue;
+					if (!p.has_set)
+					{
+						errs.push_back(Error{e->loc.file, Pos{e->loc.line, e->loc.column},
+							"property '" + p.name + "' is read-only (no setter)"});
+						return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+					}
+					llvm::Value *baseptr = gen_expr(e->lhs->lhs);
+					llvm::Function *sf = class_property_accessor_ref(*pcit->second, p, "set");
+					if (!sf) return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+					llvm::Type *arg_ty = sf->getFunctionType()->getParamType(1);
+					llvm::Value *rhsval;
+					if (e->op == "=")
+						rhsval = gen_expr(e->rhs);
+					else
+					{
+						// 复合赋值 op=：t = get(); t = t op rhs; set(t)（先读后写）
+						const std::string base_op = e->op.substr(0, e->op.size() - 1);
+						llvm::Function *gf = class_property_accessor_ref(*pcit->second, p, "get");
+						llvm::Value *old = gf ? (llvm::Value *)builder.CreateCall(gf, {baseptr})
+							: llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+						llvm::Value *rv = gen_expr(e->rhs);
+						rhsval = apply_compound_op(base_op, old, rv, p.type, get_expr_ctype(e->rhs));
+					}
+					if (rhsval->getType() != arg_ty)
+						rhsval = convert_value(rhsval, arg_ty, get_expr_ctype(e->rhs));
+					builder.CreateCall(sf, {baseptr, rhsval});
+					return rhsval;
+				}
+			}
+		}
+		// P391 Co class 属性写入：方法/访问器体内裸属性名 a = rhs / a op= rhs → call <prop>.set(this, v)
+		//   （与上方 obj.prop Member 写块平行；只读写/写只读拒收由 sema 方法体定向遍历阻断，此处 errs 为防御）。
+		if (cur_this_ && !cur_class_tag_.empty() && e->lhs->kind == ExprKind::VarRef)
+		{
+			auto pcit = class_defs_.find(cur_class_tag_);
+			if (pcit != class_defs_.end())
+			{
+				for (const auto &p : pcit->second->properties)
+				{
+					if (p.name != e->lhs->name) continue;
+					if (!p.has_set)
+					{
+						errs.push_back(Error{e->loc.file, Pos{e->loc.line, e->loc.column},
+							"property '" + p.name + "' is read-only (no setter)"});
+						return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+					}
+					if (e->op != "=" && !p.has_get)
+					{
+						errs.push_back(Error{e->loc.file, Pos{e->loc.line, e->loc.column},
+							"property '" + p.name + "' is write-only (no getter)"});
+						return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+					}
+					llvm::Function *sf = class_property_accessor_ref(*pcit->second, p, "set");
+					if (!sf) return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+					llvm::Type *arg_ty = sf->getFunctionType()->getParamType(1);
+					llvm::Value *rhsval;
+					if (e->op == "=")
+						rhsval = gen_expr(e->rhs);
+					else
+					{
+						// 复合赋值 op=：t = get(); t = t op rhs; set(t)（先读后写，与 obj.prop 同展开）
+						const std::string base_op = e->op.substr(0, e->op.size() - 1);
+						llvm::Function *gf = class_property_accessor_ref(*pcit->second, p, "get");
+						llvm::Value *old = gf ? (llvm::Value *)builder.CreateCall(gf, {cur_this_})
+							: (llvm::Value *)llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0);
+						llvm::Value *rv = gen_expr(e->rhs);
+						rhsval = apply_compound_op(base_op, old, rv, p.type, get_expr_ctype(e->rhs));
+					}
+					if (rhsval->getType() != arg_ty)
+						rhsval = convert_value(rhsval, arg_ty, get_expr_ctype(e->rhs));
+					builder.CreateCall(sf, {cur_this_, rhsval});
+					return rhsval;
+				}
+			}
 		}
 		// 位域写访问: read-modify-write
 		if (e->lhs->kind == ExprKind::Member)
@@ -8615,6 +9097,9 @@ vla_restore_emit(0);       // P348：同上
 				{
 					for (const auto &m : cit->second->members)
 						if (!m.name.empty() && m.name == field) return m.type;
+					// P391 Co class 属性：obj.prop 的类型 = 属性类型（与普通成员类型解析对称，供 get_expr_ctype）。
+					for (const auto &p : cit->second->properties)
+						if (p.name == field) return p.type;
 					return nullptr;
 				}
 			}

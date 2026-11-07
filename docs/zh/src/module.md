@@ -12,9 +12,9 @@
 
 ## 对外接口：`public`
 
-- `public` 是 Co **唯一的可见性关键字**——没有 `private`，也不另设 `export`。它同时承担两件事：标记**模块接口**（可被其他模块 `import`）与**动态库导出**（写入 DLL 导出表）。
+- `public` 是 Co 对外的关键字，同时承担两件事：标记**模块接口**（可被其他模块 `import`）与**动态库导出**（写入 DLL 导出表）；不另设 `export`。`private` 可出现在各处，仅作「省略 `public`」的**显式写法**，其导出与跨模块语义和省略 `public` 完全一致、不额外改变可见性；Co 里唯一真正施加访问限制之处是 class 属性的 `get`/`set` 访问器（详见「class」章节）。
 - 未标 `public` 的定义仅在模块内部可见；标了 `public` 才对外可见、才可被导入。
-- `public` 可修饰顶层函数、全局变量与 `struct` / `union` / `enum` 类型（跨模块类型可见性自 0.3.0/0.3.1 可用），以及**文件作用域 `typedef`**（`public typedef int MyInt;`，自 V0.4.1.40 起进入导出面；非 `public` 的 `typedef` 不导出）；`class` 及其成员的 `public` 修饰自 V0.4.0 起可用（`public class` 的跨模块 `import` 消费仍未开放）。
+- `public` 可修饰顶层函数、全局变量与 `struct` / `union` / `enum` 类型（跨模块类型可见性自 0.3.0/0.3.1 可用），以及**文件作用域 `typedef`**（`public typedef int MyInt;`，自 V0.4.1.40 起进入导出面；非 `public` 的 `typedef` 不导出）；`class` 及其成员的 `public` 修饰自 V0.4.0 起可用；被 `import` 模块的 `public class` 可在消费方 `new`、调用实例/静态成员、读写成员与属性（跨模块消费自 P391 实测确认可用）。
 - imported 的非 `public` 符号在 codegen 强制 `InternalLinkage`——同模块内部引用可解析，但不注入外部可见的 LLVM 值。
 
 ## 同名标签：警告 + 限定类型名

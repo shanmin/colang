@@ -149,6 +149,21 @@ public:
 				if (m.name == "__new__" || m.name == "__retain__" ||
 					m.name == "__release__" || m.name == "__delete__")
 					report(m.loc, "reserved protocol name '" + m.name + "' cannot be used as method name");
+			// P391 Co class 属性：结构校验（保留协议名 + 同类重名 members/methods/properties + 至少一访问器）
+			for (const auto &p : c.properties)
+			{
+				if (p.name == "__new__" || p.name == "__retain__" || p.name == "__release__" ||
+					p.name == "__delete__" || p.name == "__ctor__" || p.name == "__dtor__")
+					report(p.loc, "reserved protocol name '" + p.name + "' cannot be used as property name");
+				for (const auto &m : c.members)
+					if (m.name == p.name) { report(p.loc, "property '" + p.name + "' conflicts with member of same name"); break; }
+				for (const auto &m : c.methods)
+					if (m.name == p.name) { report(p.loc, "property '" + p.name + "' conflicts with method of same name"); break; }
+				for (const auto &q : c.properties)
+					if (&q != &p && q.name == p.name) { report(p.loc, "duplicate property '" + p.name + "'"); break; }
+				if (!p.has_get && !p.has_set)
+					report(p.loc, "property '" + p.name + "' must have at least one accessor");
+			}
 			// P300 形参/成员所有权（0.4.0 收尾）：class 句柄作成员——宿主拥有（赋值 store-own、
 			//   __new__ 置 null、__delete__ 级联 release）。
 			// P300 struct/union 作 class 成员（值语义内嵌）：无引用计数/无所有权转移，随宿主堆块分配/释放；
@@ -272,6 +287,10 @@ public:
 		{
 			if (f.body) check_func(f);
 		}
+		// P391 Co class 属性：方法/访问器体的定向属性门禁（方法体不经 check_func，此处只做属性读写拒收、
+		//   不做全量类型检查，避免牵动既有 class 用例）。裸名分派由 codegen 承载，本遍历把
+		//   只读写/写只读/静态方法访问实例属性拦为非零退出（codegen errs 不置退出码）。
+		for (const auto &c : tu->classes) check_class_body_properties(c);
 		// P211 Co 层入口模型：顶层裸语句需检查（break/continue 无围比上下文一时报错，
 		//   表达式引用未声明符号同样拒收）。cur_func_=nullptr，Return 已自然旁路“void 函数不应
 		//   返回值”类检查（见 check_stmt 中 Return 分支的 cur_func_ 守卫）。
@@ -1415,8 +1434,10 @@ private:
 		}
 		if (to->kind == TypeKind::Array)
 		{
-			// 字符串字面量整体初始化字符数组（C 标准）：不逐元素（不触及元素位）
-			if (args.size() == 1 && args[0] && args[0]->kind == ExprKind::StringLiteral) return;
+			// 字符串字面量整体初始化字符数组（C 标准）：不逐元素（不触及元素位）。
+			//   须推进游标 pos：本槽作为子聚合（brace elision）时字符串就是 args[pos]，
+			//   若不推进，下一成员会重复取用同一字符串 → 错位误报（0013 族独错根因之一）。
+			if (args.size() == 1 && args[0] && args[0]->kind == ExprKind::StringLiteral) { pos++; return; }
 			// P349：brace elision 形态（`struct T {u8 s[4]; u8 a;} t = {"abc", 1};`）——此时 args 是
 			//   外层花括号内容、字符串只是其中一项，上一条判据不成立（旧行为把游标降到元素 u8，
 			//   报「指针转整数」。clang 接受，属误拒）。改按「当前项是字符串 + 元素是字符型」
@@ -1436,6 +1457,10 @@ private:
 			if (to->tag.empty()) { pos++; return; }
 			const StructDef *sd = find_struct_def_by_tag(to->tag);
 			if (!sd || !sd->is_definition || sd->members.empty()) { pos++; return; } // 不完整 → 放行并消费一项防错位
+			// 知情边界（0.7.0）：union 若以无名/零宽位域首列（如 `unsigned long :0;`），codegen 的
+			//   union 存储通道无条件取 members[0].type（见 codegen.cpp get_struct_type 的 fty），
+			//   本身即错位；sema 若此处跳过定位到首个具名成员只会被放行后静默落错值（COMPILE_FAIL→OUT_MISMATCH，更危险）。
+			//   本批不扩面：维持 members[0] 口径（此类 union 初值仍报 COMPILE_FAIL，不列入可修缺陷分母）。
 			agg_consume(sd->members[0].type, args, pos, depth); // union 仅填首成员（C 标准）
 			return;
 		}
@@ -1446,6 +1471,9 @@ private:
 		for (const auto &m : sd->members)
 		{
 			if (pos >= args.size()) break;
+			// C 6.7.9：无名位域（含零宽 :0）不参与位置初始化。codegen 走 LLVM 槽、无名/零宽位域不出槽，
+			//   此处须同样跳过且不消费初值，否则与成员槽错位（0013 族 81 例 colang 独错根因之一）。
+			if (m.bit_width >= 0 && m.name.empty()) continue;
 			agg_consume(m.type, args, pos, depth);
 		}
 	}
@@ -1961,6 +1989,8 @@ private:
 				if (!m.name.empty() && m.name == field) return; // 含 static 成员
 			for (const auto &m : cit->second->methods)
 				if (m.name == field) return;                    // 方法访问（obj.method / obj.method()）
+			for (const auto &p : cit->second->properties)
+				if (p.name == field) return;                    // P391 属性访问（obj.prop 触发访问器）
 			report(loc, "no member named '" + field + "' in " + spell_record(rec));
 			return;
 		}
@@ -2382,6 +2412,9 @@ private:
 				// 静态成员也通过此路径返回类型
 				for (const auto &m : cit->second->methods)
 					if (m.name == field) return m.ret_type;
+				// P391 Co class 属性：obj.prop 的类型 = 属性类型（get 访问器返回型）
+				for (const auto &p : cit->second->properties)
+					if (p.name == field) return p.type;
 				return nullptr;
 			}
 			// P344：按当前代码归属取记录定义（模块内自引用不得被宿主同名项顶替）。
@@ -3145,6 +3178,380 @@ private:
 			report(s->loc, "statement requires expression of integer type ('void' invalid)");
 	}
 
+	// P391 Co class 属性：解析 Member 表达式是否为 class 属性访问（`.`/`->` 基为已定义类、名属 properties）；
+	//   命中返回属性指针，否则 nullptr。heap-only 句柄 `obj.prop` 基型即 Class；指针/数组基解一层亦为 Class。
+	const ClassProperty *member_property(const ExprPtr &m)
+	{
+		if (!m || m->kind != ExprKind::Member || m->op == "::") return nullptr;
+		CTypePtr base = resolve_type(m->lhs);
+		if (!base) return nullptr;
+		std::string tag;
+		if (base->kind == TypeKind::Class) tag = base->tag;
+		else if ((base->kind == TypeKind::Pointer || base->kind == TypeKind::Array) &&
+				base->base && base->base->kind == TypeKind::Class)
+			tag = base->base->tag;
+		if (tag.empty()) return nullptr;
+		auto cit = classes_.find(tag);
+		if (cit == classes_.end()) return nullptr;
+		for (const auto &p : cit->second->properties)
+			if (p.name == m->name) return &p;
+		return nullptr;
+	}
+
+	// —— P391 Co class 属性：方法/访问器体定向门禁（入口见 run() 调用处）——
+	// 解析写/读目标表达式是否为当前类的属性位（与 codegen 裸名分派同口径）：
+	//   裸名 VarRef——成员/形参/局部/value 遮蔽即不算（scope 命中）；
+	//   obj.prop——基限 ThisRef 或本体内可解析名为 class 句柄（指针/数组基解一层），调用/下标等深形保守跳过。
+	// out_needs_instance：静态方法体内裸名访问实例属性（codegen 无 this、不落分派，须拦下防静默错值）。
+	// P393 out_external：访问发生在「定义该类之外」——Member 基解析出的属主 tag ≠ cd.tag（他类句柄的
+	//   obj.prop）即为外部；ThisRef/裸名/同类他实例句柄 tag==cd.tag 为内部。外部语境下 private 访问器拒收。
+	const ClassProperty *body_prop_target(const ExprPtr &t, const ClassDef &cd,
+		const std::unordered_map<std::string, CTypePtr> &scope, bool in_static, bool &out_needs_instance, bool &out_external)
+	{
+		out_needs_instance = false;
+		out_external = false;
+		if (!t) return nullptr;
+		if (t->kind == ExprKind::VarRef)
+		{
+			if (t->module_qualifier || t->name.empty()) return nullptr;
+			if (scope.count(t->name)) return nullptr; // 被成员/形参/局部/value 遮蔽（codegen vars_ 优先命中同口径）
+			for (const auto &p : cd.properties)
+				if (p.name == t->name)
+				{
+					if (in_static) out_needs_instance = true;
+					return &p;
+				}
+			return nullptr;
+		}
+		if (t->kind == ExprKind::Member && t->op != "::")
+		{
+			std::string tag;
+			if (t->lhs && t->lhs->kind == ExprKind::ThisRef) tag = cd.tag;
+			else if (t->lhs && t->lhs->kind == ExprKind::VarRef && !t->lhs->module_qualifier)
+			{
+				auto sit = scope.find(t->lhs->name);
+				if (sit != scope.end() && sit->second)
+				{
+					const CTypePtr &b = sit->second;
+					if (b->kind == TypeKind::Class) tag = b->tag;
+					else if ((b->kind == TypeKind::Pointer || b->kind == TypeKind::Array) &&
+							b->base && b->base->kind == TypeKind::Class)
+						tag = b->base->tag;
+				}
+			}
+			if (tag.empty()) return nullptr;
+			auto cit = classes_.find(tag);
+			if (cit == classes_.end()) return nullptr;
+			for (const auto &p : cit->second->properties)
+				if (p.name == t->name) { out_external = (tag != cd.tag); return &p; }
+			return nullptr;
+		}
+		return nullptr;
+	}
+
+	// 收集体内局部声明名（扁平、宁多勿漏：撞名则该位不当下属性访问）。
+	void collect_body_local_decls(const StmtPtr &s, std::unordered_map<std::string, CTypePtr> &scope, int depth)
+	{
+		if (!s || depth > 64) return;
+		if (s->kind == StmtKind::Decl && !s->var_name.empty() && !scope.count(s->var_name))
+			scope[s->var_name] = s->var_type;
+		for (const auto &b : s->body) collect_body_local_decls(b, scope, depth + 1);
+		collect_body_local_decls(s->then_branch, scope, depth + 1);
+		collect_body_local_decls(s->else_branch, scope, depth + 1);
+		collect_body_local_decls(s->for_init, scope, depth + 1);
+		collect_body_local_decls(s->init_stmt, scope, depth + 1);
+	}
+
+	// 属性位读写拒收：文案与 obj.prop 既有门禁（check_expr）逐字一致。
+	void gate_prop_access(const ExprPtr &t, const ClassDef &cd, const std::unordered_map<std::string, CTypePtr> &scope,
+		bool in_static, bool is_write, const std::string &aop)
+	{
+		if (!t) return;
+		bool needs_inst = false;
+		bool external = false;
+		const ClassProperty *pr = body_prop_target(t, cd, scope, in_static, needs_inst, external);
+		if (!pr) return;
+		if (needs_inst)
+		{
+			report(t->loc, "property '" + pr->name + "' cannot be accessed from a static method (no 'this')");
+			return;
+		}
+		if (is_write)
+		{
+			if (!pr->has_set)
+				report(t->loc, "property '" + pr->name + "' is read-only (no setter)");
+			else if (external && !pr->set_public)
+				report(t->loc, "setter of property '" + pr->name + "' is private");
+			else if (aop != "=" && !pr->has_get)
+				report(t->loc, "property '" + pr->name + "' is write-only (no getter)");
+			else if (aop != "=" && external && !pr->get_public)
+				report(t->loc, "getter of property '" + pr->name + "' is private");
+		}
+		else if (!pr->has_get)
+			report(t->loc, "property '" + pr->name + "' is write-only (no getter)");
+		else if (external && !pr->get_public)
+			report(t->loc, "getter of property '" + pr->name + "' is private");
+	}
+
+	void gate_body_expr(const ExprPtr &e, const ClassDef &cd, const std::unordered_map<std::string, CTypePtr> &scope,
+		bool in_static, int depth)
+	{
+		if (!e || depth > 96) return;
+		if (e->kind == ExprKind::Assign)
+		{
+			// 写目标按写位门禁（不再重复作读）；成员链的基与右侧照常下探。
+			gate_prop_access(e->lhs, cd, scope, in_static, true, e->op);
+			if (e->lhs && e->lhs->kind == ExprKind::Member && e->lhs->lhs)
+				gate_body_expr(e->lhs->lhs, cd, scope, in_static, depth + 1);
+			gate_body_expr(e->rhs, cd, scope, in_static, depth + 1);
+			return;
+		}
+		if (e->kind == ExprKind::VarRef || e->kind == ExprKind::Member)
+		{
+			gate_prop_access(e, cd, scope, in_static, false, "=");
+			if (e->lhs) gate_body_expr(e->lhs, cd, scope, in_static, depth + 1);
+			return;
+		}
+		// P395：属性自增/自减（体内裸 prop / obj.prop）——先读后写，须 get 与 set 俱备且可见，
+		//   与复合赋值同口径（aop != "=" 使 gate_prop_access 一并校验 getter）。
+		if (e->kind == ExprKind::Unary && (e->op == "++" || e->op == "--"))
+		{
+			gate_prop_access(e->lhs, cd, scope, in_static, true, e->op);
+			if (e->lhs && e->lhs->kind == ExprKind::Member && e->lhs->lhs)
+				gate_body_expr(e->lhs->lhs, cd, scope, in_static, depth + 1);
+			return;
+		}
+		// P395：属性取址拒收（体内 &prop / &obj.prop）——属性是访问器函数对、无存储地址可取。
+		if (e->kind == ExprKind::Unary && e->op == "&")
+		{
+			bool ni = false, ex = false;
+			if (const ClassProperty *pr = body_prop_target(e->lhs, cd, scope, in_static, ni, ex))
+				report(e->loc, "cannot take address of property '" + pr->name + "'");
+			else if (e->lhs) gate_body_expr(e->lhs, cd, scope, in_static, depth + 1);
+			return;
+		}
+		// 其余形态按读位下探。
+		gate_body_expr(e->lhs, cd, scope, in_static, depth + 1);
+		gate_body_expr(e->rhs, cd, scope, in_static, depth + 1);
+		for (const auto &a : e->args) gate_body_expr(a, cd, scope, in_static, depth + 1);
+	}
+
+	void gate_body_stmt(const StmtPtr &s, const ClassDef &cd, const std::unordered_map<std::string, CTypePtr> &scope,
+		bool in_static, int depth)
+	{
+		if (!s || depth > 64) return;
+		gate_body_expr(s->expr, cd, scope, in_static, depth);
+		gate_body_expr(s->var_init, cd, scope, in_static, depth);
+		gate_body_expr(s->for_incr, cd, scope, in_static, depth);
+		for (const auto &b : s->body) gate_body_stmt(b, cd, scope, in_static, depth + 1);
+		gate_body_stmt(s->then_branch, cd, scope, in_static, depth + 1);
+		gate_body_stmt(s->else_branch, cd, scope, in_static, depth + 1);
+		gate_body_stmt(s->for_init, cd, scope, in_static, depth + 1);
+		gate_body_stmt(s->init_stmt, cd, scope, in_static, depth + 1);
+	}
+
+	// P394：上下文关键字 field 仅在属性访问器体内有效，指本属性合成后备字段。
+	//   非自动实现（backing_field 空、未留裸 get;/set;）的访问器体内出现裸 field → 拒收（须先有合成
+	//   后备才能指）。仅计 VarRef 形态的裸 field；this.field / obj.field 是 Member（名字段非 VarRef），
+	//   不误计，仍达成员。合法命中不报错（解析交 codegen 绑后备 GEP）。
+	void check_field_keyword(const ExprPtr &e, const ClassProperty &p, int depth)
+	{
+		if (!e || depth > 96) return;
+		if (e->kind == ExprKind::VarRef)
+		{
+			if (e->name == "field" && p.backing_field.empty())
+				report(e->loc, "keyword 'field' is only available in an auto-implemented property");
+			return;
+		}
+		check_field_keyword(e->lhs, p, depth + 1);
+		check_field_keyword(e->rhs, p, depth + 1);
+		for (const auto &a : e->args) check_field_keyword(a, p, depth + 1);
+	}
+	void check_field_keyword(const StmtPtr &s, const ClassProperty &p, int depth)
+	{
+		if (!s || depth > 64) return;
+		check_field_keyword(s->expr, p, depth);
+		check_field_keyword(s->var_init, p, depth);
+		check_field_keyword(s->for_incr, p, depth);
+		for (const auto &b : s->body) check_field_keyword(b, p, depth + 1);
+		check_field_keyword(s->then_branch, p, depth + 1);
+		check_field_keyword(s->else_branch, p, depth + 1);
+		check_field_keyword(s->for_init, p, depth + 1);
+		check_field_keyword(s->init_stmt, p, depth + 1);
+	}
+
+	// 入口：逐类遍历方法/访问器体。P398：先对每个有 body 的方法/访问器做与函数体同级的全量类型
+	//   检查（check_class_body_full），再跑既有属性门禁（gate_body_stmt）。顺序=全量在前、门禁在后，
+	//   诊断不重复（属性位读写/私有/静态/取址交 gate，undeclared/相容/元数/goto×RC/VLA/fallthrough/-Wunused*
+	//   交全量；check_expr 体内属性位诊断已由 !cur_class_ 守卫跳过）。
+	void check_class_body_properties(const ClassDef &c)
+	{
+		for (const auto &m : c.methods)
+		{
+			if (!m.body) continue;
+			check_class_body_full(c, m.body, c.tag + "." + m.name, m.ret_type, m.params, nullptr, false);
+			std::unordered_map<std::string, CTypePtr> scope;
+			for (const auto &mm : c.members) if (!mm.name.empty()) scope[mm.name] = mm.type;
+			for (const auto &pr : m.params) if (!pr.first.empty()) scope[pr.first] = pr.second;
+			collect_body_local_decls(m.body, scope, 0);
+			gate_body_stmt(m.body, c, scope, m.is_static, 0);
+		}
+		const CTypePtr void_ty = make_type(TypeKind::Void);
+		for (const auto &p : c.properties)
+		{
+			std::unordered_map<std::string, CTypePtr> base_scope;
+			for (const auto &mm : c.members) if (!mm.name.empty()) base_scope[mm.name] = mm.type;
+			if (p.get_body)
+			{
+				check_class_body_full(c, p.get_body, c.tag + "." + p.name + ".get", p.type, {}, p.type, false);
+				auto sc = base_scope;
+				if (!p.backing_field.empty()) sc["field"] = p.type; // P394：预留 field 位（遮蔽同名成员，交 codegen 绑后备）
+				collect_body_local_decls(p.get_body, sc, 0);
+				check_field_keyword(p.get_body, p, 0);
+				gate_body_stmt(p.get_body, c, sc, false, 0);
+			}
+			if (p.set_body)
+			{
+				check_class_body_full(c, p.set_body, c.tag + "." + p.name + ".set", void_ty, {}, p.type, true);
+				auto sc = base_scope;
+				sc["value"] = p.type; // setter 隐式参数（codegen vars_ 已绑，遮蔽同名属性位）
+				if (!p.backing_field.empty()) sc["field"] = p.type; // P394：同上，set 体亦预留 field
+				collect_body_local_decls(p.set_body, sc, 0);
+				check_field_keyword(p.set_body, p, 0);
+				gate_body_stmt(p.set_body, c, sc, false, 0);
+			}
+		}
+	}
+
+	// P398：方法/访问器体的全量类型检查驱动——逐条镜像 check_func 的完整序列，为方法体绑定瞬时
+	//   FuncDecl 快照（cur_func_ 供 Return 分支/元数诊断/-Wunused-parameter，生命周期覆盖整段检查）
+	//   与 cur_class_（供 ThisRef 接住、并令 check_expr 体内属性位诊断让位 gate_body），把类上下文裸名
+	//   （成员/形参/属性名/访问器 value/field）注入 scopes_，使其不被误报 undeclared（与 codegen vars_ 裸名
+	//   绑定同集合）。属性读写/私有/静态/取址/field 的深度语义仍交紧随其后的 gate_body；本路补的是
+	//   此前方法体免检的通用类型面（未声明名/赋值相容/元数/goto×RC/VLA 跳跃/fallthrough/-Wunused*/-Wreturn-type）。
+	void check_class_body_full(const ClassDef &cd, const StmtPtr &body, const std::string &diag_name,
+		const CTypePtr &ret_type, const std::vector<std::pair<std::string, CTypePtr>> &params,
+		const CTypePtr &prop_type, bool is_setter)
+	{
+		if (!body) return;
+		FuncDecl snap;
+		snap.name = diag_name;
+		snap.return_type = ret_type;
+		for (const auto &pr : params)
+			if (!pr.first.empty()) snap.params.push_back(Param{pr.first, pr.second, body->loc});
+		snap.source_module_key = cd.source_module_key;
+		// (I) 值形参完备性兜底（同 check_func）：按值形参在 codegen alloca，incomplete record 会漏给后端崩。
+		for (const auto &pr : params)
+			if (pr.second) enforce_complete_type(pr.second, body->loc, IctxParam);
+
+		cur_func_ = &snap;
+		cur_class_ = &cd;
+		cur_source_module_key_ = cd.source_module_key; // 体内引用跨模块符号按归属模块判可见性
+		scopes_.clear();
+		scopes_.emplace_back(); // 成员+形参+属性名+隐式 value/field 层（块内局部仍由 check_stmt Decl 正常压入）
+		auto &base = scopes_.back();
+		param_list_.clear();
+		for (const auto &mm : cd.members) if (!mm.name.empty()) base[mm.name] = {mm.type, mm.loc};
+		for (const auto &pr : params)
+			if (!pr.first.empty()) { base[pr.first] = {pr.second, body->loc}; param_list_.emplace_back(pr.first, body->loc); }
+		// 属性名注入：仅过 undeclared 门禁（体内裸属性名的 VarRef 不被误报）；类型/读写语义仍交 gate_body。
+		for (const auto &p : cd.properties) if (!p.name.empty() && !base.count(p.name)) base[p.name] = {p.type, p.loc};
+		if (prop_type)
+		{
+			// 访问器体：`field` 恒注入（auto 后备指它；非 auto 亦注入以抑制 undeclared——精确拒收文案交 gate 的
+			//   check_field_keyword）；setter 另注入隐式 `value`。
+			if (!base.count("field")) base["field"] = {prop_type, body->loc};
+			if (is_setter && !base.count("value")) base["value"] = {prop_type, body->loc};
+		}
+
+		used_var_names_.clear();
+		declared_locals_.clear();
+		read_var_names_.clear();
+		written_var_names_.clear();
+		suppress_read_once_.clear();
+		labels_.clear();
+		collect_labels(body);
+		check_goto_class_crossing(body); // P300：禁 goto 跨越需 RC 清理的类句柄声明
+		check_jump_bypass_vla(body);     // P348：禁 goto/case 跳过 VLA 初始化
+		// 非 void 方法/getter 可能落到末尾而无 return（同 check_func -Wreturn-type 告警）。
+		if (ret_type && ret_type->kind != TypeKind::Void && falls_through(body))
+			warn(body->loc, "non-void function does not return a value in all control paths", "return-type");
+		check_stmt(body, 0, 0);
+		// -Wunused-variable / -Wunused-but-set-variable / -Wunused-parameter（收尾告警，同 check_func）
+		for (const auto &[name, loc] : declared_locals_)
+			if (!used_var_names_.count(name))
+				warn(loc, "unused variable '" + name + "'", "unused-variable");
+		for (const auto &[name, loc] : declared_locals_)
+			if (used_var_names_.count(name) && written_var_names_.count(name) && !read_var_names_.count(name))
+				warn(loc, "variable '" + name + "' set but not used", "unused-but-set-variable");
+		for (const auto &[name, loc] : param_list_)
+			if (!used_var_names_.count(name))
+				warn(loc, "unused parameter '" + name + "'", "unused-parameter");
+
+		cur_func_ = nullptr;
+		cur_class_ = nullptr;
+		cur_source_module_key_.clear();
+	}
+
+	// P398：方法调用元数 + 实参类型相容。基可为 `this`（ThisRef，取 cur_class_）、类句柄变量
+	//   （obj.m，解 Class/Pointer{Class}/Array{Class}）、或类名（C::m 静态，VarRef 经 classes_ 解 Class）。
+	//   命中 ClassMethod 才查；非方法名（属性/字段/成员函数指针）落空即放行，交既有门禁/通用路径。
+	void check_method_call(const ExprPtr &e)
+	{
+		const ExprPtr &mem = e->lhs;
+		if (!mem || mem->kind != ExprKind::Member) return;
+		if (mem->q_func || mem->q_global) return; // 限定符号直调（模块函数），非类方法
+		const ExprPtr &b = mem->lhs;
+		if (!b) return;
+		std::string tag;
+		if (b->kind == ExprKind::ThisRef)
+		{
+			if (cur_class_) tag = cur_class_->tag;
+		}
+		else if (b->kind == ExprKind::VarRef && b->module_qualifier)
+			return; // 模块限定基，非本类方法
+		else
+		{
+			CTypePtr bt = resolve_type(b);
+			if (bt)
+			{
+				if (bt->kind == TypeKind::Class) tag = bt->tag;
+				else if ((bt->kind == TypeKind::Pointer || bt->kind == TypeKind::Array) &&
+				         bt->base && bt->base->kind == TypeKind::Class)
+					tag = bt->base->tag;
+			}
+		}
+		if (tag.empty()) return;
+		auto cit = classes_.find(tag);
+		if (cit == classes_.end() || !cit->second) return;
+		const ClassMethod *cm = nullptr;
+		for (const auto &m : cit->second->methods)
+			if (m.name == mem->name) { cm = &m; break; }
+		if (!cm) return;
+		const std::size_t np = cm->params.size();
+		const std::size_t na = e->args.size();
+		if (na != np)
+			report(e->loc, std::string(na < np ? "too few arguments" : "too many arguments") +
+			              " to method '" + mem->name + "'");
+		const std::size_t nb = na < np ? na : np;
+		for (std::size_t i = 0; i < nb; ++i)
+		{
+			const ExprPtr &ag = e->args[i];
+			if (!ag || (is_ternary_src(ag) && !ternary_has_void_arm(ag))) continue;
+			const CTypePtr rt = resolve_type(ag);
+			if (!rt) continue;
+			const CTypePtr pt = cm->params[i].second;
+			if (!pt) continue;
+			if (pt->kind == TypeKind::Union || pt->kind == TypeKind::Function) continue;
+			if (pt->kind == TypeKind::Pointer && pt->base &&
+			    (pt->base->kind == TypeKind::Function || pt->base->kind == TypeKind::Union))
+				continue;
+			const Compat cc = assign_compat(rt, pt, ag);
+			if (cc == Compat::Ok || cc == Compat::Skip) continue;
+			report(ag->loc, compat_arg_msg(pt, rt, cc));
+		}
+	}
+
 	// —— 表达式检查 ——
 	void check_expr(const ExprPtr &e)
 	{
@@ -3190,6 +3597,27 @@ private:
 			const ExprPtr &L = e->lhs;
 			if (L)
 			{
+				// P391 Co class 属性写入：obj.prop = / obj.prop op= → 左值为属性，登记写上下文 + 校验访问器存在。
+				if (L->kind == ExprKind::Member)
+				{
+					if (const ClassProperty *pr = member_property(L))
+					{
+						member_write_ctx_.insert(L.get());
+						// P398：方法/访问器体内（cur_class_ 非空）属性写点的只读/只写/私有诊断统一交 gate_body
+						//   （其按内部/外部语境正确裁定），本路类外语境判定在体内失效，故体内只短路通用左值核、
+						//   不自出诊断。类外（cur_class_ 空）仍由本路核。
+						// P393：本路（check_expr）只经普通函数/main/全局初值——恒为类外语境，private 访问器直接拒收。
+						if (!cur_class_ && !pr->has_set)
+							report(e->loc, "property '" + pr->name + "' is read-only (no setter)");
+						else if (!cur_class_ && !pr->set_public)
+							report(e->loc, "setter of property '" + pr->name + "' is private");
+						else if (!cur_class_ && e->op != "=" && !pr->has_get)
+							report(e->loc, "property '" + pr->name + "' is write-only (no getter)");
+						else if (!cur_class_ && e->op != "=" && !pr->get_public)
+							report(e->loc, "getter of property '" + pr->name + "' is private");
+						break; // 属性写走访问器语义，跳过通用左值/相容核（子表达式递归仍在 switch 外进行）
+					}
+				}
 				// 路 B 阶段1b-iii：限定访问写目标 m.x = ... —— 先绑定；const 全局报只读（裁定Ⅷ）、
 				//   非 const 与本地同权（不设跨模块只读门）；命中绑定则不走常规成员 assignability。
 				if (L->kind == ExprKind::Member) try_bind_qualified_member(L);
@@ -3261,7 +3689,34 @@ private:
 		}
 		case ExprKind::Unary:
 			// P254：++/-- 的操作数是可写位置（clang 与赋值同文，不说 "cannot increment"）
-			if (e->op == "++" || e->op == "--") check_write_target(e->lhs, e->loc);
+			if (e->op == "++" || e->op == "--")
+			{
+				// P395：属性自增/自减——obj.prop++ 先读后写，须 get 与 set 俱备且可见（本路恒类外语境）。
+				//   登记写上下文抑制后续 Member 读位重复诊断（与 Assign 同口径）。
+				// P398：类内（cur_class_ 非空）属性自增减交 gate_body 裁定，本路体内跳过。
+				if (const ClassProperty *pr = member_property(e->lhs))
+				{
+					member_write_ctx_.insert(e->lhs.get());
+					if (!cur_class_ && !pr->has_set)
+						report(e->loc, "property '" + pr->name + "' is read-only (no setter)");
+					else if (!cur_class_ && !pr->set_public)
+						report(e->loc, "setter of property '" + pr->name + "' is private");
+					else if (!cur_class_ && !pr->has_get)
+						report(e->loc, "property '" + pr->name + "' is write-only (no getter)");
+					else if (!cur_class_ && !pr->get_public)
+						report(e->loc, "getter of property '" + pr->name + "' is private");
+				}
+				else check_write_target(e->lhs, e->loc);
+			}
+			// P395：属性取址拒收——&obj.prop 无存储地址可取（属性是访问器函数对）。
+			if (e->op == "&" && member_property(e->lhs))
+			{
+				const ClassProperty *pr = member_property(e->lhs);
+				member_write_ctx_.insert(e->lhs.get()); // 抑制后续 Member 读位重复
+				// P398：类内属性取址交 gate_body（体内 &prop/&obj.prop），本路体内跳过。
+				if (!cur_class_)
+					report(e->loc, "cannot take address of property '" + pr->name + "'");
+			}
 			// P302：`sizeof(T)` / `_Alignof(T)` 的类型操作数同样是类型引用点，须过跨模块裁定
 			if (e->type && (e->op == "sizeof" || e->op == "alignof")) enforce_type_visible(e->type, e->loc);
 			// P333：`sizeof` / `_Alignof` 施于不完整记录（clang 同文拒收，不再静默给 0）
@@ -3318,6 +3773,16 @@ private:
 				break;
 			}
 			CTypePtr base = resolve_type(e->lhs);
+			// P391 Co class 属性读取（非写目标）：obj.prop 无 getter → 只写诊断（写目标已由 Assign 登记、此处消费跳过）。
+			// P398：类内属性读点（obj.prop / this.prop）交 gate_body 按内部/外部语境裁定，本路体内跳过。
+			if (member_write_ctx_.erase(e.get()) == 0 && !cur_class_)
+				if (const ClassProperty *pr = member_property(e))
+				{
+					if (!pr->has_get)
+						report(e->loc, "property '" + pr->name + "' is write-only (no getter)");
+					else if (!pr->get_public) // P393：类外读私有 getter 拒收（本路恒为外部语境）
+						report(e->loc, "getter of property '" + pr->name + "' is private");
+				}
 			if (base)
 			{
 				if (e->op == "." && !is_struct_like(base))
@@ -3454,6 +3919,10 @@ private:
 					}
 				}
 			}
+			// P398：方法调用 obj.m(args)/this.m(args)/C::m(args) —— 此前 Call 只处理裸函数名
+			//   （!e->lhs），方法调用的元数与实参类型相容根本不查；本路补齐（交 check_method_call）。
+			else if (e->lhs && e->lhs->kind == ExprKind::Member)
+				check_method_call(e);
 			break;
 		}
 		case ExprKind::Cast:
@@ -3665,16 +4134,8 @@ private:
 			{
 				report(s->loc, "non-void function should return a value");
 			}
-			// P300 Co class（详见项目内部设计文档）：返类函数须返无主值（new / 返句柄的调用），禁 `return c;`
-			//   返局部拥有句柄（否则 callee 计数与 caller release 会双重释放）。
-			if (s->expr && cur_func_ && cur_func_->return_type &&
-				cur_func_->return_type->kind == TypeKind::Class)
-			{
-				bool fresh = s->expr->kind == ExprKind::New || s->expr->kind == ExprKind::Call;
-				CTypePtr rt = resolve_type(s->expr);
-				if (!fresh && rt && rt->kind == TypeKind::Class)
-					report(s->loc, "cannot return owned class handle; return a 'new' expression instead");
-			}
+			// P300 Co class §4.4「返类函数须返无主值」拒收已按路线 1B 撤除：交出自有句柄改由
+			//   codegen Return 路径自动 retain（见 codegen.cpp），返回自有/成员/形参句柄合法且计数平衡。
 			if (s->expr) check_expr(s->expr);
 			break;
 		}
@@ -4060,6 +4521,8 @@ private:
 	std::unordered_set<std::string> read_var_names_;  // 变量被“读取”（非纯赋值左侧）
 	std::unordered_set<std::string> written_var_names_; // 变量被“写入”（赋值左侧/++/--操作数）
 	std::string suppress_read_once_; // 下一轮 VarRef 命中该名称时跳过 read 登记（消费后清空）
+	// P391 Co class 属性：记录「作为赋值/自增减左值被核」的 Member 节点，读点据此跳过只写误报。
+	std::unordered_set<const void *> member_write_ctx_;
 	// -Wunused-function：跟踪被调用/引用的 static 函数名
 	std::unordered_set<std::string> used_func_names_;
 	const FuncDecl *cur_func_ = nullptr;

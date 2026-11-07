@@ -728,12 +728,20 @@ struct Parser
 				continue;
 			}
 			// P300 Co class（0.4.0）：[public] class 短路识别（同 import 模式）。
+			// P392：private 对称落点——[private] class（≡ 省略 public、纯语法糖、不新增强制）。
 			if (check_keyword("class") ||
-				(peek().kind == TokKind::Keyword && peek().text == "public" &&
+				(peek().kind == TokKind::Keyword && (peek().text == "public" || peek().text == "private") &&
 				 pos + 1 < toks.size() && toks[pos + 1].text == "class" && toks[pos + 1].kind == TokKind::Keyword))
 			{
 				bool cls_pub = match_keyword("public");
-				if (parse_class_def(*tu, cls_pub))
+				bool cls_priv = match_keyword("private");
+				if (cls_pub && cls_priv)
+				{
+					error(peek().loc, "'private' cannot be combined with 'public'");
+					skip_to_semi();
+					continue;
+				}
+				if (parse_class_def(*tu, cls_pub && !cls_priv))
 					continue;
 				skip_to_semi();
 				continue;
@@ -931,10 +939,19 @@ struct Parser
 		while (!at_end() && !check_punct("}"))
 		{
 			// 成员/方法前置修饰符
-			bool m_pub = match_keyword("public");
-			bool m_static = match_keyword("static");
-			if (m_pub && match_keyword("static")) m_static = true; // public static 顺序
-			if (m_static && match_keyword("public")) m_pub = true; // static public 顺序
+			// P392：private 与 public 对称（≡ 省略 public、纯语法糖）；循环消费任意顺序的
+			//   public/private/static，public/private 同时出现拒收，private 归一为 is_public=false。
+			bool m_pub = false, m_priv = false, m_static = false;
+			for (;;)
+			{
+				if (match_keyword("public"))  { m_pub = true; continue; }
+				if (match_keyword("private")) { m_priv = true; continue; }
+				if (match_keyword("static"))  { m_static = true; continue; }
+				break;
+			}
+			if (m_pub && m_priv)
+				error(peek().loc, "'private' cannot be combined with 'public'");
+			m_pub = m_pub && !m_priv; // private → 内部（下游 is_public 统一取 m_pub）
 
 			// 析构函数：~ClassName()
 			if (check_punct("~"))
@@ -1055,6 +1072,63 @@ struct Parser
 				cm.body = parse_compound_stmt();
 				cd.methods.push_back(std::move(cm));
 				match_punct(";");
+			}
+			else if (check_punct("{"))
+			{
+				// P391 Co class 属性：TYPE name { get... set... }（字段名后必为 ;/,，{ 唯一标识属性）
+				ClassProperty cp;
+				cp.name = mname;
+				cp.type = mtype;
+				cp.is_public = m_pub;
+				cp.loc = peek().loc;
+				expect_punct("{");
+				while (!at_end() && !check_punct("}"))
+				{
+					// P393：get/set 前可各带 public/private 修饰（缺省 public）；同访问器两者并存拒收。
+					//   public/private 为 Keyword token、get/set 为 Identifier token，不冲突。
+					bool acc_pub = false, acc_priv = false;
+					for (;;)
+					{
+						if (match_keyword("public"))  { acc_pub = true; continue; }
+						if (match_keyword("private")) { acc_priv = true; continue; }
+						break;
+					}
+					if (acc_pub && acc_priv)
+						error(peek().loc, "'public' and 'private' cannot both modify an accessor");
+					const bool is_get = (peek().kind == TokKind::Identifier && peek().text == "get");
+					const bool is_set = (peek().kind == TokKind::Identifier && peek().text == "set");
+					if (!is_get && !is_set)
+					{
+						error(peek().loc, "expected 'get' or 'set' accessor in property body");
+						break;
+					}
+					if (is_get)
+					{
+						if (cp.has_get) error(peek().loc, "duplicate 'get' accessor");
+						advance(); // get
+						cp.has_get = true;
+						cp.get_public = !acc_priv;
+						if (check_punct("{")) { cp.get_body = parse_compound_stmt(); cp.get_auto = false; }
+						else { expect_punct(";"); cp.get_auto = true; }
+					}
+					else
+					{
+						if (cp.has_set) error(peek().loc, "duplicate 'set' accessor");
+						advance(); // set
+						cp.has_set = true;
+						cp.set_public = !acc_priv;
+						if (check_punct("{")) { cp.set_body = parse_compound_stmt(); cp.set_auto = false; }
+						else { expect_punct(";"); cp.set_auto = true; }
+					}
+				}
+				expect_punct("}");
+				match_punct(";"); // 允许属性尾分号
+				if (!cp.has_get && !cp.has_set)
+					error(cp.loc, "property must have at least one accessor");
+				// 任一访问器为自动 ⇒ 合成隐藏后备字段（内部名，用户不可书写引用）
+				if ((cp.has_get && cp.get_auto) || (cp.has_set && cp.set_auto))
+					cp.backing_field = "__prop_" + cp.name;
+				cd.properties.push_back(std::move(cp));
 			}
 			else
 			{
@@ -2567,11 +2641,21 @@ struct Parser
 		}
 		// 存储类说明符（前置消费 + parse_decl_specifiers 期间消费的任意顺序部分）
 		// P211 Co 层：允许 public 与 static/extern 任意顺序混用，顶层存储类位。
+		// P392：private 与 public 对称（≡ 省略 public、纯语法糖，不下传即 is_public 保持 false）；
+		//   public/private 互斥 → 报错并认领本项（仿 attr_fatal_，防顶层推测回滚吞诊断）。
 		bool is_public = match_keyword("public");
+		bool is_private = match_keyword("private");
 		bool is_static = match_keyword("static");
 		bool is_extern = match_keyword("extern");
-		// 后置顺序的 public（例如 `static public int x;`）在 parse_decl_specifiers 中消费。
+		// 后置顺序的 public/private（例如 `static public int x;`）在 parse_decl_specifiers 中消费。
 		if (match_keyword("public")) is_public = true;
+		if (match_keyword("private")) is_private = true;
+		if (is_public && is_private)
+		{
+			error(peek().loc, "'private' cannot be combined with 'public'");
+			skip_to_semi();
+			return true; // 认领本顶层项、保留互斥诊断（不被推测解析回滚吞掉）
+		}
 		// typedef 检测
 		bool is_typedef = match_keyword("typedef");
 		// 0.4.1 a2（C23 标准收紧中置位）：属性列表不得出现在声明说明符之间（存储类/typedef 之后）。

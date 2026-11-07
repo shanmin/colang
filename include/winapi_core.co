@@ -609,6 +609,7 @@ public unsigned int GetWindowsDirectoryW(wchar_t *lpBuffer, unsigned int uBufSiz
 public void* GlobalAlloc(unsigned int uFlags, unsigned long long dwBytes);
 public void* GlobalFree(void *hMem);
 public void* GlobalLock(void *hMem);
+public unsigned long long GlobalSize(void *hMem);
 public int GlobalUnlock(void *hMem);
 public void* HeapAlloc(void *hHeap, unsigned int dwFlags, unsigned long long dwBytes);
 public int HeapFree(void *hHeap, unsigned int dwFlags, void *lpMem);
@@ -840,10 +841,33 @@ public const int THREAD_PRIORITY_NORMAL = 0;
 public const int THREAD_PRIORITY_BELOW_NORMAL = -1;
 public const int THREAD_PRIORITY_LOWEST = -2;
 
+// —— kernel32 批次 XXIII 补充（追加于段末、块内字母序；线程控制/线程描述/线程错误模式/高精度与时间转换）——
+//   注：SystemTimeToTzSpecificLocalTime/TzSpecificLocalTimeToSystemTime/GetTimeZoneInformation 依赖
+//   TIME_ZONE_INFORMATION 结构体布局，本批未含该 struct（须先行 -fdump-record-layouts 证伪），同簇 3 个函数后置。
+public int CompareFileTime(const struct FILETIME *lpFileTime1, const struct FILETIME *lpFileTime2);   // LONG=int；fileapi.h:44
+public void* CreateRemoteThread(void *hProcess, struct SECURITY_ATTRIBUTES *lpThreadAttributes, unsigned long long dwStackSize, unsigned int (*lpStartAddress)(void *), void *lpParameter, unsigned int dwCreationFlags, unsigned int *lpThreadId);   // HANDLE→void*、SIZE_T→unsigned long long、LPTHREAD_START_ROUTINE 镜像 CreateThread；processthreadsapi.h:212
+public void ExitThread(unsigned int dwExitCode);   // DECLSPEC_NORETURN VOID；processthreadsapi.h:287
+public int FileTimeToLocalFileTime(const struct FILETIME *lpFileTime, struct FILETIME *lpLocalFileTime);   // BOOL；fileapi.h:180
+public int FileTimeToSystemTime(const struct FILETIME *lpFileTime, struct SYSTEMTIME *lpSystemTime);   // BOOL；timezoneapi.h:81
+public int FlushInstructionCache(void *hProcess, const void *lpBaseAddress, unsigned long long dwSize);   // BOOL、LPCVOID→const void*、SIZE_T；processthreadsapi.h:862
+public void GetSystemTimePreciseAsFileTime(struct FILETIME *lpSystemTimeAsFileTime);   // VOID；sysinfoapi.h:454
+public int GetThreadDescription(void *hThread, wchar_t **ppszThreadDescription);   // HRESULT=int、PWSTR*→wchar_t**；processthreadsapi.h:1433
+public unsigned int GetThreadErrorMode(void);   // DWORD、VOID 参；errhandlingapi.h:236
+public unsigned int ResumeThread(void *hThread);   // DWORD；processthreadsapi.h:329
+public int SetLocalTime(const struct SYSTEMTIME *lpSystemTime);   // BOOL；sysinfoapi.h:165
+public int SetSystemTime(const struct SYSTEMTIME *lpSystemTime);   // BOOL；sysinfoapi.h:383
+public int SetThreadDescription(void *hThread, const wchar_t *lpThreadDescription);   // HRESULT=int、PCWSTR→const wchar_t*；processthreadsapi.h:1425
+public int SetThreadErrorMode(unsigned int dwNewMode, unsigned int *lpOldMode);   // BOOL、LPDWORD→unsigned int*；errhandlingapi.h:243
+public unsigned int SuspendThread(void *hThread);   // DWORD；processthreadsapi.h:322
+public int SwitchToThread(void);   // BOOL、VOID 参；processthreadsapi.h:186
+
 // —— advapi32：[[lib("advapi32")]] 安全令牌/权限族（OpenProcessToken/AdjustTokenPrivileges/LookupPrivilegeValueW）——
 [[lib("advapi32")]] public int AdjustTokenPrivileges(void *TokenHandle, int DisableAllPrivileges, struct TOKEN_PRIVILEGES *NewState, unsigned int BufferLength, struct TOKEN_PRIVILEGES *PreviousState, unsigned int *ReturnLength);
+[[lib("advapi32")]] public int GetTokenInformation(void *TokenHandle, int TokenInformationClass, void *TokenInformation, unsigned int TokenInformationLength, unsigned int *ReturnLength);
 [[lib("advapi32")]] public int LookupPrivilegeValueW(const wchar_t *lpSystemName, const wchar_t *lpName, struct LUID *lpLuid);
 [[lib("advapi32")]] public int OpenProcessToken(void *ProcessHandle, unsigned int DesiredAccess, void **TokenHandle);
+// TOKEN_INFORMATION_CLASS 成员（GetTokenInformation 第 2 参；走 public const 路线）
+public const int TokenElevation = 20;
 
 // 文件属性标志（SetFileAttributesW 的 dwFileAttributes、WIN32_FIND_DATAW/BY_HANDLE_FILE_INFORMATION 的 dwFileAttributes）
 public const unsigned int FILE_ATTRIBUTE_READONLY = 0x00000001;
@@ -876,6 +900,7 @@ public const unsigned int SE_PRIVILEGE_USED_FOR_ACCESS = 0x80000000;
 public const int COLOR_WINDOW = 5;
 public const int CS_HREDRAW = 2;
 public const int CS_VREDRAW = 1;
+public const int CURSOR_SHOWING = 0x00000001;
 public const int CW_USEDEFAULT = -2147483648;
 public const int PM_NOREMOVE = 0;
 public const int PM_REMOVE = 1;
@@ -1137,6 +1162,7 @@ public const int HTCLIENT = 1;
 public const int HTCLOSE = 20;
 // 分层窗口属性标志（SetLayeredWindowAttributes）
 public const int LWA_ALPHA = 0x00000002;
+public const int LWA_COLORKEY = 0x00000001;
 // 多显示器查找标志（MonitorFromRect/MonitorFromWindow）
 public const int MONITOR_DEFAULTTONEAREST = 2;
 // DPI 感知上下文伪句柄：真身 ((DPI_AWARENESS_CONTEXT)-4)（windef.h），按整型宏存 -4，调用 SetProcessDpiAwarenessContext 以 (void*) 传参
@@ -1353,6 +1379,7 @@ public const int CF_UNICODETEXT = 13;
 public const int CF_ENHMETAFILE = 14;
 public const int CF_HDROP = 15;
 public const int CF_LOCALE = 16;
+public const int CF_DIBV5 = 17;
 // Hook 类型（SetWindowsHookExW 的 idHook）
 public const int WH_KEYBOARD = 2;
 public const int WH_GETMESSAGE = 3;
@@ -5999,6 +6026,93 @@ public struct LASTINPUTINFO
 	UINT cbSize;
 	DWORD dwTime;
 };
+// CURSORINFO：GetCursorInfo 光标状态；对照 SDK x64 tagCURSORINFO。sizeof=24。cbSize 须由调用方填 sizeof。
+public struct CURSORINFO
+{
+	DWORD cbSize;
+	DWORD flags;
+	HCURSOR hCursor;
+	struct POINT pt;
+};
+// TOKEN_ELEVATION：GetTokenInformation(TokenElevation) 的 UAC 提升态；对照 SDK x64 TOKEN_ELEVATION。sizeof=4。
+public struct TOKEN_ELEVATION
+{
+	DWORD TokenIsElevated;
+};
+// MIB_IPADDRROW：GetIpAddrTable 单行 IPv4 地址表项；对照 SDK x64 ipmib.h MIB_IPADDRROW。sizeof=24（IPAddr/IF_INDEX/ULONG/DWORD 一律 unsigned int(4)、尾两字段 unsigned short，切勿用 unsigned long 否则行宽膨胀至 40/48）。
+public struct MIB_IPADDRROW
+{
+	DWORD dwAddr;
+	DWORD dwIndex;
+	DWORD dwMask;
+	DWORD dwBCastAddr;
+	DWORD dwReasmSize;
+	unsigned short unused1;
+	unsigned short wType;
+};
+// MIB_IPADDRTABLE：GetIpAddrTable 输出表头；对照 SDK x64 MIB_IPADDRTABLE。sizeof=28（dwNumEntries 4 + table[1] 24）；table 为 ANY_SIZE 柔性数组、实取项数由 dwNumEntries 决定、按 24 字节行跨幅遍历。
+public struct MIB_IPADDRTABLE
+{
+	DWORD dwNumEntries;
+	struct MIB_IPADDRROW table[1];
+};
+
+// MIB_IF_ROW2：单个网络接口信息（Vista+，源 netioapi.h）；对照 SDK x64 _MIB_IF_ROW2。sizeof=1352。
+// 建模要点：NET_LUID 以 ULONGLONG 等尺寸/对齐(8)占位；IFTYPE 属 ULONG 故 DWORD；各枚举按 SDK enum=int；
+// InterfaceAndOperStatusFlags 的 8 个 BOOLEAN:1 位域打包为 1 字节（SDK 即 1B），后接 OperStatus 补 3 字节对齐；
+// 物理地址数组长度 IF_MAX_PHYS_ADDRESS_LENGTH=32、别名字符串 IF_MAX_STRING_SIZE+1=257。GetIfTable2 返回的按行遍历须以本结构体 sizeof 为步长。
+public struct MIB_IF_ROW2
+{
+	ULONGLONG InterfaceLuid;
+	DWORD InterfaceIndex;
+	struct GUID InterfaceGuid;
+	WCHAR Alias[257];
+	WCHAR Description[257];
+	DWORD PhysicalAddressLength;
+	BYTE PhysicalAddress[32];
+	BYTE PermanentPhysicalAddress[32];
+	DWORD Mtu;
+	DWORD Type;
+	int TunnelType;
+	int MediaType;
+	int PhysicalMediumType;
+	int AccessType;
+	int DirectionType;
+	BYTE InterfaceAndOperStatusFlags;
+	int OperStatus;
+	int AdminStatus;
+	int MediaConnectState;
+	struct GUID NetworkGuid;
+	int ConnectionType;
+	ULONGLONG TransmitLinkSpeed;
+	ULONGLONG ReceiveLinkSpeed;
+	ULONGLONG InOctets;
+	ULONGLONG InUcastPkts;
+	ULONGLONG InNUcastPkts;
+	ULONGLONG InDiscards;
+	ULONGLONG InErrors;
+	ULONGLONG InUnknownProtos;
+	ULONGLONG InUcastOctets;
+	ULONGLONG InMulticastOctets;
+	ULONGLONG InBroadcastOctets;
+	ULONGLONG OutOctets;
+	ULONGLONG OutUcastPkts;
+	ULONGLONG OutNUcastPkts;
+	ULONGLONG OutDiscards;
+	ULONGLONG OutErrors;
+	ULONGLONG OutUcastOctets;
+	ULONGLONG OutMulticastOctets;
+	ULONGLONG OutBroadcastOctets;
+	ULONGLONG OutQLen;
+};
+
+// MIB_IF_TABLE2：接口表头（源 netioapi.h）；对照 SDK x64 _MIB_IF_TABLE2。sizeof=1360（NumberOfEntries@0，TableEntry 因行对齐8补至@8）。
+// 内存由 GetIfTable2 分配，用毕交 FreeMibTable 释放；Table 为变长数组，此处以 [1] 建模，按 NumberOfEntries 遍历。
+public struct MIB_IF_TABLE2
+{
+	DWORD NumberOfEntries;
+	struct MIB_IF_ROW2 TableEntry[1];
+};
 
 // —— user32：[[lib("user32")]] 声明库归属（段内按函数名字母序）——
 [[lib("user32")]] public int AdjustWindowRect(struct RECT *lpRect, unsigned int dwStyle, int bMenu);
@@ -6031,6 +6145,7 @@ public struct LASTINPUTINFO
 [[lib("user32")]] public int GetClassNameA(void *hWnd, char *lpClassName, int nMaxCount);
 [[lib("user32")]] public int GetClassNameW(void *hWnd, wchar_t *lpClassName, int nMaxCount);
 [[lib("user32")]] public int GetClientRect(void *hWnd, struct RECT *lpRect);
+[[lib("user32")]] public int GetCursorInfo(struct CURSORINFO *pCursorInfo);
 [[lib("user32")]] public int GetCursorPos(struct POINT *lpPoint);
 [[lib("user32")]] public void* GetDC(void *hWnd);
 [[lib("user32")]] public void* GetDesktopWindow(void);
@@ -6041,6 +6156,7 @@ public struct LASTINPUTINFO
 [[lib("user32")]] public void* GetForegroundWindow(void);
 [[lib("user32")]] public short GetKeyState(int nVirtKey);
 [[lib("user32")]] public int GetMessageA(struct MSG *lpMsg, void *hWnd, unsigned int wMsgFilterMin, unsigned int wMsgFilterMax);
+[[lib("user32")]] public unsigned int GetMessageExtraInfo(void);
 [[lib("user32")]] public unsigned int GetMessagePos(void);
 [[lib("user32")]] public int GetMessageTime(void);
 [[lib("user32")]] public int GetMessageW(struct MSG *lpMsg, void *hWnd, unsigned int wMsgFilterMin, unsigned int wMsgFilterMax);
@@ -6071,6 +6187,7 @@ public struct LASTINPUTINFO
 [[lib("user32")]] public void* LoadCursorW(void *hInstance, const wchar_t *lpCursorName);
 [[lib("user32")]] public void* LoadIconA(void *hInstance, const char *lpIconName);
 [[lib("user32")]] public void* LoadIconW(void *hInstance, const wchar_t *lpIconName);
+[[lib("user32")]] public int LockWorkStation(void);
 [[lib("user32")]] public int MessageBoxA(void *hWnd, const char *lpText, const char *lpCaption, unsigned int uType);
 [[lib("user32")]] public int MessageBoxW(void *hWnd, const wchar_t *lpText, const wchar_t *lpCaption, unsigned int uType);
 [[lib("user32")]] public void* MonitorFromRect(const struct RECT *lprc, unsigned int dwFlags);
@@ -6171,15 +6288,22 @@ public struct LASTINPUTINFO
 [[lib("user32")]] public int SetWindowPlacement(void *hWnd, const struct WINDOWPLACEMENT *lpwndpl);
 
 // —— user32 批次 XV 补充（追加于段末、块内字母序；剪贴板操作/文本插入/窗口枚举）——
+[[lib("user32")]] public int AddClipboardFormatListener(void *hWnd);
 [[lib("user32")]] public int CloseClipboard(void);
 [[lib("user32")]] public int EmptyClipboard(void);
+[[lib("user32")]] public unsigned int EnumClipboardFormats(unsigned int format);
 [[lib("user32")]] public void* GetClipboardData(unsigned int uFormat);
+[[lib("user32")]] public int GetClipboardFormatNameW(unsigned int format, wchar_t *formatName, int maxCount);
+[[lib("user32")]] public unsigned int GetClipboardSequenceNumber(void);
 [[lib("user32")]] public int IsClipboardFormatAvailable(unsigned int format);
 [[lib("user32")]] public int OpenClipboard(void *hWndNewOwner);
+[[lib("user32")]] public unsigned int RegisterClipboardFormatW(const wchar_t *format);
+[[lib("user32")]] public int RemoveClipboardFormatListener(void *hWnd);
 [[lib("user32")]] public void* SetClipboardData(unsigned int uFormat, void *hMem);
 
 // —— user32 批次 XVI 补充（追加于段末、块内字母序；窗口枚举/回调遍历）——
 [[lib("user32")]] public int EnumChildWindows(void *hWndParent, int (*lpEnumFunc)(void *, long long), long long lParam);
+[[lib("user32")]] public int EnumDisplayMonitors(void *hdc, const struct RECT *lprcRect, int (*lpfnEnum)(void *, void *, struct RECT *, long long), long long dwData);
 [[lib("user32")]] public int EnumWindows(int (*lpEnumFunc)(void *, long long), long long lParam);
 
 // —— user32 批次 XVII 补充（追加于段末、块内字母序；Hook/键盘状态/字符映射）——
@@ -6519,6 +6643,7 @@ public struct NOTIFYICONDATAW
 
 // —— shell32：[[lib("shell32")]] Shell 目录浏览/已知文件夹/托盘图标/命令行解析/文件打开（段内字母序；LPITEMIDLIST/PCIDLIST_ABSOLUTE 作 void*，HRESULT=int）——
 [[lib("shell32")]] public wchar_t** CommandLineToArgvW(const wchar_t *lpCmdLine, int *pNumArgs);
+[[lib("shell32")]] public unsigned int DragQueryFileW(void *hDrop, unsigned int iFile, wchar_t *lpszFile, unsigned int cch);
 [[lib("shell32")]] public void* SHBrowseForFolderW(struct BROWSEINFOW *lpbi);
 [[lib("shell32")]] public int SHGetFolderPathW(void *hwnd, int csidl, void *hToken, unsigned int dwFlags, wchar_t *pszPath);
 [[lib("shell32")]] public int SHGetPathFromIDListW(void *pidl, wchar_t *pszPath);
@@ -6556,6 +6681,27 @@ public const int REG_QWORD = 11;
 [[lib("advapi32")]] public int RegGetValueW(void *hkey, const wchar_t *lpSubKey, const wchar_t *lpValue, unsigned int dwFlags, unsigned int *pdwType, void *pvData, unsigned int *pcbData);
 [[lib("advapi32")]] public int RegQueryValueExW(void *hKey, const wchar_t *lpValueName, unsigned int *lpReserved, unsigned int *lpType, unsigned char *lpData, unsigned int *lpcbData);
 [[lib("advapi32")]] public int RegSetValueExW(void *hKey, const wchar_t *lpValueName, unsigned int Reserved, unsigned int dwType, const unsigned char *lpData, unsigned int cbData);
+
+// —— advapi32：[[lib("advapi32")]] CryptoAPI CAPI 句柄（HCRYPTPROV/HCRYPTKEY/HCRYPTHASH 系 SDK ULONG_PTR＝unsigned long long(8)、ALGID/DWORD＝unsigned int、BOOL/int＝int、BYTE*＝unsigned char*、LPCWSTR＝const wchar_t*；段内字母序）——
+[[lib("advapi32")]] public int CryptAcquireContextW(unsigned long long *phProv, const wchar_t *szContainer, const wchar_t *szProvider, unsigned int dwProvType, unsigned int dwFlags);
+[[lib("advapi32")]] public int CryptCreateHash(unsigned long long hProv, unsigned int Algid, unsigned long long hKey, unsigned int dwFlags, unsigned long long *phHash);
+[[lib("advapi32")]] public int CryptDecrypt(unsigned long long hKey, unsigned long long hHash, int Final, unsigned int dwFlags, unsigned char *pbData, unsigned int *pdwDataLen, unsigned int dwBufLen);
+[[lib("advapi32")]] public int CryptDeriveKey(unsigned long long hProv, unsigned int Algid, unsigned long long hBaseData, unsigned int dwFlags, unsigned long long *phKey);
+[[lib("advapi32")]] public int CryptDestroyHash(unsigned long long hHash);
+[[lib("advapi32")]] public int CryptDestroyKey(unsigned long long hKey);
+[[lib("advapi32")]] public int CryptEncrypt(unsigned long long hKey, unsigned long long hHash, int Final, unsigned int dwFlags, unsigned char *pbData, unsigned int *pdwDataLen, unsigned int dwBufLen);
+[[lib("advapi32")]] public int CryptGenRandom(unsigned long long hProv, unsigned int dwLen, unsigned char *pbBuffer);
+[[lib("advapi32")]] public int CryptGetHashParam(unsigned long long hHash, unsigned int dwParam, unsigned char *pbData, unsigned int *pdwDataLen, unsigned int dwFlags);
+[[lib("advapi32")]] public int CryptHashData(unsigned long long hHash, const unsigned char *pbData, unsigned int dwDataLen, unsigned int dwFlags);
+[[lib("advapi32")]] public int CryptImportKey(unsigned long long hProv, const unsigned char *pbData, unsigned int dwDataLen, unsigned long long hPubKey, unsigned int dwFlags, unsigned long long *phKey);
+[[lib("advapi32")]] public int CryptReleaseContext(unsigned long long hProv, unsigned int dwFlags);
+[[lib("advapi32")]] public int CryptSetHashParam(unsigned long long hHash, unsigned int dwParam, const unsigned char *pbData, unsigned int dwFlags);
+[[lib("advapi32")]] public int CryptSetKeyParam(unsigned long long hKey, unsigned int dwParam, const unsigned char *pbData, unsigned int dwFlags);
+
+// —— bcrypt：[[lib("bcrypt")]] CNG（BCRYPT_ALG_HANDLE 为指针句柄＝void*/void**、NTSTATUS(LONG)＝int、ULONG/DWORD＝unsigned int、PUCHAR＝unsigned char*、cIterations(ULONGLONG)＝unsigned long long；段内字母序）——
+[[lib("bcrypt")]] public int BCryptCloseAlgorithmProvider(void *hAlgorithm, unsigned int dwFlags);
+[[lib("bcrypt")]] public int BCryptDeriveKeyPBKDF2(void *hPrf, unsigned char *pbPassword, unsigned int cbPassword, unsigned char *pbSalt, unsigned int cbSalt, unsigned long long cIterations, unsigned char *pbDerivedKey, unsigned int cbDerivedKey, unsigned int dwFlags);
+[[lib("bcrypt")]] public int BCryptOpenAlgorithmProvider(void **phAlgorithm, const wchar_t *pszAlgId, const wchar_t *pszImplementation, unsigned int dwFlags);
 
 // —— comctl32 专用常量（仅本段函数使用；定义紧邻其使用者）——
 // 通用控件 / tooltip（comctl32 · InitCommonControlsEx / TTM_*）
@@ -6735,6 +6881,7 @@ public struct timeval
 };
 
 // —— ws2_32：[[lib("ws2_32")]] BSD 套接字起步族（段内字母序，case-sensitive：大写 WSA* 先于小写函数；SOCKET 形参/返回按底层类型 unsigned long long；struct sockaddr* 形参按指针 * 贴名）——
+[[lib("ws2_32")]] public int WSAAsyncSelect(unsigned long long s, void *hWnd, int wMsg, int lEvent);
 [[lib("ws2_32")]] public int WSACleanup(void);
 [[lib("ws2_32")]] public int WSAStartup(unsigned short wVersionRequested, struct WSADATA *lpWSAData);
 [[lib("ws2_32")]] public unsigned long long accept(unsigned long long s, struct sockaddr *addr, int *addrlen);
@@ -6742,6 +6889,7 @@ public struct timeval
 [[lib("ws2_32")]] public int closesocket(unsigned long long s);
 [[lib("ws2_32")]] public int connect(unsigned long long s, const struct sockaddr *name, int namelen);
 [[lib("ws2_32")]] public int gethostname(char *name, int namelen);
+[[lib("ws2_32")]] public int getnameinfo(const struct sockaddr *sa, int salen, char *host, int hostlen, char *serv, int servlen, int flags);
 [[lib("ws2_32")]] public unsigned int htonl(unsigned int hostlong);
 [[lib("ws2_32")]] public unsigned short htons(unsigned short hostshort);
 [[lib("ws2_32")]] public unsigned int inet_addr(const char *cp);
@@ -6749,7 +6897,9 @@ public struct timeval
 [[lib("ws2_32")]] public unsigned int ntohl(unsigned int netlong);
 [[lib("ws2_32")]] public unsigned short ntohs(unsigned short netshort);
 [[lib("ws2_32")]] public int recv(unsigned long long s, char *buf, int len, int flags);
+[[lib("ws2_32")]] public int recvfrom(unsigned long long s, char *buf, int len, int flags, struct sockaddr *fromAddr, int *fromLen);   // SDK 形参 from/fromlen；from 系 Co 上下文关键字（parser 判 import…from），故改名 fromAddr/fromLen 规避；末参 socklen_t* → int*
 [[lib("ws2_32")]] public int send(unsigned long long s, const char *msg, int len, int flags);
+[[lib("ws2_32")]] public int sendto(unsigned long long s, const char *msg, int len, int flags, const struct sockaddr *toAddr, int toLen);   // SDK 形参 to/tolen；末参 socklen_t → int
 [[lib("ws2_32")]] public int shutdown(unsigned long long s, int how);
 [[lib("ws2_32")]] public unsigned long long socket(int af, int type, int protocol);
 
@@ -6777,6 +6927,11 @@ public struct timeval
 [[lib("ws2_32")]] public int getpeername(unsigned long long s, struct sockaddr *name, int *namelen);
 [[lib("ws2_32")]] public int getsockname(unsigned long long s, struct sockaddr *name, int *namelen);
 [[lib("ws2_32")]] public int ioctlsocket(unsigned long long s, int cmd, unsigned int *argp);   // SDK cmd 为 long（.h/C 口径 4 字节=int），原误作 unsigned int
+
+// —— iphlpapi：[[lib("iphlpapi")]] IPv4 地址表 / 接口表（GetIpAddrTable/GetIfTable2 返回 DWORD 错误码→unsigned int；pdwSize PULONG→unsigned int*；bOrder BOOL→int；GetIfTable2 出参 PMIB_IF_TABLE2*（函数自行分配，用毕 FreeMibTable 释放，返回 VOID）——
+[[lib("iphlpapi")]] public void FreeMibTable(void *MemoryTable);
+[[lib("iphlpapi")]] public unsigned int GetIfTable2(struct MIB_IF_TABLE2 **Table);
+[[lib("iphlpapi")]] public unsigned int GetIpAddrTable(struct MIB_IPADDRTABLE *pIpAddrTable, unsigned int *pdwSize, int bOrder);
 
 // —— crypt32 专用常量（CryptoAPI 字符串编解码标志；真值源 wincrypt.h L20922–20945，CRYPT_STRING_* 作 int）——
 public const int CRYPT_STRING_BASE64 = 0x00000001;

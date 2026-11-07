@@ -499,11 +499,33 @@ struct ClassMethod
 	SourceLoc loc;
 };
 
+// ============================================================
+// class 属性（P391 Co 层，0.7.0）：访问器函数对，透明 obj.a / obj.a=x
+// ============================================================
+struct ClassProperty
+{
+	std::string name;       // 属性名（不得与同类 members/methods/properties 重名）
+	CTypePtr type;          // 属性类型（沿用 class 成员类型白名单）
+	bool is_public = false;
+	// P393：访问器级可见性——缺省 public；标 private 的访问器仅「定义该类之内」可调，类外拒收。
+	bool get_public = true; // get 访问器是否对外可见
+	bool set_public = true; // set 访问器是否对外可见
+	bool has_get = false;   // 声明了 get 访问器
+	bool has_set = false;   // 声明了 set 访问器
+	bool get_auto = false;  // get 无显式体（自动，需合成后备字段）
+	bool set_auto = false;  // set 无显式体（自动，需合成后备字段）
+	StmtPtr get_body;       // get 显式体（null = 自动/缺省）
+	StmtPtr set_body;       // set 显式体（null = 自动/缺省）
+	std::string backing_field; // 任一访问器为自动时由 parser 合成的隐藏后备字段名（内部名，非空即占布局槽）
+	SourceLoc loc;
+};
+
 struct ClassDef
 {
 	std::string tag;                    // 类名
 	std::vector<ClassMember> members;
 	std::vector<ClassMethod> methods;
+	std::vector<ClassProperty> properties; // P391 Co class 属性
 	bool has_ctor = false;
 	bool has_dtor = false;
 	SourceLoc loc;

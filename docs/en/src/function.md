@@ -33,7 +33,7 @@ A function definition has four parts: the return type `TYPE`, the function name 
 
 ### Visibility and export
 
-`public` is Co's only visibility keyword (there is no `private`, and no separate `export`). It carries both the "module interface" and the "dynamic library export" meanings at once:
+`public` is Co's keyword for making something external. It carries both the "module interface" and the "dynamic library export" meanings at once (there is no separate `export`); `private` may appear as an explicit spelling of *omitting* `public`, with the same external/cross-module meaning as omitting `public` and no added restriction (the only place Co enforces an access restriction is class property accessors — see the "class" chapter). The table below is stated in terms of `public`:
 
 | Form | Meaning |
 | --- | --- |

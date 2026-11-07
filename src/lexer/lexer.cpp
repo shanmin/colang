@@ -137,7 +137,9 @@ bool is_keyword(const std::string &word)
 		"_BitInt",
 		// P211 Co 层：单一存储类位关键字——标记顶层函数/全局为模块接口 + DLL 导出。
 		//   本批：纯存储类位，不改默认 linkage（非 public 仍 ExternalLinkage）。
-		"public",
+		// P392：private 作 public 对称的显式可见性标注位——纯语法糖，语义 ≡ 省略 public
+		//   （is_public 保持 false、不新增访问强制），不改默认 linkage。
+		"public", "private",
 		// P212 Co 层：跨模块导入与模块声明头关键字。
 		//   `import` 与 `from`/`as` 共同构成导入语法（`from`/`as` 不作保留字、
 		//   仅靠上下文词法识别、保留对旧 C 代码中同名标识符的兼容）。

@@ -12,9 +12,9 @@ Modules exist to support organizing large projects and to avoid the duplicate-de
 
 ## The external interface: `public`
 
-- `public` is Co's **only visibility keyword** — there is no `private`, and no separate `export`. It serves two roles at once: marking the **module interface** (importable by other modules) and **dynamic-library export** (written to the DLL export table).
+- `public` is Co's keyword for making something external. It serves two roles at once: marking the **module interface** (importable by other modules) and **dynamic-library export** (written to the DLL export table); there is no separate `export`. `private` may appear anywhere as an **explicit spelling of *omitting* `public`** — its export and cross-module meaning are identical to omitting `public` and add no further visibility change. The only place in Co that actually enforces an access restriction is the `get`/`set` accessors of a class property (see the "class" chapter).
 - A definition without `public` is visible only inside its module; only a `public` definition is externally visible and importable.
-- `public` may modify top-level functions, global variables, and `struct` / `union` / `enum` types (cross-module type visibility has been available since 0.3.0/0.3.1), as well as **file-scope `typedef`** (`public typedef int MyInt;`, part of the export surface since V0.4.1.40; a non-`public` `typedef` is not exported); `public` on `class` and its members has been available since V0.4.0 (cross-module `import` consumption of a `public class` is still not opened).
+- `public` may modify top-level functions, global variables, and `struct` / `union` / `enum` types (cross-module type visibility has been available since 0.3.0/0.3.1), as well as **file-scope `typedef`** (`public typedef int MyInt;`, part of the export surface since V0.4.1.40; a non-`public` `typedef` is not exported); `public` on `class` and its members has been available since V0.4.0; a `public class` from an imported module can be `new`-ed and its instance/static members, fields and properties used from the consuming module (cross-module consumption confirmed working since P391).
 - Non-`public` imported symbols are forced to `InternalLinkage` during codegen — references within the same module resolve, but no externally-visible LLVM value is emitted.
 
 ## Same-name tags: warning + qualified type names
