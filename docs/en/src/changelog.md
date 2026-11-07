@@ -3,6 +3,9 @@
 This record lists major changes to the Co (colang) language/compiler by release version.
 Versioning policy: 0.* = development/test releases, 1.* = official releases, 2.* = bootstrap.
 
+## V1.0.0
+- Official release.
+
 ## V0.7.0
 - **`class` now supports properties**: a class member can be defined as a property via an accessor pair — `int a { get { return _a; } set { _a = value; } }`; reading `obj.a` / writing `obj.a = x` uses the same syntax as an ordinary field and dispatches to `get` / `set` automatically. Read-only (only `get`), write-only (only `set`) and **auto-property sugar** (`int b { get; set; }`, where the compiler synthesizes a hidden backing field) are supported; inside an auto-property's accessor the contextual keyword `field` reads/writes that backing storage directly (matching C# 14 style). `obj.prop++` / `--` (prefix / postfix) and compound assignment `obj.prop += x` all expand correctly as "read, modify, write"; a property has no independent storage address, so taking its address (`&obj.prop`) is an error.
 - **New `private` keyword + accessor-level visibility**: `private` is explicit sugar (semantically equivalent to omitting `public`; cross-module visibility is still governed by the single `public` gate) and may precede members / methods / properties at the top level, the class header, and inside the class body; `public` and `private` together on one declaration is an error. Each property accessor can carry its own visibility (e.g. `public int a { get; private set; }`) — an accessor marked `private` may be called only inside the class that defines it, and external read/write is rejected per read-only / write-only.

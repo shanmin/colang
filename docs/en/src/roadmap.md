@@ -110,7 +110,21 @@ First delivery covers `import` (`.co` source merge) and the **linking core** (ch
 
 ## Planned
 
-Details for 1.\* / 2.\* / 3.\* milestones will be finalized by the maintainer before 0.\* wraps up.
+Planned Co-language-layer features for the 1.\* line are registered below (each shipped in a backward-compatible manner); 3.\* details will be finalized by the maintainer, and the 2.\* goal follows.
+
+### Planned language-layer features (1.\* line)
+
+- **Built-in `string` / `wstring` value types**: first-class string value types carrying an implicit length, directly comparable and concatenable, added at the Co language layer (beyond C).
+- **Cross-module binary `import`**: `import` currently consumes `.co` sources only; planned to consume `.dll` / `.lib` / `.so` / `.a` binaries directly (the production side is already in place).
+- **`class` inheritance / virtual functions / RTTI**: on top of the delivered `class` core, add single/multiple inheritance, virtual functions and runtime type information, with up- and down-casting.
+- **Full `winapi.co` coverage**: the Co modular wrapper of the Win32 API keeps expanding, ultimately covering the full API set via a metadata-driven auto-generation pipeline.
+- **Structured exception handling (`try` / `catch` / `throw`)** (deferred requirement): retained as a language-layer requirement; its design and semantics are **not yet finalized or scheduled** — this entry registers intent only and is not a release or compatibility commitment.
+
+### V2.0.0 — Bootstrap
+
+- **Goal**: rewrite the colang compiler's main body in the Co language itself, so the resulting compiler can compile its own source (bootstrap) — transitioning from today's C++ implementation to a version written in Co that closes the loop by compiling itself.
+- **Prerequisites**: the Co language layer must be complete, correct and fast enough to express an entire compiler; **the back-end must first be settled** — either bind through a pure-C interface (`LLVM-C`) and link prebuilt libraries, or replace LLVM with a self-owned back-end (full bootstrap); and the whole build chain must be able to compile colang with colang itself. (Inheritance / virtual functions / exceptions are **not** prerequisites of bootstrap, only optional language conveniences when writing a compiler, and are already listed among the 1.\* features above.)
+- **Significance**: bootstrap is the foundation for reaching product finalization (3.\*) — once the compiler can compile itself, it sheds dependence on an external C++ toolchain and enters a long-term self-maintaining stage.
 
 ## Terminology
 
