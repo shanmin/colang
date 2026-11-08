@@ -10,4 +10,4 @@ Co is a new language extended from C. It stays as compatible as possible with ex
 
 The default file extension of Co source files is `.co`.
 
-All current syntax of Co is based on C, so anything not covered in this document follows the current C standard (C23 / C11 recommended, i.e. ISO/IEC 9899:2024 and ISO/IEC 9899:2011). Wherever Co conflicts with or extends C, this document will describe it as clearly as possible.
+All current syntax of Co is based on C, so anything not covered in this document follows the current C standard (C23 recommended, i.e. ISO/IEC 9899:2024). Wherever Co conflicts with or extends C, this document will describe it as clearly as possible.
